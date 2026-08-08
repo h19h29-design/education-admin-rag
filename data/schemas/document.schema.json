@@ -1,0 +1,159 @@
+{
+  "$id": "data/schemas/document.schema.json",
+  "additionalProperties": false,
+  "description": "A verified source document and the policy required to use it safely.",
+  "properties": {
+    "access_level": {
+      "enum": [
+        "staff",
+        "public"
+      ],
+      "title": "Access Level",
+      "type": "string"
+    },
+    "doc_id": {
+      "minLength": 1,
+      "title": "Doc Id",
+      "type": "string"
+    },
+    "edition_year": {
+      "maximum": 2100,
+      "minimum": 1900,
+      "title": "Edition Year",
+      "type": "integer"
+    },
+    "extraction_method": {
+      "enum": [
+        "native",
+        "ocr"
+      ],
+      "title": "Extraction Method",
+      "type": "string"
+    },
+    "ingestion_version": {
+      "minLength": 1,
+      "title": "Ingestion Version",
+      "type": "string"
+    },
+    "page_numbering_rule": {
+      "minLength": 1,
+      "title": "Page Numbering Rule",
+      "type": "string"
+    },
+    "pdf_page_count": {
+      "exclusiveMinimum": 0,
+      "title": "Pdf Page Count",
+      "type": "integer"
+    },
+    "public_url": {
+      "anyOf": [
+        {
+          "format": "uri",
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Public Url"
+    },
+    "publisher": {
+      "minLength": 1,
+      "title": "Publisher",
+      "type": "string"
+    },
+    "redistribution_status": {
+      "enum": [
+        "unverified",
+        "approved",
+        "denied"
+      ],
+      "title": "Redistribution Status",
+      "type": "string"
+    },
+    "registration_no": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Registration No"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Sha256",
+      "type": "string"
+    },
+    "source_dpi": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Dpi"
+    },
+    "source_filename": {
+      "minLength": 1,
+      "title": "Source Filename",
+      "type": "string"
+    },
+    "source_period_end": {
+      "anyOf": [
+        {
+          "format": "date",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Period End"
+    },
+    "source_period_start": {
+      "anyOf": [
+        {
+          "format": "date",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Period Start"
+    },
+    "title": {
+      "minLength": 1,
+      "title": "Title",
+      "type": "string"
+    }
+  },
+  "required": [
+    "doc_id",
+    "edition_year",
+    "title",
+    "publisher",
+    "source_filename",
+    "sha256",
+    "pdf_page_count",
+    "extraction_method",
+    "redistribution_status",
+    "access_level",
+    "page_numbering_rule",
+    "ingestion_version"
+  ],
+  "title": "Document",
+  "type": "object"
+}

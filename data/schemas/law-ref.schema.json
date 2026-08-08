@@ -1,0 +1,176 @@
+{
+  "$defs": {
+    "SourceSpan": {
+      "additionalProperties": false,
+      "description": "A locatable fragment in an original PDF page.",
+      "properties": {
+        "bbox": {
+          "maxItems": 4,
+          "minItems": 4,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Bbox",
+          "type": "array"
+        },
+        "page_label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Page Label"
+        },
+        "pdf_page_index": {
+          "minimum": 1,
+          "title": "Pdf Page Index",
+          "type": "integer"
+        },
+        "text_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Text Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pdf_page_index",
+        "bbox",
+        "text_sha256"
+      ],
+      "title": "SourceSpan",
+      "type": "object"
+    }
+  },
+  "$id": "data/schemas/law-ref.schema.json",
+  "additionalProperties": false,
+  "description": "A law or guidance citation preserved exactly as the source document printed it.",
+  "properties": {
+    "abbreviation": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Abbreviation"
+    },
+    "article": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Article"
+    },
+    "case_id": {
+      "minLength": 1,
+      "title": "Case Id",
+      "type": "string"
+    },
+    "cited_effective_date": {
+      "anyOf": [
+        {
+          "format": "date",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cited Effective Date"
+    },
+    "display_name": {
+      "minLength": 1,
+      "title": "Display Name",
+      "type": "string"
+    },
+    "item": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Item"
+    },
+    "law_ref_id": {
+      "minLength": 1,
+      "title": "Law Ref Id",
+      "type": "string"
+    },
+    "paragraph": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Paragraph"
+    },
+    "parsing_confidence": {
+      "maximum": 1,
+      "minimum": 0,
+      "title": "Parsing Confidence",
+      "type": "number"
+    },
+    "quote": {
+      "minLength": 1,
+      "title": "Quote",
+      "type": "string"
+    },
+    "review_status": {
+      "enum": [
+        "machine_extracted",
+        "needs_review",
+        "search_approved",
+        "approved",
+        "rejected"
+      ],
+      "title": "Review Status",
+      "type": "string"
+    },
+    "source_span": {
+      "$ref": "#/$defs/SourceSpan"
+    }
+  },
+  "required": [
+    "law_ref_id",
+    "case_id",
+    "display_name",
+    "quote",
+    "source_span",
+    "parsing_confidence",
+    "review_status"
+  ],
+  "title": "LawRef",
+  "type": "object"
+}

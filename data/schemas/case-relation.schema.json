@@ -1,0 +1,53 @@
+{
+  "$id": "data/schemas/case-relation.schema.json",
+  "additionalProperties": false,
+  "description": "A reviewed relationship between two distinct canonical cases.",
+  "properties": {
+    "confidence": {
+      "maximum": 1,
+      "minimum": 0,
+      "title": "Confidence",
+      "type": "number"
+    },
+    "relation_id": {
+      "minLength": 1,
+      "title": "Relation Id",
+      "type": "string"
+    },
+    "relation_type": {
+      "enum": [
+        "related",
+        "duplicate",
+        "supersedes",
+        "conflicts"
+      ],
+      "title": "Relation Type",
+      "type": "string"
+    },
+    "review_status": {
+      "minLength": 1,
+      "title": "Review Status",
+      "type": "string"
+    },
+    "source_case_id": {
+      "minLength": 1,
+      "title": "Source Case Id",
+      "type": "string"
+    },
+    "target_case_id": {
+      "minLength": 1,
+      "title": "Target Case Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "relation_id",
+    "source_case_id",
+    "target_case_id",
+    "relation_type",
+    "confidence",
+    "review_status"
+  ],
+  "title": "CaseRelation",
+  "type": "object"
+}

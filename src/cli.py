@@ -1,8 +1,10 @@
+import json
 import os
 from pathlib import Path
 
 import typer
 
+from src.corpus.models import Case, CaseRelation, Chunk, Document, LawRef
 from src.ingestion.manifest import (
     ManifestError,
     load_manifest,
@@ -58,6 +60,35 @@ def verify_sources(
     typer.echo(f"verified={verified} changed={changed} failed={failed}")
     if failed:
         raise typer.Exit(code=1)
+
+
+_SCHEMA_MODELS = {
+    "document.schema.json": Document,
+    "case.schema.json": Case,
+    "chunk.schema.json": Chunk,
+    "law-ref.schema.json": LawRef,
+    "case-relation.schema.json": CaseRelation,
+}
+
+
+@app.command("export-schemas")
+def export_schemas(
+    output: Path = typer.Option(..., "--output", file_okay=False),  # noqa: B008 - Typer command parameter.
+) -> None:
+    """Write managed schemas deterministically; overwrite stale managed files and reject unknown ones."""
+    output.mkdir(parents=True, exist_ok=True)
+    managed_names = set(_SCHEMA_MODELS)
+    unexpected = sorted(path.name for path in output.glob("*.schema.json") if path.name not in managed_names)
+    if unexpected:
+        typer.echo(f"unexpected schema files: {', '.join(unexpected)}")
+        raise typer.Exit(code=2)
+
+    for filename, model in _SCHEMA_MODELS.items():
+        schema = model.model_json_schema()
+        schema["$id"] = f"data/schemas/{filename}"
+        rendered = json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        (output / filename).write_text(rendered, encoding="utf-8", newline="\n")
+    typer.echo(f"exported={len(_SCHEMA_MODELS)} output={output}")
 
 
 if __name__ == "__main__":
