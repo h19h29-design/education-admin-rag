@@ -342,12 +342,14 @@ source = { virtual = "." }
 dependencies = [
     { name = "pydantic" },
     { name = "pymupdf" },
-    { name = "qdrant-client" },
-    { name = "sentence-transformers" },
     { name = "typer" },
 ]
 
 [package.optional-dependencies]
+index = [
+    { name = "qdrant-client" },
+    { name = "sentence-transformers" },
+]
 ocr = [
     { name = "paddleocr", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "paddlepaddle", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -368,11 +370,11 @@ requires-dist = [
     { name = "paddlepaddle", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'ocr'", specifier = "==3.1.1" },
     { name = "pydantic" },
     { name = "pymupdf" },
-    { name = "qdrant-client" },
-    { name = "sentence-transformers" },
+    { name = "qdrant-client", marker = "extra == 'index'" },
+    { name = "sentence-transformers", marker = "extra == 'index'" },
     { name = "typer" },
 ]
-provides-extras = ["ocr"]
+provides-extras = ["ocr", "index"]
 
 [package.metadata.requires-dev]
 dev = [

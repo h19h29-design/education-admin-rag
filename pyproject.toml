@@ -6,8 +6,6 @@ requires-python = ">=3.11,<3.12"
 dependencies = [
     "pydantic",
     "pymupdf",
-    "qdrant-client",
-    "sentence-transformers",
     "typer",
 ]
 
@@ -15,6 +13,10 @@ dependencies = [
 ocr = [
     "paddleocr; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "paddlepaddle==3.1.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+index = [
+    "qdrant-client",
+    "sentence-transformers",
 ]
 
 [dependency-groups]

@@ -1,4 +1,5 @@
 import re
+import tomllib
 from pathlib import Path
 
 
@@ -7,6 +8,44 @@ def test_ingestion_image_enforces_linux_amd64_platform() -> None:
     from_instruction = dockerfile.read_text().splitlines()[0]
 
     assert from_instruction.startswith("FROM --platform=linux/amd64 ")
+
+
+def test_ingestion_dependency_boundary_excludes_index_stack_from_base() -> None:
+    """Catches vector/embedding dependencies leaking into the OCR image graph."""
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads(Path("uv.lock").read_text(encoding="utf-8"))
+    root_package = next(
+        package
+        for package in lock["package"]
+        if package["name"] == "education-admin-rag"
+    )
+    docker_sync = next(
+        line
+        for line in Path("docker/ingestion.Dockerfile").read_text().splitlines()
+        if line.startswith("RUN uv sync")
+    )
+
+    assert project["project"]["dependencies"] == ["pydantic", "pymupdf", "typer"]
+    assert project["project"]["optional-dependencies"].get("index", []) == [
+        "qdrant-client",
+        "sentence-transformers",
+    ]
+    assert project["project"]["optional-dependencies"]["ocr"] == [
+        "paddleocr; sys_platform == 'linux' and platform_machine == 'x86_64'",
+        "paddlepaddle==3.1.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    ]
+    assert [dependency["name"] for dependency in root_package["dependencies"]] == [
+        "pydantic",
+        "pymupdf",
+        "typer",
+    ]
+    assert [
+        dependency["name"]
+        for dependency in root_package.get("optional-dependencies", {}).get(
+            "index", []
+        )
+    ] == ["qdrant-client", "sentence-transformers"]
+    assert docker_sync == "RUN uv sync --frozen --extra ocr --no-dev"
 
 
 def test_ingestion_image_is_digest_pinned_multistage_with_frozen_venv_and_models() -> (

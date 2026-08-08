@@ -90,7 +90,7 @@ Expected: 출력이 없고, 기존 작업 폴더의 미커밋 파일은 새 work
 
 - [ ] **Step 2: 테스트를 실행할 최소 의존성 환경만 먼저 고정한다.**
 
-`.python-version`, `pyproject.toml`, `docker/ingestion.Dockerfile`, `.gitignore`를 만든다. `pyproject.toml`에 `typer`, `pydantic`, `pymupdf`, `sentence-transformers`, `qdrant-client`를 기본 runtime dependency로 선언한다. `paddleocr`와 CPU용 `paddlepaddle`은 Linux/amd64 ingestion image에서만 설치하는 `ocr` optional dependency로 분리한다. `pytest`, `pytest-cov`, `ruff`, `mypy`, `jsonschema`는 dev dependency로 선언한다. `docker/ingestion.Dockerfile`은 digest로 고정한 Python 3.11 slim base와 `uv sync --frozen --extra ocr`를 사용한다.
+`.python-version`, `pyproject.toml`, `docker/ingestion.Dockerfile`, `.gitignore`를 만든다. `pyproject.toml`의 기본 runtime dependency에는 `typer`, `pydantic`, `pymupdf`만 선언한다. `paddleocr`와 CPU용 `paddlepaddle`은 Linux/amd64 ingestion image에서만 설치하는 `ocr` optional dependency로, `sentence-transformers`와 `qdrant-client`는 향후 indexer image에서만 설치하는 `index` optional dependency로 분리한다. `pytest`, `pytest-cov`, `ruff`, `mypy`, `jsonschema`는 dev dependency로 선언한다. `docker/ingestion.Dockerfile`은 digest로 고정한 Python 3.11 slim base와 `uv sync --frozen --extra ocr --no-dev`를 사용하며, indexer는 `uv sync --frozen --extra index --no-dev`를 사용한다.
 
 ```bash
 uv lock
@@ -599,8 +599,11 @@ SEN_QA_OCR_SMOKE_DIR="$(mktemp -d "$PWD/artifacts/ocr-smoke.XXXXXX")"
 SEN_QA_RUNTIME_USER="$(id -u):$(id -g)"
 docker buildx build --platform linux/amd64 --load --network default -f docker/ingestion.Dockerfile -t education-admin-ingestion:corpus-v1 .
 test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' education-admin-ingestion:corpus-v1)" = "linux/amd64"
+SEN_QA_INGESTION_IMAGE_SIZE_BYTES="$(docker image inspect --format '{{.Size}}' education-admin-ingestion:corpus-v1)"
+test "$SEN_QA_INGESTION_IMAGE_SIZE_BYTES" -le 2500000000
 docker image inspect --format 'SEN_QA_INGESTION_IMAGE_DIGEST={{.Id}}' education-admin-ingestion:corpus-v1 > artifacts/build/ingestion.env
-docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -c 'import cv2; import paddle; from paddleocr import PaddleOCR; print("runtime-imports=ok")'
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -c 'import cv2, paddle, paddleocr, paddlex, pymupdf, pydantic, typer; print("runtime-imports=ok")'
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -c 'import importlib.metadata as metadata, importlib.util as util; modules=("torch", "sentence_transformers", "transformers", "qdrant_client", "triton"); present=[name for name in modules if util.find_spec(name) is not None]; distributions={dist.metadata["Name"].lower() for dist in metadata.distributions() if dist.metadata["Name"]}; accelerator=sorted(name for name in distributions if name.startswith(("nvidia-", "cuda-"))); assert not present, present; assert not accelerator, accelerator; print("index-stack=absent")'
 docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli validate-ocr-models
 docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" --env-file artifacts/build/ingestion.env -e SEN_QA_SOURCE_ROOT=/sources --mount "type=bind,src=$SEN_QA_BUILDER_SOURCE_ROOT,dst=/sources,readonly" --mount "type=bind,src=$SEN_QA_OCR_SMOKE_DIR,dst=/work/artifacts/ocr-smoke" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli extract-ocr --year 2025 --pages 13 --output /work/artifacts/ocr-smoke
 sha256sum "$SEN_QA_OCR_SMOKE_DIR/sen-qa-2025.jsonl" > artifacts/build/ocr-smoke-run-1.sha256
@@ -610,7 +613,7 @@ cmp artifacts/build/ocr-smoke-run-1.sha256 artifacts/build/ocr-smoke-run-2.sha25
 docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli validate-ocr-models
 ```
 
-`SEN_QA_INGESTION_IMAGE_DIGEST`에는 바로 앞에서 기록한 local content digest가 env file로 전달된다. Build만 네트워크를 사용하며 runtime은 host 소유 출력 디렉터리와 같은 non-root UID/GID로 실행한다. Expected: Docker server와 final image가 linux/amd64이고, network가 차단된 read-only container에서 runtime import, locked-model 검증, 실제 page-13 CPU 예측이 성공한다. 두 실행의 JSONL hash가 같고 page JSON에는 PDF-point bbox/confidence, `render_dpi=300`, source/render hash, review flags, image digest가 기록된다. 두 실행 전후 locked-model 검증이 모두 통과해야 한다. Docker/buildx가 없으면 host 명령으로 우회하지 않고 Linux builder 준비 작업으로 차단한다.
+`SEN_QA_INGESTION_IMAGE_DIGEST`에는 바로 앞에서 기록한 local content digest가 env file로 전달된다. Build만 네트워크를 사용하며 runtime은 host 소유 출력 디렉터리와 같은 non-root UID/GID로 실행한다. Expected: Docker server와 final image가 linux/amd64이고 image size가 2,500,000,000 bytes 이하이며, OCR runtime module은 모두 import되고 index/CUDA stack module과 `nvidia-*`/`cuda-*` distribution은 하나도 없다. network가 차단된 read-only container에서 locked-model 검증과 실제 page-13 CPU 예측이 성공한다. 두 실행의 JSONL hash가 같고 page JSON에는 PDF-point bbox/confidence, `render_dpi=300`, source/render hash, review flags, image digest가 기록된다. 두 실행 전후 locked-model 검증이 모두 통과해야 한다. Docker/buildx가 없으면 host 명령으로 우회하지 않고 Linux builder 준비 작업으로 차단한다.
 
 - [ ] **Step 8: 커밋한다.**
 
@@ -966,7 +969,7 @@ uv run pytest tests/retrieval/test_dense.py -q
 
 - [ ] **Step 3: Task 9에서 고정한 `BAAI/bge-m3` cache를 offline 검증한다.**
 
-`docker/indexer.Dockerfile`은 digest로 고정한 Python base에서 `config/models.lock.json`의 40자리 commit SHA만 내려받아 encoder/tokenizer를 image에 bake하고 파일별 SHA-256을 재검사한다. runtime은 `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `--network none`으로 시작하며 `main`, `latest`, 비어 있는 revision, cache miss를 모두 실패시킨다. tokenizer revision과 encoder revision이 다르면 dense build를 시작하지 않는다.
+`docker/indexer.Dockerfile`은 digest로 고정한 Python base에서 `uv sync --frozen --extra index --no-dev`로 embedding/vector dependency를 설치하고, `config/models.lock.json`의 40자리 commit SHA만 내려받아 encoder/tokenizer를 image에 bake하고 파일별 SHA-256을 재검사한다. runtime은 `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `--network none`으로 시작하며 `main`, `latest`, 비어 있는 revision, cache miss를 모두 실패시킨다. tokenizer revision과 encoder revision이 다르면 dense build를 시작하지 않는다.
 
 - [ ] **Step 4: batch encoder와 Qdrant payload를 구현한다.**
 
