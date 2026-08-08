@@ -591,13 +591,26 @@ Expected: PaddlePaddle을 import하지 않는 fake adapter 테스트가 통과�
 ```bash
 docker version
 docker buildx version
-mkdir -p artifacts/build artifacts/ocr-smoke
+test "$(id -u)" -ne 0
+SEN_QA_BUILDER_SOURCE_ROOT=/volume1/education-admin/source
+test -d "$SEN_QA_BUILDER_SOURCE_ROOT"
+mkdir -p artifacts/build artifacts
+SEN_QA_OCR_SMOKE_DIR="$(mktemp -d "$PWD/artifacts/ocr-smoke.XXXXXX")"
+SEN_QA_RUNTIME_USER="$(id -u):$(id -g)"
 docker buildx build --platform linux/amd64 --load --network default -f docker/ingestion.Dockerfile -t education-admin-ingestion:corpus-v1 .
+test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' education-admin-ingestion:corpus-v1)" = "linux/amd64"
 docker image inspect --format 'SEN_QA_INGESTION_IMAGE_DIGEST={{.Id}}' education-admin-ingestion:corpus-v1 > artifacts/build/ingestion.env
-docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g --env-file artifacts/build/ingestion.env -e SEN_QA_SOURCE_ROOT=/sources -v /volume1/education-admin/source:/sources:ro -v "$PWD/artifacts/ocr-smoke:/work/artifacts/ocr-smoke:rw" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli extract-ocr --year 2025 --pages 13 --output artifacts/ocr-smoke
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -c 'import cv2; import paddle; from paddleocr import PaddleOCR; print("runtime-imports=ok")'
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli validate-ocr-models
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" --env-file artifacts/build/ingestion.env -e SEN_QA_SOURCE_ROOT=/sources --mount "type=bind,src=$SEN_QA_BUILDER_SOURCE_ROOT,dst=/sources,readonly" --mount "type=bind,src=$SEN_QA_OCR_SMOKE_DIR,dst=/work/artifacts/ocr-smoke" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli extract-ocr --year 2025 --pages 13 --output /work/artifacts/ocr-smoke
+sha256sum "$SEN_QA_OCR_SMOKE_DIR/sen-qa-2025.jsonl" > artifacts/build/ocr-smoke-run-1.sha256
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" --env-file artifacts/build/ingestion.env -e SEN_QA_SOURCE_ROOT=/sources --mount "type=bind,src=$SEN_QA_BUILDER_SOURCE_ROOT,dst=/sources,readonly" --mount "type=bind,src=$SEN_QA_OCR_SMOKE_DIR,dst=/work/artifacts/ocr-smoke" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli extract-ocr --year 2025 --pages 13 --output /work/artifacts/ocr-smoke
+sha256sum "$SEN_QA_OCR_SMOKE_DIR/sen-qa-2025.jsonl" > artifacts/build/ocr-smoke-run-2.sha256
+cmp artifacts/build/ocr-smoke-run-1.sha256 artifacts/build/ocr-smoke-run-2.sha256
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli validate-ocr-models
 ```
 
-`SEN_QA_INGESTION_IMAGE_DIGEST`에는 바로 앞에서 기록한 local content digest가 env file로 전달된다. Expected: Docker server architecture가 amd64이고, network가 차단된 container에서 page JSON에 bbox/confidence, `render_dpi=300`, source/render hash, image digest가 기록된다. Docker/buildx가 없으면 host 명령으로 우회하지 않고 Linux builder 준비 작업으로 차단한다.
+`SEN_QA_INGESTION_IMAGE_DIGEST`에는 바로 앞에서 기록한 local content digest가 env file로 전달된다. Build만 네트워크를 사용하며 runtime은 host 소유 출력 디렉터리와 같은 non-root UID/GID로 실행한다. Expected: Docker server와 final image가 linux/amd64이고, network가 차단된 read-only container에서 runtime import, locked-model 검증, 실제 page-13 CPU 예측이 성공한다. 두 실행의 JSONL hash가 같고 page JSON에는 PDF-point bbox/confidence, `render_dpi=300`, source/render hash, review flags, image digest가 기록된다. 두 실행 전후 locked-model 검증이 모두 통과해야 한다. Docker/buildx가 없으면 host 명령으로 우회하지 않고 Linux builder 준비 작업으로 차단한다.
 
 - [ ] **Step 8: 커밋한다.**
 
