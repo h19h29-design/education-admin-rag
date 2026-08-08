@@ -1,0 +1,10 @@
+{
+  "page_width": 1000,
+  "page_height": 1400,
+  "lines": [
+    {"text": "R1", "bbox": [520.0, 100.0, 700.0, 130.0], "confidence": 0.9},
+    {"text": "L2 혼합 ABC-12", "bbox": [50.0, 151.0, 400.0, 181.0], "confidence": 0.9},
+    {"text": "L1", "bbox": [50.0, 103.0, 400.0, 133.0], "confidence": 0.9},
+    {"text": "R2", "bbox": [500.0, 149.0, 800.0, 179.0], "confidence": 0.9}
+  ]
+}

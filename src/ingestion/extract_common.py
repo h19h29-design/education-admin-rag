@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -47,7 +47,7 @@ class BoundingBox(BaseModel):
 
 
 class RawSpan(BaseModel):
-    """Unchanged native text span supplied by PyMuPDF."""
+    """Unchanged text span with source-native or measured OCR confidence."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -58,21 +58,28 @@ class RawSpan(BaseModel):
     confidence: float = Field(default=1.0)
 
     @model_validator(mode="after")
-    def is_native_and_finite(self) -> Self:
-        if self.confidence != 1.0:
-            raise ValueError("native span confidence must be exactly 1.0")
+    def has_finite_confidence_and_size(self) -> Self:
+        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("span confidence must be finite and between 0 and 1")
         if not math.isfinite(self.size):
             raise ValueError("span size must be finite")
         return self
 
 
 class RawLine(BaseModel):
-    """Unchanged native text line supplied by PyMuPDF."""
+    """Unchanged text line supplied by the selected extractor."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     bbox: BoundingBox
     spans: tuple[RawSpan, ...]
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def has_finite_confidence(self) -> Self:
+        if not math.isfinite(self.confidence):
+            raise ValueError("line confidence must be finite")
+        return self
 
 
 class RawBlock(BaseModel):
@@ -85,12 +92,13 @@ class RawBlock(BaseModel):
 
 
 class RawPage(BaseModel):
-    """Immutable, pre-cleanup page provenance and its native text hierarchy."""
+    """Immutable, pre-cleanup page provenance and raw text hierarchy."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     doc_id: str = Field(min_length=1)
     edition_year: int = Field(ge=1900, le=2100)
+    extraction_source: Literal["native", "ocr"] = "native"
     pdf_page_index: int = Field(ge=1)
     page_label: str | None
     page_width: float = Field(gt=0)
@@ -106,6 +114,12 @@ class RawPage(BaseModel):
             raise ValueError("page label must be a positive decimal string")
         if not _SHA256_RE.fullmatch(self.render_sha256):
             raise ValueError("render SHA-256 must be lowercase hexadecimal")
+        if self.extraction_source == "native" and any(
+            line.confidence != 1.0 or any(span.confidence != 1.0 for span in line.spans)
+            for block in self.raw_blocks
+            for line in block.lines
+        ):
+            raise ValueError("native page confidence must be exactly 1.0")
         return self
 
 

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -12,6 +13,18 @@ from src.ingestion.extract_native import (
     NativeExtractionError,
     extract_document,
     write_document_jsonl,
+)
+from src.ingestion.extract_ocr import (
+    ModelLockError,
+    OcrAdapterError,
+    OcrExtractionError,
+    create_paddle_adapter,
+    download_locked_archive,
+    extract_ocr_document,
+    load_model_lock,
+    prepare_model_staging,
+    validate_installed_models,
+    write_ocr_jsonl,
 )
 from src.ingestion.manifest import (
     ManifestError,
@@ -80,6 +93,29 @@ def _parse_native_years(years: str) -> tuple[int, ...]:
     if len(set(parsed)) != len(parsed):
         raise ValueError("years must not contain duplicates")
     return parsed
+
+
+def _parse_ocr_pages(selection: str) -> tuple[int, ...]:
+    """Parse exact positive pages and inclusive ranges without whitespace or duplicates."""
+    if not selection or re.fullmatch(r"[0-9,-]+", selection) is None:
+        raise ValueError("pages must be positive numbers or inclusive ranges")
+    pages: list[int] = []
+    for part in selection.split(","):
+        if "-" in part:
+            bounds = part.split("-")
+            if len(bounds) != 2 or not all(bound.isdecimal() for bound in bounds):
+                raise ValueError("pages must be positive numbers or inclusive ranges")
+            start, end = (int(bound) for bound in bounds)
+            if start < 1 or end < start:
+                raise ValueError("pages range is invalid")
+            pages.extend(range(start, end + 1))
+        else:
+            if not part.isdecimal() or int(part) < 1:
+                raise ValueError("pages must be positive numbers or inclusive ranges")
+            pages.append(int(part))
+    if not pages or len(set(pages)) != len(pages) or pages != sorted(pages):
+        raise ValueError("pages must be unique and ascending")
+    return tuple(pages)
 
 
 def _resolve_extraction_paths(source_root: Path, output: Path) -> tuple[Path, Path]:
@@ -200,6 +236,123 @@ def extract_native(
         raise typer.Exit(code=1) from error
 
     typer.echo(f"documents={len(selected)} pages={page_count} extracted={extracted} quarantined={quarantined} failed={int(quarantined > 0)}")
+    if quarantined:
+        raise typer.Exit(code=1)
+
+
+@app.command("prepare-ocr-models")
+def prepare_ocr_models(
+    lock_path: Path = typer.Option(  # noqa: B008 - Typer declares CLI parameters this way.
+        Path("config/models.lock.json"), "--lock", exists=True, dir_okay=False, readable=True
+    ),
+    output: Path = typer.Option(..., "--output", file_okay=False),  # noqa: B008
+) -> None:
+    """Build-only preparation of hash-locked official OCR model archives."""
+    try:
+        lock = load_model_lock(lock_path)
+        prepare_model_staging(lock, output, download_locked_archive)
+    except (ModelLockError, OSError) as error:
+        typer.echo(f"models=0 failed=1 error={error}")
+        raise typer.Exit(code=1) from error
+    typer.echo(f"models={len(lock.models)} failed=0")
+
+
+@app.command("validate-ocr-models")
+def validate_ocr_models(
+    lock_path: Path = typer.Option(  # noqa: B008 - Typer declares CLI parameters this way.
+        Path("config/models.lock.json"), "--lock", exists=True, dir_okay=False, readable=True
+    ),
+    model_root: Path = typer.Option(  # noqa: B008
+        Path("/opt/models/paddleocr"), "--model-root", exists=True, file_okay=False, readable=True
+    ),
+) -> None:
+    """Runtime local-byte validation with no download fallback."""
+    try:
+        lock = load_model_lock(lock_path)
+        validate_installed_models(lock, model_root)
+    except ModelLockError as error:
+        typer.echo(f"models=0 failed=1 error={error}")
+        raise typer.Exit(code=1) from error
+    typer.echo(f"models={len(lock.models)} failed=0")
+
+
+@app.command("extract-ocr")
+def extract_ocr(
+    year: int = typer.Option(..., "--year"),
+    pages: str = typer.Option(..., "--pages"),
+    output: Path = typer.Option(..., "--output", file_okay=False),  # noqa: B008
+    manifest: Path = typer.Option(  # noqa: B008
+        Path("data/manifests/sen_qa_sources.json"),
+        "--manifest",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+    ),
+    lock_path: Path = typer.Option(  # noqa: B008
+        Path("config/models.lock.json"), "--lock", exists=True, dir_okay=False, readable=True
+    ),
+    model_root: Path = typer.Option(  # noqa: B008
+        Path("/opt/models/paddleocr"), "--model-root", file_okay=False
+    ),
+) -> None:
+    """Verify and OCR one approved annual PDF using only locked local models."""
+    source_root_value = os.environ.get("SEN_QA_SOURCE_ROOT")
+    if not source_root_value:
+        typer.echo("SEN_QA_SOURCE_ROOT is required")
+        raise typer.Exit(code=2)
+    image_digest = os.environ.get("SEN_QA_INGESTION_IMAGE_DIGEST")
+    if not image_digest:
+        typer.echo("SEN_QA_INGESTION_IMAGE_DIGEST is required")
+        raise typer.Exit(code=2)
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest) is None:
+        typer.echo("SEN_QA_INGESTION_IMAGE_DIGEST must be sha256:<64 lowercase hex>")
+        raise typer.Exit(code=2)
+    try:
+        source_root, output = _resolve_extraction_paths(Path(source_root_value), output)
+        page_indexes = _parse_ocr_pages(pages)
+        documents = load_manifest(manifest)
+    except (ManifestError, NativeExtractionError, ValueError) as error:
+        typer.echo(f"documents=0 pages=0 extracted=0 quarantined=0 failed=1 error={error}")
+        raise typer.Exit(code=2) from error
+    selected = tuple(document for document in documents if document.edition_year == year)
+    if len(selected) != 1 or selected[0].extraction_method != "ocr":
+        typer.echo("documents=0 pages=0 extracted=0 quarantined=0 failed=1 error=year is not approved for OCR")
+        raise typer.Exit(code=2)
+    document = selected[0]
+    if page_indexes[-1] > document.pdf_page_count:
+        typer.echo("documents=0 pages=0 extracted=0 quarantined=0 failed=1 error=pages exceed approved document")
+        raise typer.Exit(code=2)
+    try:
+        source = resolve_source(source_root, document)
+        verify_source(source, document)
+        lock = load_model_lock(lock_path)
+        validate_installed_models(lock, model_root)
+        adapter = create_paddle_adapter(lock, model_root)
+    except (ManifestError, ModelLockError, OcrAdapterError) as error:
+        typer.echo(f"documents=0 pages=0 extracted=0 quarantined=0 failed=1 error={error}")
+        raise typer.Exit(code=1) from error
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    workspace = Path(tempfile.mkdtemp(prefix=f".{output.name}.promotion-", dir=output.parent))
+    staging = workspace / "new-output"
+    staging.mkdir()
+    promotion_started = False
+    try:
+        records = extract_ocr_document(source, document, page_indexes, adapter, image_digest)
+        write_ocr_jsonl(staging / f"{document.doc_id}.jsonl", records)
+        extracted = sum(record.status == "extracted" for record in records)
+        quarantined = sum(record.status == "quarantined" for record in records)
+        promotion_started = True
+        _replace_output_directory(staging, output)
+    except (OcrExtractionError, NativeExtractionError, ValueError, OSError) as error:
+        if not promotion_started:
+            shutil.rmtree(workspace, ignore_errors=True)
+        typer.echo("documents=1 pages=0 extracted=0 quarantined=0 failed=1 error=" + str(error))
+        raise typer.Exit(code=1) from error
+    typer.echo(
+        f"documents=1 pages={len(records)} extracted={extracted} "
+        f"quarantined={quarantined} failed={int(quarantined > 0)}"
+    )
     if quarantined:
         raise typer.Exit(code=1)
 
