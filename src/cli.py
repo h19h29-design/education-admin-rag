@@ -86,6 +86,7 @@ def export_schemas(
     for filename, model in _SCHEMA_MODELS.items():
         schema = model.model_json_schema()
         schema["$id"] = f"data/schemas/{filename}"
+        schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
         rendered = json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         (output / filename).write_text(rendered, encoding="utf-8", newline="\n")
     typer.echo(f"exported={len(_SCHEMA_MODELS)} output={output}")

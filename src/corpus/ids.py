@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 
 _WHITESPACE = re.compile(r"\s+")
 _SAFE_CASE_NO = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
+_RESERVED_DUPLICATE_SUFFIX = re.compile(r"^.+-p[1-9][0-9]*-[0-9a-f]{8}$")
 _HEX_SHA = re.compile(r"^[0-9a-fA-F]+$")
 
 # These source-facing Korean labels are intentionally fixed.  New labels use a
@@ -73,6 +74,8 @@ def _normalize_case_number(case_no: str) -> str:
     normalized = _normalized_text(case_no, label="case number").replace(" ", "-")
     if not _SAFE_CASE_NO.fullmatch(normalized):
         raise ValueError("case number must contain only letters, numbers, and single hyphens")
+    if _RESERVED_DUPLICATE_SUFFIX.fullmatch(normalized.lower()):
+        raise ValueError("case number uses a reserved duplicate suffix")
     if normalized.isdigit():
         return str(int(normalized))
     return normalized.lower()
@@ -97,7 +100,9 @@ def make_case_id(
     )
     if not duplicate:
         return case_id
-    if start_page is None or start_page < 1 or title is None:
+    if isinstance(start_page, bool) or not isinstance(start_page, int) or start_page < 1:
+        raise ValueError("duplicate start page must be a positive integer")
+    if title is None:
         raise ValueError("duplicate case IDs require a valid start page and title")
     try:
         suffix = title_hash(title)

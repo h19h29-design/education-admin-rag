@@ -59,6 +59,34 @@ def test_duplicate_case_requires_valid_collision_inputs(page: int, title: str) -
         make_case_id(2025, "계약", "계약 일반", "1", page, title, duplicate=True)
 
 
+def test_case_number_cannot_alias_a_duplicate_collision_suffix() -> None:
+    """Catches a base case number producing the exact ID reserved for a duplicate."""
+    title = "2단계 입찰"
+    reserved_case_no = f"1-p13-{title_hash(title)}"
+    duplicate_id = make_case_id(
+        2025, "계약", "계약 일반", "1", 13, title, duplicate=True
+    )
+    assert duplicate_id == f"senqa-2025-contract-contract-general-{reserved_case_no}"
+
+    with pytest.raises(ValueError, match="reserved duplicate suffix"):
+        make_case_id(2025, "계약", "계약 일반", reserved_case_no)
+
+
+@pytest.mark.parametrize("start_page", [True, 1.0, "1"])
+def test_duplicate_start_page_requires_a_real_positive_integer(start_page: object) -> None:
+    """Catches bool, float, or string pages producing ambiguous duplicate IDs."""
+    with pytest.raises(ValueError, match="positive integer"):
+        make_case_id(
+            2025,
+            "계약",
+            "계약 일반",
+            "1",
+            start_page,  # type: ignore[arg-type]
+            "2단계 입찰",
+            duplicate=True,
+        )
+
+
 def test_retired_case_id_is_never_reissued() -> None:
     """Catches a tombstoned canonical ID being reintroduced after retirement."""
     registry = IssuedIdRegistry.in_memory()

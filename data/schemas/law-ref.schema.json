@@ -1,6 +1,7 @@
 {
   "$defs": {
     "SourceSpan": {
+      "$comment": "Runtime canonical validation is required because JSON Schema cannot compare bbox coordinates to enforce x0 < x1 and y0 < y1.",
       "additionalProperties": false,
       "description": "A locatable fragment in an original PDF page.",
       "properties": {
@@ -57,6 +58,7 @@
     }
   },
   "$id": "data/schemas/law-ref.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "A law or guidance citation preserved exactly as the source document printed it.",
   "properties": {
@@ -101,6 +103,16 @@
       ],
       "default": null,
       "title": "Cited Effective Date"
+    },
+    "currency_status": {
+      "enum": [
+        "unverified",
+        "current",
+        "historical_reference",
+        "superseded"
+      ],
+      "title": "Currency Status",
+      "type": "string"
     },
     "display_name": {
       "minLength": 1,
@@ -169,6 +181,7 @@
     "quote",
     "source_span",
     "parsing_confidence",
+    "currency_status",
     "review_status"
   ],
   "title": "LawRef",

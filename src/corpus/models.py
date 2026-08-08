@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, date, datetime
-from typing import Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, model_validator
 
@@ -14,16 +14,119 @@ ReviewStatus: TypeAlias = Literal[
 PiiClass: TypeAlias = Literal[
     "none", "anonymized_case", "quasi_identifier", "public_credit", "restricted"
 ]
+CurrencyStatus: TypeAlias = Literal[
+    "unverified", "current", "historical_reference", "superseded"
+]
+
+_SAFE_PII_CLASSES = ["none", "anonymized_case", "quasi_identifier"]
+_UNSAFE_REVIEW_STATUSES = ["machine_extracted", "needs_review", "rejected"]
+_FALSE_ELIGIBILITY = {
+    "properties": {
+        "search_eligible": {"const": False},
+        "answer_eligible": {"const": False},
+    }
+}
+
+
+def _add_case_schema_invariants(schema: dict[str, Any]) -> None:
+    """Add standard JSON Schema conditionals equivalent to Case eligibility policy."""
+    schema["allOf"] = [
+        {
+            "if": {
+                "properties": {"case_type": {"const": "credits"}},
+                "required": ["case_type"],
+            },
+            "then": _FALSE_ELIGIBILITY,
+        },
+        {
+            "if": {
+                "properties": {
+                    "pii_class": {"enum": ["public_credit", "restricted"]}
+                },
+                "required": ["pii_class"],
+            },
+            "then": _FALSE_ELIGIBILITY,
+        },
+        {
+            "if": {
+                "properties": {
+                    "case_type": {"not": {"const": "credits"}},
+                    "pii_class": {"enum": _SAFE_PII_CLASSES},
+                    "review_status": {"enum": _UNSAFE_REVIEW_STATUSES},
+                },
+                "required": ["case_type", "pii_class", "review_status"],
+            },
+            "then": _FALSE_ELIGIBILITY,
+        },
+        {
+            "if": {
+                "properties": {
+                    "case_type": {"not": {"const": "credits"}},
+                    "pii_class": {"enum": _SAFE_PII_CLASSES},
+                    "review_status": {"const": "search_approved"},
+                },
+                "required": ["case_type", "pii_class", "review_status"],
+            },
+            "then": {
+                "properties": {
+                    "search_eligible": {"const": True},
+                    "answer_eligible": {"const": False},
+                }
+            },
+        },
+        {
+            "if": {
+                "properties": {
+                    "case_type": {"not": {"const": "credits"}},
+                    "pii_class": {"enum": _SAFE_PII_CLASSES},
+                    "review_status": {"const": "approved"},
+                },
+                "required": ["case_type", "pii_class", "review_status"],
+            },
+            "then": {"properties": {"search_eligible": {"const": True}}},
+        },
+    ]
+
+
+def _add_chunk_schema_invariants(schema: dict[str, Any]) -> None:
+    """Add standard JSON Schema conditionals equivalent to Chunk privacy policy."""
+    schema["allOf"] = [
+        {
+            "if": {
+                "properties": {
+                    "pii_class": {"enum": ["public_credit", "restricted"]}
+                },
+                "required": ["pii_class"],
+            },
+            "then": _FALSE_ELIGIBILITY,
+        },
+        {
+            "if": {
+                "properties": {"answer_eligible": {"const": True}},
+                "required": ["answer_eligible"],
+            },
+            "then": {"properties": {"search_eligible": {"const": True}}},
+        },
+    ]
 
 
 class CanonicalModel(BaseModel):
     """Base class that rejects data not explicitly covered by a reviewed contract."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
 
 class SourceSpan(CanonicalModel):
     """A locatable fragment in an original PDF page."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "$comment": (
+                "Runtime canonical validation is required because JSON Schema cannot compare "
+                "bbox coordinates to enforce x0 < x1 and y0 < y1."
+            )
+        }
+    )
 
     pdf_page_index: int = Field(ge=1)
     page_label: str | None = None
@@ -42,6 +145,15 @@ class SourceSpan(CanonicalModel):
 
 class Document(CanonicalModel):
     """A verified source document and the policy required to use it safely."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "$comment": (
+                "Runtime canonical validation is required because JSON Schema cannot compare "
+                "source_period_start and source_period_end."
+            )
+        }
+    )
 
     doc_id: str = Field(min_length=1)
     edition_year: int = Field(ge=1900, le=2100)
@@ -75,6 +187,8 @@ class Document(CanonicalModel):
 class Case(CanonicalModel):
     """One independently citable question-answer, audit, law-index, or credits record."""
 
+    model_config = ConfigDict(json_schema_extra=_add_case_schema_invariants)
+
     case_id: str = Field(min_length=1)
     legacy_ids: tuple[str, ...] = ()
     doc_id: str = Field(min_length=1)
@@ -96,7 +210,7 @@ class Case(CanonicalModel):
     critical_field_review: str = Field(min_length=1)
     pii_class: PiiClass
     anonymization_status: str = Field(min_length=1)
-    currency_status: str = Field(min_length=1)
+    currency_status: CurrencyStatus
     search_eligible: bool
     answer_eligible: bool
     review_status: ReviewStatus
@@ -104,7 +218,10 @@ class Case(CanonicalModel):
     @model_validator(mode="after")
     def eligibility_matches_review_and_privacy(self) -> Case:
         reason: str
-        if self.pii_class in {"public_credit", "restricted"}:
+        if self.case_type == "credits":
+            expected = (False, False)
+            reason = "credits"
+        elif self.pii_class in {"public_credit", "restricted"}:
             expected = (False, False)
             reason = self.pii_class
         elif self.review_status in {"machine_extracted", "needs_review", "rejected"}:
@@ -130,15 +247,20 @@ class Case(CanonicalModel):
 class Chunk(CanonicalModel):
     """A retrievable child of a single canonical case."""
 
+    model_config = ConfigDict(json_schema_extra=_add_chunk_schema_invariants)
+
     chunk_id: str = Field(min_length=1)
     case_id: str = Field(min_length=1)
     role: Literal["question", "answer", "basis", "facts", "table"]
     sequence: int = Field(ge=1)
     text: str = Field(min_length=1)
     embedding_text: str = Field(min_length=1)
-    source_span_indexes: tuple[int, ...] = Field(min_length=1)
+    source_span_indexes: tuple[int, ...] = Field(
+        min_length=1, json_schema_extra={"uniqueItems": True}
+    )
     token_count: int = Field(ge=0)
     quality_flags: tuple[str, ...] = ()
+    pii_class: PiiClass
     search_eligible: bool
     answer_eligible: bool
 
@@ -148,6 +270,10 @@ class Chunk(CanonicalModel):
             set(self.source_span_indexes)
         ) != len(self.source_span_indexes):
             raise ValueError("source span indexes must be unique non-negative indexes")
+        if self.pii_class in {"public_credit", "restricted"} and (
+            self.search_eligible or self.answer_eligible
+        ):
+            raise ValueError(f"eligibility violates {self.pii_class} policy")
         if self.answer_eligible and not self.search_eligible:
             raise ValueError("answer eligibility requires search eligibility")
         return self
@@ -167,18 +293,28 @@ class LawRef(CanonicalModel):
     quote: str = Field(min_length=1)
     source_span: SourceSpan
     parsing_confidence: float = Field(ge=0, le=1)
+    currency_status: CurrencyStatus
     review_status: ReviewStatus
 
 
 class CaseRelation(CanonicalModel):
     """A reviewed relationship between two distinct canonical cases."""
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "$comment": (
+                "Runtime canonical validation is required because JSON Schema cannot compare "
+                "source_case_id and target_case_id to reject self-relations."
+            )
+        }
+    )
+
     relation_id: str = Field(min_length=1)
     source_case_id: str = Field(min_length=1)
     target_case_id: str = Field(min_length=1)
     relation_type: Literal["related", "duplicate", "supersedes", "conflicts"]
     confidence: float = Field(ge=0, le=1)
-    review_status: str = Field(min_length=1)
+    review_status: ReviewStatus
 
     @model_validator(mode="after")
     def relates_distinct_cases(self) -> CaseRelation:

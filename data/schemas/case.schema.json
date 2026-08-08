@@ -1,6 +1,7 @@
 {
   "$defs": {
     "SourceSpan": {
+      "$comment": "Runtime canonical validation is required because JSON Schema cannot compare bbox coordinates to enforce x0 < x1 and y0 < y1.",
       "additionalProperties": false,
       "description": "A locatable fragment in an original PDF page.",
       "properties": {
@@ -57,7 +58,166 @@
     }
   },
   "$id": "data/schemas/case.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "case_type": {
+            "const": "credits"
+          }
+        },
+        "required": [
+          "case_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "answer_eligible": {
+            "const": false
+          },
+          "search_eligible": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "pii_class": {
+            "enum": [
+              "public_credit",
+              "restricted"
+            ]
+          }
+        },
+        "required": [
+          "pii_class"
+        ]
+      },
+      "then": {
+        "properties": {
+          "answer_eligible": {
+            "const": false
+          },
+          "search_eligible": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "case_type": {
+            "not": {
+              "const": "credits"
+            }
+          },
+          "pii_class": {
+            "enum": [
+              "none",
+              "anonymized_case",
+              "quasi_identifier"
+            ]
+          },
+          "review_status": {
+            "enum": [
+              "machine_extracted",
+              "needs_review",
+              "rejected"
+            ]
+          }
+        },
+        "required": [
+          "case_type",
+          "pii_class",
+          "review_status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "answer_eligible": {
+            "const": false
+          },
+          "search_eligible": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "case_type": {
+            "not": {
+              "const": "credits"
+            }
+          },
+          "pii_class": {
+            "enum": [
+              "none",
+              "anonymized_case",
+              "quasi_identifier"
+            ]
+          },
+          "review_status": {
+            "const": "search_approved"
+          }
+        },
+        "required": [
+          "case_type",
+          "pii_class",
+          "review_status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "answer_eligible": {
+            "const": false
+          },
+          "search_eligible": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "case_type": {
+            "not": {
+              "const": "credits"
+            }
+          },
+          "pii_class": {
+            "enum": [
+              "none",
+              "anonymized_case",
+              "quasi_identifier"
+            ]
+          },
+          "review_status": {
+            "const": "approved"
+          }
+        },
+        "required": [
+          "case_type",
+          "pii_class",
+          "review_status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "search_eligible": {
+            "const": true
+          }
+        }
+      }
+    }
+  ],
   "description": "One independently citable question-answer, audit, law-index, or credits record.",
   "properties": {
     "anonymization_status": {
@@ -119,7 +279,12 @@
       "type": "string"
     },
     "currency_status": {
-      "minLength": 1,
+      "enum": [
+        "unverified",
+        "current",
+        "historical_reference",
+        "superseded"
+      ],
       "title": "Currency Status",
       "type": "string"
     },

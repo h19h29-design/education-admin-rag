@@ -1,5 +1,7 @@
 {
+  "$comment": "Runtime canonical validation is required because JSON Schema cannot compare source_period_start and source_period_end.",
   "$id": "data/schemas/document.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "A verified source document and the policy required to use it safely.",
   "properties": {

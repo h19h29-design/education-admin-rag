@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from datetime import UTC, date, datetime, timedelta, timezone
+from itertools import product
 from pathlib import Path
 
 import jsonschema
@@ -28,16 +29,88 @@ def _span() -> dict[str, object]:
     return {
         "pdf_page_index": 13,
         "page_label": "13",
-        "bbox": [126.0, 341.0, 1064.0, 1498.0],
+        "bbox": (126.0, 341.0, 1064.0, 1498.0),
         "text_sha256": "a" * 64,
     }
+
+
+def _law_ref_payload(**updates: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "law_ref_id": "lawref-2025-000001",
+        "case_id": "senqa-2025-contract-contract-general-1",
+        "display_name": "지방계약법",
+        "abbreviation": None,
+        "article": "제13조",
+        "paragraph": None,
+        "item": None,
+        "cited_effective_date": None,
+        "quote": "관련 규정",
+        "source_span": _span(),
+        "parsing_confidence": 0.9,
+        "currency_status": "historical_reference",
+        "review_status": "needs_review",
+    }
+    payload.update(updates)
+    return payload
+
+
+def _document_payload(**updates: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "doc_id": "sen-qa-2025-v1",
+        "edition_year": 2025,
+        "title": "2025년 교육행정지원시스템 질문·답변 사례집",
+        "publisher": "서울특별시교육청",
+        "registration_no": "서울교육 2025-109",
+        "source_period_start": date(2024, 7, 1),
+        "source_period_end": date(2025, 6, 30),
+        "source_filename": "2025-questions-answers.pdf",
+        "sha256": "b" * 64,
+        "pdf_page_count": 314,
+        "extraction_method": "ocr",
+        "source_dpi": 300,
+        "public_url": None,
+        "redistribution_status": "unverified",
+        "access_level": "staff",
+        "page_numbering_rule": "body_same_as_pdf",
+        "ingestion_version": "corpus-v1",
+    }
+    payload.update(updates)
+    return payload
+
+
+def _ingestion_run_payload(**updates: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "run_id": "run-20250808-001",
+        "release_id": "corpus-20250808120000-deadbeef",
+        "started_at": datetime(2025, 8, 8, 12, 0, tzinfo=UTC),
+        "ended_at": datetime(2025, 8, 8, 12, 1, tzinfo=UTC),
+        "manifest_version": "manifest-v1",
+        "source_sha256s": ("c" * 64,),
+        "extractor_version": "extract-v1",
+        "ocr_engine_version": "paddle-1",
+        "ocr_model_version": "korean-v1",
+        "container_image": "sha256:" + "d" * 64,
+        "normalizer_version": "normalizer-v1",
+        "parser_version": "parser-v1",
+        "schema_version": "schema-v1",
+        "document_page_counts": {
+            "sen-qa-2025-v1": {"succeeded": 314, "quarantined": 0, "failed": 0}
+        },
+        "created_case_ids": (),
+        "changed_case_ids": (),
+        "deleted_case_ids": (),
+        "quality_metrics": {"coverage": 1.0},
+        "approved_by": None,
+    }
+    payload.update(updates)
+    return payload
 
 
 @pytest.fixture
 def case_payload() -> dict[str, object]:
     return {
         "case_id": "senqa-2025-contract-contract-general-1",
-        "legacy_ids": ["CT-001"],
+        "legacy_ids": ("CT-001",),
         "doc_id": "sen-qa-2025-v1",
         "case_type": "qa",
         "domain": "계약",
@@ -50,8 +123,8 @@ def case_payload() -> dict[str, object]:
         "answer": "정규화된 답변 본문",
         "facts": None,
         "basis_text": "근거와 참고자료 본문",
-        "law_ref_ids": ["lawref-2025-000001"],
-        "source_spans": [_span()],
+        "law_ref_ids": ("lawref-2025-000001",),
+        "source_spans": (_span(),),
         "extraction_source": "ocr",
         "extraction_confidence": 0.98,
         "critical_field_review": "verified",
@@ -64,54 +137,73 @@ def case_payload() -> dict[str, object]:
     }
 
 
-@pytest.mark.parametrize(
-    ("review_status", "pii_class", "search_eligible", "answer_eligible", "valid"),
-    [
-        ("machine_extracted", "none", False, False, True),
-        ("machine_extracted", "none", True, False, False),
-        ("needs_review", "anonymized_case", False, False, True),
-        ("needs_review", "anonymized_case", False, True, False),
-        ("rejected", "quasi_identifier", False, False, True),
-        ("rejected", "quasi_identifier", True, True, False),
-        ("search_approved", "none", True, False, True),
-        ("search_approved", "none", True, True, False),
-        ("search_approved", "none", False, False, False),
-        ("approved", "none", True, False, True),
-        ("approved", "anonymized_case", True, True, True),
-        ("approved", "quasi_identifier", True, True, True),
-        ("approved", "none", False, False, False),
-        ("approved", "public_credit", False, False, True),
-        ("approved", "public_credit", True, False, False),
-        ("search_approved", "public_credit", False, False, True),
-        ("search_approved", "public_credit", True, False, False),
-        ("machine_extracted", "restricted", False, False, True),
-        ("machine_extracted", "restricted", False, True, False),
-    ],
+_REVIEW_STATUSES = (
+    "machine_extracted",
+    "needs_review",
+    "search_approved",
+    "approved",
+    "rejected",
 )
-def test_case_eligibility_truth_table(
-    case_payload: dict[str, object],
+_PII_CLASSES = (
+    "none",
+    "anonymized_case",
+    "quasi_identifier",
+    "public_credit",
+    "restricted",
+)
+
+
+def _case_eligibility_is_valid(
+    case_type: str,
     review_status: str,
     pii_class: str,
     search_eligible: bool,
     answer_eligible: bool,
-    valid: bool,
+) -> bool:
+    if (
+        case_type == "credits"
+        or pii_class in {"public_credit", "restricted"}
+        or review_status in {"machine_extracted", "needs_review", "rejected"}
+    ):
+        valid_flags = {(False, False)}
+    elif review_status == "search_approved":
+        valid_flags = {(True, False)}
+    else:
+        valid_flags = {(True, False), (True, True)}
+    return (search_eligible, answer_eligible) in valid_flags
+
+
+@pytest.mark.parametrize(
+    ("case_type", "review_status", "pii_class", "search_eligible", "answer_eligible"),
+    list(product(("qa", "credits"), _REVIEW_STATUSES, _PII_CLASSES, (False, True), (False, True))),
+)
+def test_case_eligibility_truth_table(
+    case_payload: dict[str, object],
+    case_type: str,
+    review_status: str,
+    pii_class: str,
+    search_eligible: bool,
+    answer_eligible: bool,
 ) -> None:
-    """Catches any review or PII branch that leaks a case into an index."""
+    """Catches any credits, review, or PII branch that leaks a case into an index."""
     case_payload.update(
+        case_type=case_type,
         review_status=review_status,
         pii_class=pii_class,
         search_eligible=search_eligible,
         answer_eligible=answer_eligible,
     )
 
-    if valid:
+    if _case_eligibility_is_valid(
+        case_type, review_status, pii_class, search_eligible, answer_eligible
+    ):
         case = Case.model_validate(case_payload)
         assert (case.search_eligible, case.answer_eligible) == (
             search_eligible,
             answer_eligible,
         )
     else:
-        with pytest.raises(ValidationError, match="eligibility|public_credit|restricted"):
+        with pytest.raises(ValidationError, match="eligibility|public_credit|restricted|credits"):
             Case.model_validate(case_payload)
 
 
@@ -131,8 +223,8 @@ def test_case_forbids_unknown_fields(case_payload: dict[str, object], field: str
     [
         ({"pdf_page_index": 0}, "greater than or equal to 1"),
         ({"text_sha256": "A" * 64}, "pattern"),
-        ({"bbox": [0.0, 1.0, 0.0, 2.0]}, "ordered"),
-        ({"bbox": [0.0, math.nan, 1.0, 2.0]}, "finite"),
+        ({"bbox": (0.0, 1.0, 0.0, 2.0)}, "ordered"),
+        ({"bbox": (0.0, math.nan, 1.0, 2.0)}, "finite"),
     ],
 )
 def test_source_span_rejects_invalid_citation_geometry(
@@ -148,7 +240,7 @@ def test_source_span_rejects_invalid_citation_geometry(
 def test_source_span_requires_exactly_four_coordinates() -> None:
     """Catches incomplete citation rectangles that cannot locate source text."""
     payload = _span()
-    payload["bbox"] = [0.0, 1.0, 2.0]
+    payload["bbox"] = (0.0, 1.0, 2.0)
     with pytest.raises(ValidationError):
         SourceSpan.model_validate(payload)
 
@@ -157,25 +249,10 @@ def test_document_rejects_reversed_source_period() -> None:
     """Catches a document recording an impossible source coverage period."""
     with pytest.raises(ValidationError, match="source period end"):
         Document.model_validate(
-            {
-                "doc_id": "sen-qa-2025-v1",
-                "edition_year": 2025,
-                "title": "2025년 교육행정지원시스템 질문·답변 사례집",
-                "publisher": "서울특별시교육청",
-                "registration_no": "서울교육 2025-109",
-                "source_period_start": date(2025, 7, 1),
-                "source_period_end": date(2025, 6, 30),
-                "source_filename": "2025-questions-answers.pdf",
-                "sha256": "b" * 64,
-                "pdf_page_count": 314,
-                "extraction_method": "ocr",
-                "source_dpi": 300,
-                "public_url": None,
-                "redistribution_status": "unverified",
-                "access_level": "staff",
-                "page_numbering_rule": "body_same_as_pdf",
-                "ingestion_version": "corpus-v1",
-            }
+            _document_payload(
+                source_period_start=date(2025, 7, 1),
+                source_period_end=date(2025, 6, 30),
+            )
         )
 
 
@@ -190,17 +267,53 @@ def test_chunk_requires_parent_case_eligibility_shape() -> None:
                 "sequence": 1,
                 "text": "답변",
                 "embedding_text": "답변",
-                "source_span_indexes": [0],
+                "source_span_indexes": (0,),
                 "token_count": 1,
-                "quality_flags": [],
+                "quality_flags": (),
+                "pii_class": "none",
                 "search_eligible": False,
                 "answer_eligible": True,
             }
         )
 
 
-@pytest.mark.parametrize("indexes", [[-1], [0, 0]])
-def test_chunk_rejects_impossible_local_span_indexes(indexes: list[int]) -> None:
+@pytest.mark.parametrize(
+    ("pii_class", "search_eligible", "answer_eligible"),
+    list(product(_PII_CLASSES, (False, True), (False, True))),
+)
+def test_chunk_privacy_and_eligibility_truth_table(
+    pii_class: str, search_eligible: bool, answer_eligible: bool
+) -> None:
+    """Catches a sensitive chunk entering search or answer context."""
+    payload = {
+        "chunk_id": "senqa-2025-contract-contract-general-1-answer-01",
+        "case_id": "senqa-2025-contract-contract-general-1",
+        "role": "answer",
+        "sequence": 1,
+        "text": "답변",
+        "embedding_text": "답변",
+        "source_span_indexes": (0,),
+        "token_count": 1,
+        "quality_flags": (),
+        "pii_class": pii_class,
+        "search_eligible": search_eligible,
+        "answer_eligible": answer_eligible,
+    }
+    if pii_class in {"public_credit", "restricted"}:
+        valid = (search_eligible, answer_eligible) == (False, False)
+    else:
+        valid = not answer_eligible or search_eligible
+
+    if valid:
+        chunk = Chunk.model_validate(payload)
+        assert chunk.pii_class == pii_class
+    else:
+        with pytest.raises(ValidationError, match="eligibility|public_credit|restricted"):
+            Chunk.model_validate(payload)
+
+
+@pytest.mark.parametrize("indexes", [(-1,), (0, 0)])
+def test_chunk_rejects_impossible_local_span_indexes(indexes: tuple[int, ...]) -> None:
     """Catches a chunk pointing at a negative or duplicate parent source span."""
     payload = {
         "chunk_id": "senqa-2025-contract-contract-general-1-question-01",
@@ -211,7 +324,8 @@ def test_chunk_rejects_impossible_local_span_indexes(indexes: list[int]) -> None
         "embedding_text": "질문",
         "source_span_indexes": indexes,
         "token_count": 1,
-        "quality_flags": [],
+        "quality_flags": (),
+        "pii_class": "none",
         "search_eligible": True,
         "answer_eligible": False,
     }
@@ -234,56 +348,132 @@ def test_relation_rejects_a_case_relating_to_itself() -> None:
         )
 
 
+def test_relation_rejects_review_state_outside_canonical_vocabulary() -> None:
+    """Catches a relation bypassing the canonical review-state machine."""
+    with pytest.raises(ValidationError, match="review_status"):
+        CaseRelation.model_validate(
+            {
+                "relation_id": "rel-1",
+                "source_case_id": "senqa-2025-contract-contract-general-1",
+                "target_case_id": "senqa-2024-contract-contract-general-1",
+                "relation_type": "related",
+                "confidence": 0.9,
+                "review_status": "verified",
+            }
+        )
+
+
 @pytest.mark.parametrize("confidence", [-0.01, 1.01])
 def test_confidences_are_bounded(confidence: float) -> None:
     """Catches confidence values that cannot be interpreted as probabilities."""
-    payload = {
-        "law_ref_id": "lawref-2025-000001",
-        "case_id": "senqa-2025-contract-contract-general-1",
-        "display_name": "지방계약법",
-        "abbreviation": None,
-        "article": "제13조",
-        "paragraph": None,
-        "item": None,
-        "cited_effective_date": None,
-        "quote": "관련 규정",
-        "source_span": _span(),
-        "parsing_confidence": confidence,
-        "review_status": "needs_review",
-    }
+    payload = _law_ref_payload(parsing_confidence=confidence)
     with pytest.raises(ValidationError):
         LawRef.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    ("currency_status", "valid"),
+    [
+        ("unverified", True),
+        ("current", True),
+        ("historical_reference", True),
+        ("superseded", True),
+        ("latest", False),
+    ],
+)
+def test_law_ref_retains_only_reviewed_currency_statuses(
+    currency_status: str, valid: bool
+) -> None:
+    """Catches loss or uncontrolled values in per-citation latestness review."""
+    payload = _law_ref_payload(currency_status=currency_status)
+    if valid:
+        assert LawRef.model_validate(payload).currency_status == currency_status
+    else:
+        with pytest.raises(ValidationError, match="currency_status"):
+            LawRef.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("currency_status", "valid"),
+    [
+        ("unverified", True),
+        ("current", True),
+        ("historical_reference", True),
+        ("superseded", True),
+        ("latest", False),
+    ],
+)
+def test_case_uses_same_reviewed_currency_vocabulary(
+    case_payload: dict[str, object], currency_status: str, valid: bool
+) -> None:
+    """Catches case-level and citation-level currency vocabulary divergence."""
+    case_payload["currency_status"] = currency_status
+    if valid:
+        assert Case.model_validate(case_payload).currency_status == currency_status
+    else:
+        with pytest.raises(ValidationError, match="currency_status"):
+            Case.model_validate(case_payload)
+
+
 def test_ingestion_run_rejects_non_utc_or_reversed_times() -> None:
     """Catches release audit records with ambiguous or backwards timestamps."""
-    base = {
-        "run_id": "run-20250808-001",
-        "release_id": "corpus-20250808120000-deadbeef",
-        "started_at": datetime(2025, 8, 8, 12, 0, tzinfo=UTC),
-        "ended_at": datetime(2025, 8, 8, 12, 1, tzinfo=UTC),
-        "manifest_version": "manifest-v1",
-        "source_sha256s": ["c" * 64],
-        "extractor_version": "extract-v1",
-        "ocr_engine_version": "paddle-1",
-        "ocr_model_version": "korean-v1",
-        "container_image": "sha256:" + "d" * 64,
-        "normalizer_version": "normalizer-v1",
-        "parser_version": "parser-v1",
-        "schema_version": "schema-v1",
-        "document_page_counts": {"sen-qa-2025-v1": {"succeeded": 314, "quarantined": 0, "failed": 0}},
-        "created_case_ids": [],
-        "changed_case_ids": [],
-        "deleted_case_ids": [],
-        "quality_metrics": {"coverage": 1.0},
-        "approved_by": None,
-    }
-    non_utc = dict(base, started_at=datetime(2025, 8, 8, 21, 0, tzinfo=timezone(timedelta(hours=9))))
+    base = _ingestion_run_payload()
+    non_utc = dict(
+        base,
+        started_at=datetime(2025, 8, 8, 21, 0, tzinfo=timezone(timedelta(hours=9))),
+    )
     with pytest.raises(ValidationError, match="UTC"):
         IngestionRun.model_validate(non_utc)
     reversed_times = dict(base, ended_at=datetime(2025, 8, 8, 11, 59, tzinfo=UTC))
     with pytest.raises(ValidationError, match="must not precede"):
         IngestionRun.model_validate(reversed_times)
+
+
+def test_canonical_models_reject_python_scalar_coercion(
+    case_payload: dict[str, object]
+) -> None:
+    """Catches booleans, integers, or strings being coerced across canonical scalar types."""
+    bool_page = _span()
+    bool_page["pdf_page_index"] = True
+    with pytest.raises(ValidationError, match="pdf_page_index"):
+        SourceSpan.model_validate(bool_page)
+
+    case_payload["search_eligible"] = 1
+    with pytest.raises(ValidationError, match="search_eligible"):
+        Case.model_validate(case_payload)
+
+    with pytest.raises(ValidationError, match="parsing_confidence"):
+        LawRef.model_validate(_law_ref_payload(parsing_confidence="0.9"))
+
+
+@pytest.mark.parametrize("metric", [math.nan, math.inf, -math.inf])
+def test_ingestion_run_rejects_nonfinite_quality_metric(metric: float) -> None:
+    """Catches a non-JSON quality metric entering release audit metadata."""
+    with pytest.raises(ValidationError, match="quality_metrics"):
+        IngestionRun.model_validate(
+            _ingestion_run_payload(quality_metrics={"coverage": metric})
+        )
+
+
+def test_strict_models_accept_iso_dates_and_datetimes_in_json_mode() -> None:
+    """Catches strict Python validation accidentally breaking the JSON interchange contract."""
+    document_json = json.dumps(
+        {
+            **_document_payload(),
+            "source_period_start": "2024-07-01",
+            "source_period_end": "2025-06-30",
+        }
+    )
+    assert Document.model_validate_json(document_json).source_period_start == date(2024, 7, 1)
+
+    ingestion_json = json.dumps(
+        {
+            **_ingestion_run_payload(),
+            "started_at": "2025-08-08T12:00:00Z",
+            "ended_at": "2025-08-08T12:01:00Z",
+        }
+    )
+    assert IngestionRun.model_validate_json(ingestion_json).started_at.tzinfo is not None
 
 
 def test_exported_schemas_are_deterministic_and_validate_payloads(
@@ -308,6 +498,7 @@ def test_exported_schemas_are_deterministic_and_validate_payloads(
     for name, contents in first.items():
         schema = json.loads(contents)
         assert schema["$id"] == f"data/schemas/{name}"
+        assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
         jsonschema.Draft202012Validator.check_schema(schema)
 
     case_schema = json.loads(first["case.schema.json"])
@@ -316,6 +507,195 @@ def test_exported_schemas_are_deterministic_and_validate_payloads(
     invalid = dict(valid, unknown=True)
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.Draft202012Validator(case_schema).validate(invalid)
+
+
+def test_exported_case_schema_enforces_the_full_eligibility_table(tmp_path: Path) -> None:
+    """Catches a JSONL consumer accepting a Case rejected by canonical validation."""
+    output = tmp_path / "schemas"
+    assert CliRunner().invoke(app, ["export-schemas", "--output", str(output)]).exit_code == 0
+    schema = json.loads((output / "case.schema.json").read_text(encoding="utf-8"))
+    validator = jsonschema.Draft202012Validator(schema)
+    base = Case.model_validate(
+        {
+            "case_id": "senqa-2025-contract-contract-general-1",
+            "legacy_ids": ("CT-001",),
+            "doc_id": "sen-qa-2025-v1",
+            "case_type": "qa",
+            "domain": "계약",
+            "part": "계약 일반",
+            "subtopic": "계약방법 및 체결",
+            "case_no": "1",
+            "title_raw": "2단계 입찰",
+            "title_normalized": "2단계 입찰",
+            "question": "질문",
+            "answer": "답변",
+            "facts": None,
+            "basis_text": "근거",
+            "law_ref_ids": (),
+            "source_spans": (_span(),),
+            "extraction_source": "ocr",
+            "extraction_confidence": 0.98,
+            "critical_field_review": "verified",
+            "pii_class": "none",
+            "anonymization_status": "not_required",
+            "currency_status": "historical_reference",
+            "search_eligible": True,
+            "answer_eligible": True,
+            "review_status": "approved",
+        }
+    ).model_dump(mode="json")
+
+    for case_type, review_status, pii_class, search_eligible, answer_eligible in product(
+        ("qa", "credits"), _REVIEW_STATUSES, _PII_CLASSES, (False, True), (False, True)
+    ):
+        payload = {
+            **base,
+            "case_type": case_type,
+            "review_status": review_status,
+            "pii_class": pii_class,
+            "search_eligible": search_eligible,
+            "answer_eligible": answer_eligible,
+        }
+        assert validator.is_valid(payload) is _case_eligibility_is_valid(
+            case_type, review_status, pii_class, search_eligible, answer_eligible
+        )
+
+
+def test_exported_chunk_schema_enforces_privacy_and_answer_dependency(tmp_path: Path) -> None:
+    """Catches a JSONL consumer accepting a sensitive or answer-only Chunk."""
+    output = tmp_path / "schemas"
+    assert CliRunner().invoke(app, ["export-schemas", "--output", str(output)]).exit_code == 0
+    schema = json.loads((output / "chunk.schema.json").read_text(encoding="utf-8"))
+    validator = jsonschema.Draft202012Validator(schema)
+    base = {
+        "chunk_id": "senqa-2025-contract-contract-general-1-answer-01",
+        "case_id": "senqa-2025-contract-contract-general-1",
+        "role": "answer",
+        "sequence": 1,
+        "text": "답변",
+        "embedding_text": "답변",
+        "source_span_indexes": [0],
+        "token_count": 1,
+        "quality_flags": [],
+        "pii_class": "none",
+        "search_eligible": True,
+        "answer_eligible": True,
+    }
+    for pii_class, search_eligible, answer_eligible in product(
+        _PII_CLASSES, (False, True), (False, True)
+    ):
+        payload = {
+            **base,
+            "pii_class": pii_class,
+            "search_eligible": search_eligible,
+            "answer_eligible": answer_eligible,
+        }
+        if pii_class in {"public_credit", "restricted"}:
+            expected = (search_eligible, answer_eligible) == (False, False)
+        else:
+            expected = not answer_eligible or search_eligible
+        assert validator.is_valid(payload) is expected
+    assert schema["properties"]["source_span_indexes"]["uniqueItems"] is True
+
+
+def test_exported_enum_schemas_reject_unreviewed_states(tmp_path: Path) -> None:
+    """Catches schema consumers accepting unreviewed relation or currency states."""
+    output = tmp_path / "schemas"
+    assert CliRunner().invoke(app, ["export-schemas", "--output", str(output)]).exit_code == 0
+    relation_schema = json.loads(
+        (output / "case-relation.schema.json").read_text(encoding="utf-8")
+    )
+    relation = {
+        "relation_id": "rel-1",
+        "source_case_id": "senqa-2025-contract-contract-general-1",
+        "target_case_id": "senqa-2024-contract-contract-general-1",
+        "relation_type": "related",
+        "confidence": 0.9,
+        "review_status": "verified",
+    }
+    assert not jsonschema.Draft202012Validator(relation_schema).is_valid(relation)
+
+    law_schema = json.loads((output / "law-ref.schema.json").read_text(encoding="utf-8"))
+    law_ref = LawRef.model_validate(_law_ref_payload()).model_dump(mode="json")
+    law_ref["currency_status"] = "latest"
+    assert not jsonschema.Draft202012Validator(law_schema).is_valid(law_ref)
+
+
+def test_runtime_only_schema_annotations_state_the_true_boundary(tmp_path: Path) -> None:
+    """Catches relational runtime checks being mislabeled as JSON Schema enforcement."""
+    output = tmp_path / "schemas"
+    assert CliRunner().invoke(app, ["export-schemas", "--output", str(output)]).exit_code == 0
+    case_schema = json.loads((output / "case.schema.json").read_text(encoding="utf-8"))
+    bbox_comment = case_schema["$defs"]["SourceSpan"]["$comment"]
+    assert bbox_comment == (
+        "Runtime canonical validation is required because JSON Schema cannot compare "
+        "bbox coordinates to enforce x0 < x1 and y0 < y1."
+    )
+    case_payload = {
+        "case_id": "senqa-2025-contract-contract-general-1",
+        "legacy_ids": [],
+        "doc_id": "sen-qa-2025-v1",
+        "case_type": "qa",
+        "domain": "계약",
+        "part": "계약 일반",
+        "subtopic": None,
+        "case_no": "1",
+        "title_raw": "제목",
+        "title_normalized": "제목",
+        "question": "질문",
+        "answer": "답변",
+        "facts": None,
+        "basis_text": None,
+        "law_ref_ids": [],
+        "source_spans": [{**_span(), "bbox": [5.0, 0.0, 4.0, 1.0]}],
+        "extraction_source": "ocr",
+        "extraction_confidence": 0.9,
+        "critical_field_review": "verified",
+        "pii_class": "none",
+        "anonymization_status": "not_required",
+        "currency_status": "historical_reference",
+        "search_eligible": True,
+        "answer_eligible": True,
+        "review_status": "approved",
+    }
+    assert jsonschema.Draft202012Validator(case_schema).is_valid(case_payload)
+    with pytest.raises(ValidationError, match="ordered"):
+        Case.model_validate_json(json.dumps(case_payload))
+
+    relation_schema = json.loads(
+        (output / "case-relation.schema.json").read_text(encoding="utf-8")
+    )
+    assert relation_schema["$comment"] == (
+        "Runtime canonical validation is required because JSON Schema cannot compare "
+        "source_case_id and target_case_id to reject self-relations."
+    )
+    self_relation = {
+        "relation_id": "rel-1",
+        "source_case_id": "senqa-2025-contract-contract-general-1",
+        "target_case_id": "senqa-2025-contract-contract-general-1",
+        "relation_type": "related",
+        "confidence": 0.9,
+        "review_status": "approved",
+    }
+    assert jsonschema.Draft202012Validator(relation_schema).is_valid(self_relation)
+    with pytest.raises(ValidationError, match="different"):
+        CaseRelation.model_validate(self_relation)
+
+    document_schema = json.loads(
+        (output / "document.schema.json").read_text(encoding="utf-8")
+    )
+    assert document_schema["$comment"] == (
+        "Runtime canonical validation is required because JSON Schema cannot compare "
+        "source_period_start and source_period_end."
+    )
+    reversed_period = {
+        **Document.model_validate(_document_payload()).model_dump(mode="json"),
+        "source_period_start": "2025-07-01",
+        "source_period_end": "2025-06-30",
+    }
+    assert jsonschema.Draft202012Validator(document_schema).is_valid(reversed_period)
+    with pytest.raises(ValidationError, match="source period end"):
+        Document.model_validate_json(json.dumps(reversed_period))
 
 
 def test_export_schemas_refuses_to_overwrite_unmanaged_schema(tmp_path: Path) -> None:
