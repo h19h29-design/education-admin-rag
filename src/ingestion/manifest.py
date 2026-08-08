@@ -139,6 +139,8 @@ def load_manifest(manifest_path: Path) -> tuple[SourceDocument, ...]:
     """Load a JSON manifest without allowing unknown or malformed fields."""
     try:
         manifest_text = manifest_path.read_text(encoding="utf-8")
+    except UnicodeError as error:
+        raise ManifestError("manifest validation failed") from error
     except OSError as error:
         raise ManifestError("cannot read manifest file") from error
     try:
@@ -155,13 +157,20 @@ def resolve_source(source_root: Path, expected_doc: SourceDocument) -> Path:
     if relative.is_absolute() or ".." in relative.parts:
         raise ManifestError("source path must remain under the source root")
 
-    root = source_root.resolve()
-    candidate = (root / relative).resolve()
+    try:
+        root = source_root.resolve()
+        candidate = (root / relative).resolve()
+    except (OSError, RuntimeError) as error:
+        raise ManifestError("cannot resolve source path") from error
     try:
         candidate.relative_to(root)
     except ValueError as error:
         raise ManifestError("resolved source path escapes the source root") from error
-    if not candidate.is_file():
+    try:
+        is_file = candidate.is_file()
+    except (OSError, RuntimeError) as error:
+        raise ManifestError("cannot resolve source path") from error
+    if not is_file:
         raise ManifestError("source file not found under the source root")
     return candidate
 

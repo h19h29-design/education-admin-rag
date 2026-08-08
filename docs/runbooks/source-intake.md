@@ -24,6 +24,12 @@ source verification. Manifest-load failures count as one intake failure and
 print `verified=0 changed=0 failed=1`; per-document source failures continue so
 the final line always carries complete counts.
 
+Manifest files must be valid UTF-8; decode failures use the same sanitized
+manifest-validation summary. Filesystem errors while resolving the source root,
+resolving a candidate, or probing it as a file are reported as
+`cannot resolve source path`. Symlink loops and permission errors do not expose
+raw exception text and do not prevent verification of the remaining documents.
+
 The manifest tolerates only a `0.01 pt` page-size coordinate difference. This
 allows harmless PDF floating-point serialization rounding while still detecting
 changed media-box geometry. Front cover, contents, and trailing non-body pages

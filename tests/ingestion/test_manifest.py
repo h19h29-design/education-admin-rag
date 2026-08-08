@@ -102,6 +102,26 @@ def _assert_safe_cli_failure(result: Result, expected_summary: str) -> None:
     assert SENSITIVE_SENTINEL not in output
 
 
+def _write_fixture_corpus(tmp_path: Path, corrupt_year: int | None = None) -> tuple[Path, Path]:
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    documents: list[dict[str, object]] = []
+    for year in EXPECTED_EDITION_YEARS:
+        source = source_root / f"{year}.pdf"
+        if year == corrupt_year:
+            source.write_bytes(f"not a PDF {SENSITIVE_SENTINEL}".encode())
+        else:
+            _write_pdf(source)
+        documents.append(
+            _expected_document(source, doc_id=f"fixture-{year}", edition_year=year).model_dump(
+                mode="json"
+            )
+        )
+    manifest = tmp_path / "manifest.json"
+    _write_manifest(manifest, {"documents": documents})
+    return source_root, manifest
+
+
 def test_manifest_contains_exactly_2020_through_2025() -> None:
     """Catches a missing, duplicate, or wrongly ordered annual source."""
     docs = load_manifest(MANIFEST_PATH)
@@ -348,32 +368,83 @@ def test_verify_sources_sanitizes_manifest_load_failures(
     assert "manifest validation failed" in result.output
 
 
+def test_verify_sources_sanitizes_invalid_utf8_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a manifest decode failure escaping without a safe summary."""
+    manifest = tmp_path / "manifest.json"
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    manifest.write_bytes(b"\xff\xfe" + SENSITIVE_SENTINEL.encode())
+    monkeypatch.setenv("SEN_QA_SOURCE_ROOT", str(source_root))
+
+    result = CliRunner().invoke(app, ["verify-sources", "--manifest", str(manifest)])
+
+    _assert_safe_cli_failure(result, "verified=0 changed=0 failed=1")
+    assert "manifest validation failed" in result.output
+
+
 def test_verify_sources_continues_after_corrupt_pdf(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Catches one corrupt source aborting verification before complete counts."""
-    source_root = tmp_path / "sources"
-    source_root.mkdir()
-    documents: list[dict[str, object]] = []
-    for year in EXPECTED_EDITION_YEARS:
-        source = source_root / f"{year}.pdf"
-        if year == 2022:
-            source.write_bytes(f"not a PDF {SENSITIVE_SENTINEL}".encode())
-        else:
-            _write_pdf(source)
-        documents.append(
-            _expected_document(source, doc_id=f"fixture-{year}", edition_year=year).model_dump(
-                mode="json"
-            )
-        )
-    manifest = tmp_path / "manifest.json"
-    _write_manifest(manifest, {"documents": documents})
+    source_root, manifest = _write_fixture_corpus(tmp_path, corrupt_year=2022)
     monkeypatch.setenv("SEN_QA_SOURCE_ROOT", str(source_root))
 
     result = CliRunner().invoke(app, ["verify-sources", "--manifest", str(manifest)])
 
     _assert_safe_cli_failure(result, "verified=5 changed=0 failed=1")
     assert "failed document=fixture-2022 reason=cannot open source PDF" in result.output
+
+
+def test_verify_sources_continues_after_source_symlink_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a real symlink loop aborting source resolution and final counts."""
+    source_root, manifest = _write_fixture_corpus(tmp_path)
+    looping_source = source_root / "2022.pdf"
+    looping_source.unlink()
+    looping_source.symlink_to(looping_source.name)
+    monkeypatch.setenv("SEN_QA_SOURCE_ROOT", str(source_root))
+
+    result = CliRunner().invoke(app, ["verify-sources", "--manifest", str(manifest)])
+
+    _assert_safe_cli_failure(result, "verified=5 changed=0 failed=1")
+    assert "failed document=fixture-2022 reason=cannot resolve source path" in result.output
+    assert "Symlink loop" not in result.output
+
+
+@pytest.mark.parametrize("boundary", ["resolve", "is_file"])
+def test_verify_sources_sanitizes_source_path_permission_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    """Catches path-resolution/probe permission errors aborting remaining sources."""
+    source_root, manifest = _write_fixture_corpus(tmp_path)
+    denied_source = source_root / "2022.pdf"
+    if boundary == "resolve":
+        original_resolve = Path.resolve
+
+        def deny_resolve(path: Path, *args: Any, **kwargs: Any) -> Path:
+            if path == denied_source:
+                raise PermissionError(SENSITIVE_SENTINEL)
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", deny_resolve)
+    else:
+        original_is_file = Path.is_file
+
+        def deny_probe(path: Path) -> bool:
+            if path == denied_source:
+                raise PermissionError(SENSITIVE_SENTINEL)
+            return original_is_file(path)
+
+        monkeypatch.setattr(Path, "is_file", deny_probe)
+    monkeypatch.setenv("SEN_QA_SOURCE_ROOT", str(source_root))
+
+    result = CliRunner().invoke(app, ["verify-sources", "--manifest", str(manifest)])
+
+    _assert_safe_cli_failure(result, "verified=5 changed=0 failed=1")
+    assert "failed document=fixture-2022 reason=cannot resolve source path" in result.output
 
 
 def test_verify_sources_reports_mismatch_without_content(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
