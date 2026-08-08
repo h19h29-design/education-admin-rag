@@ -38,7 +38,7 @@ def verify_sources(
     try:
         documents = load_manifest(manifest)
     except ManifestError as error:
-        typer.echo(f"verified=0 changed=0 failed=0 error={error}")
+        typer.echo(f"verified=0 changed=0 failed=1 error={error}")
         raise typer.Exit(code=1) from error
 
     verified = 0

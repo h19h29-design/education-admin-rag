@@ -9,10 +9,21 @@ from pathlib import Path, PurePath
 from typing import Any, Literal
 
 import pymupdf
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
 
 PAGE_SIZE_TOLERANCE_PT = 0.01
 """Maximum harmless PDF point-coordinate rounding difference (1/100 point)."""
+
+APPROVED_EDITION_YEARS = (2020, 2021, 2022, 2023, 2024, 2025)
+EDITION_SEQUENCE_ERROR = "manifest must contain exactly editions 2020 through 2025 in order"
+PDF_LIBRARY_ERRORS = (OSError, RuntimeError, ValueError)
 
 
 class ManifestError(Exception):
@@ -117,21 +128,24 @@ class SourceManifest(BaseModel):
     def has_unique_chronological_documents(self) -> SourceManifest:
         years = [document.edition_year for document in self.documents]
         doc_ids = [document.doc_id for document in self.documents]
-        if len(set(years)) != len(years):
-            raise ValueError("edition years must be unique")
+        if tuple(years) != APPROVED_EDITION_YEARS:
+            raise ValueError(EDITION_SEQUENCE_ERROR)
         if len(set(doc_ids)) != len(doc_ids):
             raise ValueError("document IDs must be unique")
-        if years != sorted(years):
-            raise ValueError("documents must be ordered by edition year")
         return self
 
 
 def load_manifest(manifest_path: Path) -> tuple[SourceDocument, ...]:
     """Load a JSON manifest without allowing unknown or malformed fields."""
     try:
-        manifest = SourceManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+        manifest_text = manifest_path.read_text(encoding="utf-8")
     except OSError as error:
-        raise ManifestError(f"cannot read manifest: {manifest_path}") from error
+        raise ManifestError("cannot read manifest file") from error
+    try:
+        manifest = SourceManifest.model_validate_json(manifest_text)
+    except ValidationError as error:
+        message = EDITION_SEQUENCE_ERROR if EDITION_SEQUENCE_ERROR in str(error) else "manifest validation failed"
+        raise ManifestError(message) from error
     return manifest.documents
 
 
@@ -162,9 +176,12 @@ def page_label(policy: PageNumberingPolicy, pdf_page: int) -> int | None:
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise ManifestError("cannot read source file") from error
     return digest.hexdigest()
 
 
@@ -189,14 +206,25 @@ def verify_source(source_path: Path, expected_doc: SourceDocument) -> None:
 
     try:
         document: Any = pymupdf.open(source_path)  # type: ignore[no-untyped-call]
-    except Exception as error:
+    except PDF_LIBRARY_ERRORS as error:
         raise ManifestError("cannot open source PDF") from error
     try:
-        if document.page_count != expected_doc.pdf_page_count:
+        try:
+            page_count = int(document.page_count)
+        except PDF_LIBRARY_ERRORS as error:
+            raise ManifestError("cannot inspect source PDF") from error
+        if page_count != expected_doc.pdf_page_count:
             raise ManifestError("page-count mismatch")
-        for page_number in range(1, document.page_count + 1):
-            page: Any = document[page_number - 1]
-            if not _matches_profile(page_number, page.rect, expected_doc.page_size_profiles):
+        for page_number in range(1, page_count + 1):
+            try:
+                page: Any = document[page_number - 1]
+                rect = page.rect
+            except PDF_LIBRARY_ERRORS as error:
+                raise ManifestError("cannot inspect source PDF") from error
+            if not _matches_profile(page_number, rect, expected_doc.page_size_profiles):
                 raise ManifestError("page-size profile mismatch")
     finally:
-        document.close()
+        try:
+            document.close()
+        except PDF_LIBRARY_ERRORS as error:
+            raise ManifestError("cannot inspect source PDF") from error
