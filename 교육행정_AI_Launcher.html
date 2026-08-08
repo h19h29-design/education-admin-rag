@@ -223,29 +223,7 @@ function caseRow(c,tks){
 }
 
 function aiPanelHTML(q){
-  return '<div style="border:1px solid rgba(120,140,255,.32);background:rgba(120,140,255,.06);border-radius:14px;padding:14px 16px;margin-bottom:16px">'+
-    '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">'+
-      '<div style="font-weight:800;font-size:14px">🤖 AI 답변 <span style="font-weight:500;color:var(--sub);font-size:12px">— 아래 사례집을 근거로 “'+esc(q)+'”에 답합니다</span></div>'+
-      '<button type="button" class="btn sm" id="aiGo">AI 답변 생성</button>'+
-    '</div>'+
-    '<div id="aiOut" style="margin-top:10px"></div>'+
-  '</div>';
-}
-async function geminiAnswer(){
-  const out=document.getElementById('aiOut'); if(!out)return;
-  const q=window._aiQ||''; const cases=(window._aiCases||[]).slice(0,6);
-  const btn=document.getElementById('aiGo'); if(btn) btn.disabled=true;
-  out.innerHTML='<div style="font-size:13px;color:var(--sub)">🤖 사례집 기반 AI 답변 생성 중…</div>';
-  const ctx=cases.map(c=>'['+c.id+' | '+(c.year||'')+'년 '+c.cat+' p.'+c.page+'] '+c.title+' : '+String(c.body||'').replace(/\n/g,' ').slice(0,600)).join('\n\n');
-  const sys='너는 대한민국 학교행정(계약·인사·복무·보수·학교회계 지출·교육공무직) 실무 전문가다. 제공된 [사례집 발췌]를 우선 근거로 한국어로 간결하고 정확하게 답하라. 발췌에 근거가 없거나 불확실하면 그렇게 밝히고 소속 교육청 최신 지침·예규 확인을 권고하라. 답변 끝에 참고한 사례를 연도·페이지와 함께 (근거: 2024년 CT-2024-001 p.13) 형식으로 표기하라. 여러 연도의 사례가 상충하면 가장 최신 연도 기준을 우선하되 연도 차이가 있음을 명시하라.';
-  const user='[질문] '+q+'\n\n[사례집 발췌]\n'+(ctx||'(관련 사례 없음 — 일반 지식으로 신중히 답하고 확인을 권고)');
-  try{
-    const a=await geminiAsk(sys,user,false);
-    out.innerHTML='<div style="white-space:pre-wrap;font-size:13.5px;line-height:1.65">'+esc(a)+'</div>'+
-      '<div style="font-size:10.5px;color:var(--mut);margin-top:8px">※ AI 생성 답변입니다. 실제 처리 전 최신 지침·예규를 확인하세요.</div>';
-  }catch(e){
-    out.innerHTML='<div class="caveat">⚠ AI 답변 실패: '+esc(e.message)+'</div>';
-  }finally{ if(btn) btn.disabled=false; }
+  return '<div class="caveat" style="margin-bottom:16px">근거 검색 기반 서비스 준비 중입니다. 아래 사례집 검색 결과를 확인하세요.</div>';
 }
 function run(){
   const q=qEl.value.trim();
@@ -282,8 +260,6 @@ function run(){
 
   resEl.querySelectorAll('.tool').forEach(el=>el.onclick=()=>openTool(el.dataset.tool));
   resEl.querySelectorAll('.case').forEach(el=>el.onclick=()=>el.classList.toggle('open'));
-  window._aiCases=cases; window._aiQ=q;
-  const aig=document.getElementById('aiGo'); if(aig) aig.addEventListener('click',geminiAnswer);
 }
 
 qEl.addEventListener('input',()=>{clearTimeout(window._t);window._t=setTimeout(run,120);});
@@ -361,24 +337,6 @@ const BIMOK_CATS=[
  {n:'예비비',c:'',k:[['예비비',5]]},
  {n:'반환금',c:'',k:[['반환금',4],['집행잔액',3],['잔액 반환',3],['목적사업비 잔액',3]]}
 ];
-const GEMINI_KEY='AQ.Ab8RN6LY_uGDBXnukZmh0_e1o1GhPgl9BjdFC9g5NCXNkR7ZXg';
-const GEMINI_MODEL='gemini-2.5-flash';
-async function geminiAsk(sys,user,json){
-  const url='https://generativelanguage.googleapis.com/v1beta/models/'+GEMINI_MODEL+':generateContent?key='+GEMINI_KEY;
-  const body={contents:[{parts:[{text:user}]}],generationConfig:{temperature:0.2}};
-  if(sys) body.system_instruction={parts:[{text:sys}]};
-  if(json) body.generationConfig.responseMimeType='application/json';
-  const ctrl=new AbortController(); const to=setTimeout(()=>ctrl.abort(),30000);
-  let r; try{ r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:ctrl.signal}); }
-  catch(e){ clearTimeout(to); throw new Error('네트워크 오류(오프라인?)'); }
-  clearTimeout(to);
-  if(!r.ok){let m='HTTP '+r.status; try{const e=await r.json(); if(e.error&&e.error.message) m=e.error.message;}catch(_){} throw new Error(m);}
-  const d=await r.json(); const c=d.candidates&&d.candidates[0];
-  if(!c||!c.content||!c.content.parts) throw new Error('빈 응답');
-  return c.content.parts.map(p=>p.text||'').join('');
-}
-const BIMOK_REF=BIMOK_CATS.map(c=>(c.c||'(코드:소속지침확인)')+'='+c.n).join(' / ');
-const BIMOK_SYS='너는 대한민국 학교회계 예산편성의 원가통계비목 분류 전문가다. 반드시 아래 제공된 비목 코드/명칭 목록 안에서만 선택하고 임의 코드를 만들지 마라. [비목목록] '+BIMOK_REF+' [오류주의규칙] 공무직 퇴직적립금->공무직인건비(A100202) / 보건실 약품·학생 검진비->학생복지비(B100203) / 졸업앨범·교복->학생복지비(B100203) / 학생 간식->교육운영비(B100201) / 소프트웨어: 자산성->기타자산취득비, 라이선스 사용료->일반수용비(B100101), 구독형(전자책)->교육운영비(B100201). 출력은 JSON만: {\"top\":[{\"code\":\"\",\"name\":\"\",\"reason\":\"\"}],\"warn\":\"\"}. top은 확신 높은 순 1~3개. 목록에 코드가 없으면 code는 빈문자열로 두고 name만 채운다. reason은 한 문장 한국어.';
 function bmBoost(sc,code,amt){const e=sc.find(x=>x.cat.c===code);if(e)e.s+=amt;}
 function bmBoostN(sc,name,amt){const e=sc.find(x=>x.cat.n===name);if(e)e.s+=amt;}
 function bmChip(v){return '<span style="display:inline-block;background:rgba(120,140,255,.14);color:var(--acc2);border-radius:6px;padding:2px 7px;font-size:11px;margin:2px 4px 0 0">'+esc(v)+'</span>';}
@@ -393,42 +351,12 @@ function uiBimok(){
     '<div class="result" id="bimok_res"></div>'+
     '<div class="caveat">규칙 기반 추천이며 최종 편성은 소속 교육청 「학교회계 예산편성 지침」과 실제 지출 목적으로 확정하세요. 근거: 2026학년도 학교회계 예산편성 기본지침.</div>';
 }
-async function bimokClassify(){
-  const el=document.getElementById('bimok_in'); if(!el)return;
-  const res=document.getElementById('bimok_res'); res.classList.add('on');
-  const raw=(el.value||'').trim();
+function bimokClassify(){
+  const el=document.getElementById("bimok_in"); if(!el)return;
+  const res=document.getElementById("bimok_res"); res.classList.add("on");
+  const raw=(el.value||"").trim();
   if(!raw){res.innerHTML='<div class="caveat">지출 내용을 입력한 뒤 [🔎 비목 조회]를 눌러주세요.</div>';return;}
-  const go=document.getElementById('bimok_go'); if(go) go.disabled=true;
-  res.innerHTML='<div style="font-size:13px;color:var(--sub)">🤖 제미나이 AI 분석 중…</div>';
-  try{
-    const o=await bimokGemini(raw);
-    res.innerHTML=bimokRenderAI(o)+
-      '<details style="margin-top:8px"><summary style="cursor:pointer;font-size:12px;color:var(--acc2)">규칙 기반 결과도 보기</summary><div style="margin-top:8px">'+bimokRuleHTML(raw)+'</div></details>';
-  }catch(e){
-    res.innerHTML='<div class="caveat" style="margin-bottom:10px">⚠ AI 호출 실패('+esc(e.message)+') — 규칙 기반 결과로 표시합니다.</div>'+bimokRuleHTML(raw);
-  }finally{ if(go) go.disabled=false; }
-}
-async function bimokGemini(raw){
-  const out=await geminiAsk(BIMOK_SYS,'지출 내용: '+raw,true);
-  let o; try{o=JSON.parse(out);}catch(e){throw new Error('AI 응답 파싱 실패');}
-  if(!o||!o.top||!o.top.length) throw new Error('AI 결과 없음');
-  return o;
-}
-function bimokRenderAI(o){
-  let html='<div style="font-size:11px;color:var(--acc2);margin-bottom:8px;font-weight:800">🤖 제미나이 AI 분석 결과</div>';
-  o.top.slice(0,3).forEach((x,i)=>{
-    const rankc=['#3ec98a','#7a8cff','#9aa3b8'][i]||'#9aa3b8';
-    html+='<div style="border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:12px 14px;margin-bottom:10px;background:rgba(255,255,255,.02)">'+
-      '<div style="display:flex;align-items:center;gap:9px;margin-bottom:6px">'+
-        '<span style="flex:none;width:22px;height:22px;border-radius:6px;background:'+rankc+';color:#0b0f1c;font-weight:800;font-size:12px;display:flex;align-items:center;justify-content:center">'+(i+1)+'</span>'+
-        '<span style="font-weight:800;font-size:15px">'+esc(x.name||'(미상)')+'</span>'+
-        (x.code?'<span style="font-family:monospace;font-size:12px;color:var(--acc2);background:rgba(120,140,255,.12);padding:1px 7px;border-radius:6px">'+esc(x.code)+'</span>':'<span style="font-size:11px;color:var(--mut)">코드: 소속 지침 확인</span>')+
-      '</div>'+
-      (x.reason?'<div style="font-size:12px;color:var(--sub);line-height:1.5">'+esc(x.reason)+'</div>':'')+
-    '</div>';
-  });
-  if(o.warn) html+=bmWarnBox([esc(o.warn)]);
-  return html;
+  res.innerHTML=bimokRuleHTML(raw);
 }
 function bimokRuleHTML(raw){
   const txt=raw.toLowerCase();
