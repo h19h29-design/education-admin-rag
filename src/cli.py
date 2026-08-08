@@ -82,11 +82,36 @@ def _parse_native_years(years: str) -> tuple[int, ...]:
     return parsed
 
 
+def _resolve_extraction_paths(source_root: Path, output: Path) -> tuple[Path, Path]:
+    """Resolve and separate source/output trees before any extraction mutation."""
+    try:
+        resolved_source = source_root.resolve(strict=True)
+        resolved_output = output.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise NativeExtractionError("cannot resolve extraction paths") from error
+
+    filesystem_root = Path(resolved_source.anchor)
+    if resolved_source == filesystem_root or resolved_output == filesystem_root:
+        raise NativeExtractionError("source and output must not be a filesystem root")
+    if not resolved_source.is_dir():
+        raise NativeExtractionError("source root must be an existing directory")
+    if resolved_output.exists() and not resolved_output.is_dir():
+        raise NativeExtractionError("output must be an existing directory or a new path")
+    if (
+        resolved_source == resolved_output
+        or resolved_output.is_relative_to(resolved_source)
+        or resolved_source.is_relative_to(resolved_output)
+    ):
+        raise NativeExtractionError("source root and output must not overlap")
+    return resolved_source, resolved_output
+
+
 def _replace_output_directory(staging: Path, output: Path) -> None:
-    """Promote a complete staged run, restoring the previous run if promotion fails."""
-    backup = output.with_name(f".{output.name}.previous")
-    if backup.exists():
-        shutil.rmtree(backup)
+    """Promote one owned workspace, restoring or preserving its previous-output child."""
+    workspace = staging.parent
+    backup = workspace / "previous-output"
+    if backup.exists() or backup.is_symlink():
+        raise NativeExtractionError("owned promotion backup must not already exist")
     moved_previous = False
     try:
         if output.exists():
@@ -94,11 +119,21 @@ def _replace_output_directory(staging: Path, output: Path) -> None:
             moved_previous = True
         os.replace(staging, output)
     except OSError as error:
-        if moved_previous and not output.exists() and backup.exists():
-            os.replace(backup, output)
+        if moved_previous:
+            try:
+                os.replace(backup, output)
+            except OSError as restore_error:
+                raise NativeExtractionError(
+                    "cannot promote extraction output; backup preserved for recovery"
+                ) from restore_error
+        shutil.rmtree(workspace)
         raise NativeExtractionError("cannot promote extraction output") from error
     if backup.exists():
         shutil.rmtree(backup)
+    try:
+        workspace.rmdir()
+    except OSError as error:
+        raise NativeExtractionError("cannot clean promotion workspace") from error
 
 
 @app.command("extract-native")
@@ -115,9 +150,10 @@ def extract_native(
         typer.echo("SEN_QA_SOURCE_ROOT is required")
         raise typer.Exit(code=2)
     try:
+        source_root, output = _resolve_extraction_paths(Path(source_root_value), output)
         requested_years = _parse_native_years(years)
         documents = load_manifest(manifest)
-    except (ManifestError, ValueError) as error:
+    except (ManifestError, NativeExtractionError, ValueError) as error:
         typer.echo(f"documents=0 pages=0 extracted=0 quarantined=0 failed=1 error={error}")
         raise typer.Exit(code=2) from error
 
@@ -132,7 +168,7 @@ def extract_native(
     sources: list[tuple[Path, SourceDocument]] = []
     for document in selected:
         try:
-            source = resolve_source(Path(source_root_value), document)
+            source = resolve_source(source_root, document)
             verify_source(source, document)
         except ManifestError as error:
             typer.echo(f"documents=0 pages=0 extracted=0 quarantined=0 failed=1 error={error}")
@@ -141,10 +177,13 @@ def extract_native(
 
     output_parent = output.parent
     output_parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.staging-", dir=output_parent))
+    workspace = Path(tempfile.mkdtemp(prefix=f".{output.name}.promotion-", dir=output_parent))
+    staging = workspace / "new-output"
+    staging.mkdir()
     extracted = 0
     quarantined = 0
     page_count = 0
+    promotion_started = False
     try:
         for source, document in sources:
             records = extract_document(source, document)
@@ -152,9 +191,11 @@ def extract_native(
             page_count += len(records)
             extracted += sum(record.status == "extracted" for record in records)
             quarantined += sum(record.status == "quarantined" for record in records)
+        promotion_started = True
         _replace_output_directory(staging, output)
     except (NativeExtractionError, OSError) as error:
-        shutil.rmtree(staging, ignore_errors=True)
+        if not promotion_started:
+            shutil.rmtree(workspace, ignore_errors=True)
         typer.echo(f"documents={len(selected)} pages={page_count} extracted={extracted} quarantined={quarantined} failed=1 error={error}")
         raise typer.Exit(code=1) from error
 

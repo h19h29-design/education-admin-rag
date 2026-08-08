@@ -36,6 +36,26 @@ _TEXT_BLOCK_TYPE = 0
 _RENDER_HASH_PREFIX = b"sen-qa-native-render-v1\0rgb8\0"
 
 
+def _supported_pymupdf_errors() -> tuple[type[BaseException], ...]:
+    """Return the installed PyMuPDF exception family without a broad RuntimeError catch."""
+    mupdf_module = getattr(pymupdf, "mupdf", None)
+    candidates = (
+        getattr(pymupdf, "FileDataError", None),
+        getattr(pymupdf, "EmptyFileError", None),
+        getattr(mupdf_module, "FzErrorBase", None),
+    )
+    return tuple(
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, type) and issubclass(candidate, BaseException)
+    )
+
+
+PYMUPDF_ERRORS = _supported_pymupdf_errors()
+DOCUMENT_IO_ERRORS = PYMUPDF_ERRORS + (OSError, ValueError)
+PAGE_EXTRACTION_ERRORS = PYMUPDF_ERRORS + (OSError, IndexError, KeyError, TypeError, ValueError)
+
+
 class NativeExtractionError(Exception):
     """Raised for safe, document-level native extraction failures."""
 
@@ -90,7 +110,7 @@ def normalize_text(text: str) -> str:
 
 
 def _block_text(block: RawBlock) -> str:
-    return "".join(span.text for line in block.lines for span in line.spans)
+    return "\n".join("".join(span.text for span in line.spans) for line in block.lines)
 
 
 def _candidate_signature(page: RawPage, block: RawBlock) -> str | None:
@@ -105,18 +125,17 @@ def _candidate_signature(page: RawPage, block: RawBlock) -> str | None:
     if page.edition_year in (2021, 2022):
         top_limit = page.page_height * 0.08
         bottom_limit = page.page_height * 0.92
-        if block.bbox.y0 <= top_limit or block.bbox.y1 >= bottom_limit:
-            return f"header-footer:{text}"
+        if block.bbox.y1 <= top_limit:
+            return f"header-footer:top:{text}"
+        if block.bbox.y0 >= bottom_limit:
+            return f"header-footer:bottom:{text}"
     return None
 
 
-def _body_page_count(pages: tuple[RawPage, ...]) -> int:
-    return sum(page.page_label is not None for page in pages)
-
-
-def discover_repeated_signatures(pages: tuple[RawPage, ...]) -> tuple[frozenset[str], dict[str, int]]:
-    """Find template signatures using distinct-body-page frequency, never text alone."""
-    body_pages = _body_page_count(pages)
+def discover_repeated_signatures(
+    pages: tuple[RawPage, ...], *, body_page_count: int
+) -> tuple[frozenset[str], dict[str, int]]:
+    """Find templates using the manifest body-page denominator and successful occurrences."""
     per_page_signatures: list[set[str]] = []
     for page in pages:
         if page.page_label is None:
@@ -128,7 +147,7 @@ def discover_repeated_signatures(pages: tuple[RawPage, ...]) -> tuple[frozenset[
     repeated = frozenset(
         signature
         for signature, count in counts.items()
-        if count >= _repetition_threshold(signature, body_pages)
+        if count >= _repetition_threshold(signature, body_page_count)
     )
     return repeated, dict(counts)
 
@@ -235,7 +254,7 @@ def extract_document(source_path: Path, document: SourceDocument) -> tuple[Nativ
         raise NativeExtractionError("document is not approved for native extraction")
     try:
         pdf: Any = pymupdf.open(source_path)  # type: ignore[no-untyped-call]
-    except (OSError, RuntimeError, ValueError) as error:
+    except DOCUMENT_IO_ERRORS as error:
         raise NativeExtractionError("cannot open approved source PDF") from error
     records: list[NativePageRecord] = []
     raw_pages: list[RawPage] = []
@@ -244,7 +263,7 @@ def extract_document(source_path: Path, document: SourceDocument) -> tuple[Nativ
             label = printed_page_label(document.edition_year, pdf_page_index, policy=document.page_numbering)
             try:
                 raw_page = _extract_raw_page(pdf[pdf_page_index - 1], document=document, pdf_page_index=pdf_page_index)
-            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            except PAGE_EXTRACTION_ERRORS:
                 records.append(
                     QuarantinedPageRecord(
                         doc_id=document.doc_id,
@@ -269,11 +288,17 @@ def extract_document(source_path: Path, document: SourceDocument) -> tuple[Nativ
     finally:
         try:
             pdf.close()
-        except (OSError, RuntimeError, ValueError) as error:
+        except DOCUMENT_IO_ERRORS as error:
             raise NativeExtractionError("cannot close approved source PDF") from error
 
-    repeated, counts = discover_repeated_signatures(tuple(raw_pages))
-    body_count = _body_page_count(tuple(raw_pages))
+    body_count = (
+        document.page_numbering.body_end_pdf_page
+        - document.page_numbering.body_start_pdf_page
+        + 1
+    )
+    repeated, counts = discover_repeated_signatures(
+        tuple(raw_pages), body_page_count=body_count
+    )
     cleaned_by_page = {
         page.pdf_page_index: remove_repeated_margin_blocks(
             page, repeated_signatures=repeated, body_page_count=body_count, signature_counts=counts
