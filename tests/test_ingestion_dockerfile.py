@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -21,7 +22,12 @@ def test_ingestion_image_is_digest_pinned_multistage_with_frozen_venv_and_models
         for line in from_instructions
     )
     assert any("uv sync --frozen --extra ocr --no-dev" in line for line in instructions)
-    assert any("prepare-ocr-models" in line for line in instructions)
+    assert any(
+        "COPY docker/prepare_ocr_models.py /build/prepare_ocr_models.py" in line
+        for line in instructions
+    )
+    assert any("/build/prepare_ocr_models.py" in line for line in instructions)
+    assert not any("src.cli prepare-ocr-models" in line for line in instructions)
     assert any("validate-ocr-models" in line for line in instructions)
     assert any(
         "COPY --from=builder /opt/venv /opt/venv" in line for line in instructions
@@ -30,15 +36,72 @@ def test_ingestion_image_is_digest_pinned_multistage_with_frozen_venv_and_models
         "COPY --from=builder /opt/models/paddleocr /opt/models/paddleocr" in line
         for line in instructions
     )
+    runtime_stage = Path("docker/ingestion.Dockerfile").read_text().split(
+        " AS runtime\n", maxsplit=1
+    )[1]
+    assert "prepare_ocr_models" not in runtime_stage
+    assert "COPY docker" not in runtime_stage
+    runtime_python = Path("src/ingestion/extract_ocr.py").read_text() + Path(
+        "src/cli.py"
+    ).read_text()
+    assert "urlopen" not in runtime_python
+    assert "download_locked_archive" not in runtime_python
+    assert "prepare_model_staging" not in runtime_python
 
 
 def test_ingestion_runtime_is_nonroot_and_uses_locked_local_model_paths() -> None:
-    """Catches a root runtime, uv re-resolution, or a writable network-backed model cache."""
+    """Catches a root runtime, uv re-resolution, or a writable model directory."""
     instructions = Path("docker/ingestion.Dockerfile").read_text().splitlines()
 
     assert any(
         line.startswith("USER ") and line != "USER root" for line in instructions
     )
     assert any("PYTHONPATH=/work" in line for line in instructions)
-    assert any("PADDLE_HOME=/opt/models/paddleocr" in line for line in instructions)
+    assert any("PADDLE_HOME=/tmp/paddle-home" in line for line in instructions)
+    assert any(
+        "PADDLE_PDX_CACHE_HOME=/tmp/paddlex-cache" in line
+        for line in instructions
+    )
+    assert any(
+        "PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=1" in line
+        for line in instructions
+    )
+    assert any(
+        "SEN_QA_OCR_MODEL_ROOT=/opt/models/paddleocr" in line
+        for line in instructions
+    )
+    assert not any(
+        "PADDLE_HOME=/opt/models" in line
+        or "PADDLE_PDX_CACHE_HOME=/opt/models" in line
+        for line in instructions
+    )
     assert instructions[-1] == 'CMD ["/opt/venv/bin/python", "-m", "src.cli"]'
+
+
+def test_ingestion_runtime_installs_trixie_elf_dependencies_from_frozen_snapshot() -> (
+    None
+):
+    """Catches missing Paddle/OpenCV shared libraries or mutable apt inputs."""
+    dockerfile = Path("docker/ingestion.Dockerfile").read_text()
+
+    assert re.search(r"DEBIAN_SNAPSHOT=\d{8}T\d{6}Z", dockerfile)
+    assert "snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}" in dockerfile
+    assert "snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}" in dockerfile
+    assert "Acquire::Check-Valid-Until=false" in dockerfile
+    assert 'VERSION_ID" = "13"' in dockerfile
+    assert 'VERSION_CODENAME" = "trixie"' in dockerfile
+    assert (
+        'grep -Fqx "# http://snapshot.debian.org/archive/debian/' in dockerfile
+    )
+    assert (
+        'grep -Fqx "# http://snapshot.debian.org/archive/debian-security/'
+        in dockerfile
+    )
+    assert 'grep -Fqx "URIs: https://snapshot.debian.org/archive/debian/' in dockerfile
+    assert (
+        'grep -Fqx "URIs: https://snapshot.debian.org/archive/debian-security/'
+        in dockerfile
+    )
+    assert '! grep -Fq "URIs: http://deb.debian.org/"' in dockerfile
+    for package in ("libgomp1", "libgl1", "libglib2.0-0t64"):
+        assert package in dockerfile

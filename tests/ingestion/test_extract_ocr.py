@@ -10,12 +10,15 @@ import sys
 import tarfile
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pymupdf
 import pytest
 from typer.testing import CliRunner
 
 import src.cli as cli_module
+import src.ingestion.extract_ocr as ocr_module
+from docker.prepare_ocr_models import prepare_model_staging
 from src.cli import _parse_ocr_pages, app
 from src.ingestion.extract_common import (
     BoundingBox,
@@ -28,11 +31,11 @@ from src.ingestion.extract_ocr import (
     AdapterLine,
     ModelLockError,
     OcrAdapterError,
+    PaddleOcrAdapter,
     RasterImage,
     extract_pages,
     load_model_lock,
     ocr_policy,
-    prepare_model_staging,
     sort_reading_order,
     validate_installed_models,
     validate_model_lock,
@@ -76,22 +79,46 @@ def _valid_model_lock_payload() -> dict[str, object]:
 
 
 class FakePixmap:
-    width = 1000
-    height = 1400
-    n = 3
-    samples = bytes(range(12))
+    def __init__(
+        self,
+        *,
+        width: int = 1000,
+        height: int = 1400,
+        samples: bytes = bytes(range(12)),
+    ) -> None:
+        self.width = width
+        self.height = height
+        self.n = 3
+        self.samples = samples
 
 
 class FakePage:
-    def __init__(self, *, failure: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        failure: Exception | None = None,
+        point_width: float = 1000.0,
+        point_height: float = 1400.0,
+        pixmap: FakePixmap | None = None,
+    ) -> None:
         self.failure = failure
+        self.rect = SimpleNamespace(
+            x0=0.0,
+            y0=0.0,
+            x1=point_width,
+            y1=point_height,
+            width=point_width,
+            height=point_height,
+        )
+        self.derotation_matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        self.pixmap = pixmap or FakePixmap()
         self.calls: list[dict[str, object]] = []
 
     def get_pixmap(self, **kwargs: object) -> FakePixmap:
         self.calls.append(kwargs)
         if self.failure is not None:
             raise self.failure
-        return FakePixmap()
+        return self.pixmap
 
 
 class FakeAdapter:
@@ -100,14 +127,18 @@ class FakeAdapter:
         lines: tuple[AdapterLine, ...],
         *,
         failing_calls: frozenset[int] = frozenset(),
+        expected_width: int = 1000,
+        expected_height: int = 1400,
     ) -> None:
         self.lines = lines
         self.failing_calls = failing_calls
+        self.expected_width = expected_width
+        self.expected_height = expected_height
         self.calls = 0
 
     def recognize(self, image: RasterImage) -> tuple[AdapterLine, ...]:
-        assert image.width == 1000
-        assert image.height == 1400
+        assert image.width == self.expected_width
+        assert image.height == self.expected_height
         assert image.rgb_bytes == bytes(range(12))
         self.calls += 1
         if self.calls in self.failing_calls:
@@ -181,6 +212,29 @@ def _tar_archive(
             info.size = len(content)
             archive.addfile(info, io.BytesIO(content))
     return output.getvalue()
+
+
+def _patch_successful_ocr_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    source: Path,
+    document: SourceDocument,
+    records: tuple[object, ...],
+) -> None:
+    monkeypatch.setattr(cli_module, "load_manifest", lambda path: (document,))
+    monkeypatch.setattr(cli_module, "resolve_source", lambda root, selected: source)
+    monkeypatch.setattr(cli_module, "verify_source", lambda path, selected: None)
+    monkeypatch.setattr(
+        cli_module, "validate_installed_models", lambda lock, root: None
+    )
+    monkeypatch.setattr(
+        cli_module, "create_paddle_adapter", lambda lock, root: FakeAdapter(())
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "extract_ocr_document",
+        lambda path, selected, page_indexes, adapter, image_digest: records,
+    )
 
 
 def test_ocr_render_policies_are_fixed() -> None:
@@ -303,6 +357,68 @@ def test_host_import_does_not_import_or_require_paddle() -> None:
     assert completed.stderr == ""
 
 
+def test_paddle_adapter_selects_locked_model_names_and_preserves_result_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches Paddle selecting default model families despite locked model directories."""
+    captured: dict[str, object] = {}
+    predicted_images: list[object] = []
+
+    class CapturingPaddleOcr:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def predict(self, image: object) -> tuple[object, ...]:
+            predicted_images.append(image.copy())  # type: ignore[attr-defined]
+            return (
+                SimpleNamespace(
+                    json={
+                        "res": {
+                            "rec_texts": ["서울교육 2025-109"],
+                            "rec_scores": [0.97],
+                            "rec_polys": [[[1, 2], [5, 2], [5, 7], [1, 7]]],
+                        }
+                    }
+                ),
+            )
+
+    monkeypatch.setattr(
+        ocr_module.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(PaddleOCR=CapturingPaddleOcr),
+    )
+    detection_model = tmp_path / "PP-OCRv5_server_det_infer"
+    recognition_model = tmp_path / "korean_PP-OCRv5_mobile_rec_infer"
+
+    adapter = PaddleOcrAdapter(
+        detection_model=detection_model, recognition_model=recognition_model
+    )
+    lines = adapter.recognize(
+        RasterImage(width=1, height=1, rgb_bytes=b"\x01\x02\x03")
+    )
+
+    assert captured == {
+        "lang": "korean",
+        "text_detection_model_name": "PP-OCRv5_server_det",
+        "text_detection_model_dir": str(detection_model),
+        "text_recognition_model_name": "korean_PP-OCRv5_mobile_rec",
+        "text_recognition_model_dir": str(recognition_model),
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+        "device": "cpu",
+    }
+    assert lines == (
+        AdapterLine(
+            text="서울교육 2025-109",
+            bbox=(1.0, 2.0, 5.0, 7.0),
+            confidence=0.97,
+            field_type="document_number",
+        ),
+    )
+    assert predicted_images[0].tolist() == [[[3, 2, 1]]]  # type: ignore[union-attr]
+
+
 def test_full_page_render_uses_reviewed_dpi_and_records_provenance() -> None:
     """Catches strip-image OCR, alpha raster drift, or missing source/render provenance."""
     page = FakePage()
@@ -339,6 +455,154 @@ def test_full_page_render_uses_reviewed_dpi_and_records_provenance() -> None:
     assert line.bbox.model_dump() == {"x0": 10.0, "y0": 20.0, "x1": 300.0, "y1": 60.0}
     assert line.confidence == 0.94
     assert line.spans[0].confidence == 0.94
+
+
+def test_ocr_geometry_is_persisted_in_pdf_points_on_non_square_page() -> None:
+    """Catches rendered-pixel coordinates leaking into the common PDF-point contract."""
+    page = FakePage(
+        point_width=200.0,
+        point_height=100.0,
+        pixmap=FakePixmap(width=1000, height=400),
+    )
+    adapter = FakeAdapter(
+        (
+            AdapterLine(
+                text="scaled",
+                bbox=(100.0, 40.0, 500.0, 200.0),
+                confidence=0.94,
+            ),
+        ),
+        expected_width=1000,
+        expected_height=400,
+    )
+
+    record = extract_pages(
+        (page,),
+        document=_ocr_document(),
+        page_indexes=(1,),
+        adapter=adapter,
+        source_sha256="c" * 64,
+        image_digest="sha256:" + "d" * 64,
+    )[0]
+
+    assert record.raw_page.page_width == 200.0
+    assert record.raw_page.page_height == 100.0
+    assert record.raw_page.raw_blocks[0].bbox.model_dump() == {
+        "x0": 0.0,
+        "y0": 0.0,
+        "x1": 200.0,
+        "y1": 100.0,
+    }
+    assert record.raw_page.raw_blocks[0].lines[0].bbox.model_dump() == {
+        "x0": 20.0,
+        "y0": 10.0,
+        "x1": 100.0,
+        "y1": 50.0,
+    }
+
+
+def test_equivalent_300_and_350_dpi_boxes_share_point_geometry_and_location() -> None:
+    """Catches DPI-dependent persisted bboxes or opaque review locations."""
+    page_300 = FakePage(
+        point_width=200.0,
+        point_height=100.0,
+        pixmap=FakePixmap(width=600, height=300),
+    )
+    page_350 = FakePage(
+        point_width=200.0,
+        point_height=100.0,
+        pixmap=FakePixmap(width=700, height=350),
+    )
+    line_300 = AdapterLine(
+        text="low confidence",
+        bbox=(60.0, 30.0, 300.0, 150.0),
+        confidence=0.5,
+        field_type="question",
+    )
+    line_350 = AdapterLine(
+        text="low confidence",
+        bbox=(70.0, 35.0, 350.0, 175.0),
+        confidence=0.5,
+        field_type="question",
+    )
+
+    record_300 = extract_pages(
+        (page_300,),
+        document=_ocr_document(year=2023),
+        page_indexes=(1,),
+        adapter=FakeAdapter(
+            (line_300,), expected_width=600, expected_height=300
+        ),
+        source_sha256="c" * 64,
+        image_digest="sha256:" + "d" * 64,
+    )[0]
+    record_350 = extract_pages(
+        (page_350,),
+        document=_ocr_document(year=2024),
+        page_indexes=(1,),
+        adapter=FakeAdapter(
+            (line_350,), expected_width=700, expected_height=350
+        ),
+        source_sha256="c" * 64,
+        image_digest="sha256:" + "d" * 64,
+    )[0]
+
+    bbox_300 = record_300.raw_page.raw_blocks[0].lines[0].bbox
+    bbox_350 = record_350.raw_page.raw_blocks[0].lines[0].bbox
+    assert bbox_300 == bbox_350 == BoundingBox(
+        x0=20.0, y0=10.0, x1=100.0, y1=50.0
+    )
+    assert record_300.review_queue[0].location_id == record_350.review_queue[0].location_id
+
+
+@pytest.mark.parametrize(
+    ("rotation", "expected_bbox"),
+    [
+        (90, {"x0": 40.0, "y0": 40.0, "x1": 160.0, "y1": 90.0}),
+        (270, {"x0": 40.0, "y0": 10.0, "x1": 160.0, "y1": 60.0}),
+    ],
+)
+def test_rotated_ocr_boxes_are_derotated_to_bounded_unrotated_pdf_points(
+    rotation: int, expected_bbox: dict[str, float]
+) -> None:
+    """Catches rotated raster coordinates escaping unrotated point-space page bounds."""
+
+    class FractionalBoxAdapter:
+        def recognize(self, image: RasterImage) -> tuple[AdapterLine, ...]:
+            return (
+                AdapterLine(
+                    text="rotated",
+                    bbox=(
+                        image.width * 0.1,
+                        image.height * 0.2,
+                        image.width * 0.6,
+                        image.height * 0.8,
+                    ),
+                    confidence=0.9,
+                ),
+            )
+
+    pdf = pymupdf.open()
+    page = pdf.new_page(width=200.0, height=100.0)
+    page.set_rotation(rotation)
+    try:
+        record = extract_pages(
+            (page,),
+            document=_ocr_document(),
+            page_indexes=(1,),
+            adapter=FractionalBoxAdapter(),
+            source_sha256="c" * 64,
+            image_digest="sha256:" + "d" * 64,
+        )[0]
+    finally:
+        pdf.close()
+
+    assert record.raw_page.page_width == 200.0
+    assert record.raw_page.page_height == 100.0
+    bbox = record.raw_page.raw_blocks[0].lines[0].bbox
+    assert bbox.model_dump() == pytest.approx(expected_bbox)
+    assert 0.0 <= bbox.x0 <= bbox.x1 <= record.raw_page.page_width
+    assert 0.0 <= bbox.y0 <= bbox.y1 <= record.raw_page.page_height
 
 
 def test_reading_order_groups_row_centers_then_applies_left_column_first() -> None:
@@ -772,7 +1036,9 @@ def test_extract_ocr_cli_verifies_then_atomically_writes_count_only_output(
     source.write_bytes(b"synthetic source placeholder")
     output = tmp_path / "output"
     output.mkdir()
-    (output / "stale.txt").write_text("stale", encoding="utf-8")
+    (output / "fixture-2025.jsonl").write_text(
+        "STALE PRIVATE CONTENT\n", encoding="utf-8"
+    )
     document = _ocr_document()
     records = extract_pages(
         (FakePage(),),
@@ -791,19 +1057,8 @@ def test_extract_ocr_cli_verifies_then_atomically_writes_count_only_output(
         image_digest="sha256:" + "d" * 64,
     )
 
-    monkeypatch.setattr(cli_module, "load_manifest", lambda path: (document,))
-    monkeypatch.setattr(cli_module, "resolve_source", lambda root, selected: source)
-    monkeypatch.setattr(cli_module, "verify_source", lambda path, selected: None)
-    monkeypatch.setattr(
-        cli_module, "validate_installed_models", lambda lock, root: None
-    )
-    monkeypatch.setattr(
-        cli_module, "create_paddle_adapter", lambda lock, root: FakeAdapter(())
-    )
-    monkeypatch.setattr(
-        cli_module,
-        "extract_ocr_document",
-        lambda path, selected, page_indexes, adapter, image_digest: records,
+    _patch_successful_ocr_cli(
+        monkeypatch, source=source, document=document, records=records
     )
 
     result = CliRunner().invoke(
@@ -821,9 +1076,164 @@ def test_extract_ocr_cli_verifies_then_atomically_writes_count_only_output(
         == "documents=1 pages=1 extracted=1 quarantined=0 failed=0"
     )
     assert "PRIVATE OCR CONTENT" not in result.stdout
-    assert not (output / "stale.txt").exists()
+    assert b"STALE PRIVATE CONTENT" not in (
+        output / "fixture-2025.jsonl"
+    ).read_bytes()
     payload = json.loads((output / "fixture-2025.jsonl").read_text(encoding="utf-8"))
     assert (
         payload["raw_page"]["raw_blocks"][0]["lines"][0]["spans"][0]["text"]
         == "PRIVATE OCR CONTENT"
     )
+
+
+def test_extract_ocr_cli_writes_atomically_inside_mount_when_parent_is_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches creating a sibling promotion workspace on the read-only container root."""
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "2025.pdf"
+    source.write_bytes(b"synthetic source placeholder")
+    runtime_artifacts = tmp_path / "runtime-artifacts"
+    runtime_artifacts.mkdir()
+    output = runtime_artifacts / "ocr-smoke"
+    output.mkdir()
+    document = _ocr_document()
+    records = extract_pages(
+        (FakePage(),),
+        document=document,
+        page_indexes=(1,),
+        adapter=FakeAdapter(()),
+        source_sha256="c" * 64,
+        image_digest="sha256:" + "d" * 64,
+    )
+    _patch_successful_ocr_cli(
+        monkeypatch, source=source, document=document, records=records
+    )
+
+    runtime_artifacts.chmod(0o555)
+    try:
+        result = CliRunner().invoke(
+            app,
+            [
+                "extract-ocr",
+                "--year",
+                "2025",
+                "--pages",
+                "1",
+                "--output",
+                str(output),
+            ],
+            env={
+                "SEN_QA_SOURCE_ROOT": str(source_root),
+                "SEN_QA_INGESTION_IMAGE_DIGEST": "sha256:" + "d" * 64,
+            },
+        )
+    finally:
+        runtime_artifacts.chmod(0o755)
+
+    assert result.exit_code == 0
+    assert (output / "fixture-2025.jsonl").is_file()
+    assert list(runtime_artifacts.iterdir()) == [output]
+
+
+def test_extract_ocr_cli_preserves_and_rejects_unmanaged_output_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches mounted-directory extraction deleting or silently retaining unknown artifacts."""
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "2025.pdf"
+    source.write_bytes(b"synthetic source placeholder")
+    output = tmp_path / "ocr-smoke"
+    output.mkdir()
+    unmanaged = output / "operator-note.txt"
+    unmanaged.write_text("preserve me", encoding="utf-8")
+    document = _ocr_document()
+    records = extract_pages(
+        (FakePage(),),
+        document=document,
+        page_indexes=(1,),
+        adapter=FakeAdapter(()),
+        source_sha256="c" * 64,
+        image_digest="sha256:" + "d" * 64,
+    )
+    _patch_successful_ocr_cli(
+        monkeypatch, source=source, document=document, records=records
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["extract-ocr", "--year", "2025", "--pages", "1", "--output", str(output)],
+        env={
+            "SEN_QA_SOURCE_ROOT": str(source_root),
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "sha256:" + "d" * 64,
+        },
+    )
+
+    assert result.exit_code == 1
+    assert "unmanaged output file" in result.stdout
+    assert unmanaged.read_text(encoding="utf-8") == "preserve me"
+    assert not (output / "fixture-2025.jsonl").exists()
+
+
+def test_runtime_cli_does_not_expose_build_only_model_preparation(tmp_path: Path) -> None:
+    """Catches a network-capable model downloader remaining callable in the final image."""
+    result = CliRunner().invoke(
+        app,
+        ["prepare-ocr-models", "--help"],
+    )
+
+    assert result.exit_code == 2
+    assert "No such command" in result.output
+    assert not (tmp_path / "models").exists()
+
+
+def test_extract_ocr_cli_fails_closed_on_missing_models_before_adapter_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches runtime fallback download or Paddle initialization after local model failure."""
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "2025.pdf"
+    source.write_bytes(b"synthetic source placeholder")
+    model_root = tmp_path / "empty-models"
+    model_root.mkdir()
+    output = tmp_path / "ocr-smoke"
+    document = _ocr_document()
+    adapter_initialized = False
+
+    monkeypatch.setattr(cli_module, "load_manifest", lambda path: (document,))
+    monkeypatch.setattr(cli_module, "resolve_source", lambda root, selected: source)
+    monkeypatch.setattr(cli_module, "verify_source", lambda path, selected: None)
+
+    def fail_if_initialized(lock: object, root: Path) -> FakeAdapter:
+        nonlocal adapter_initialized
+        adapter_initialized = True
+        return FakeAdapter(())
+
+    monkeypatch.setattr(cli_module, "create_paddle_adapter", fail_if_initialized)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "extract-ocr",
+            "--year",
+            "2025",
+            "--pages",
+            "1",
+            "--output",
+            str(output),
+            "--model-root",
+            str(model_root),
+        ],
+        env={
+            "SEN_QA_SOURCE_ROOT": str(source_root),
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "sha256:" + "d" * 64,
+        },
+    )
+
+    assert result.exit_code == 1
+    assert "missing locked model file" in result.stdout
+    assert adapter_initialized is False
+    assert not output.exists()

@@ -4,19 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib
-import io
 import json
 import math
 import os
 import re
-import shutil
-import tarfile
 import tempfile
-from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, NamedTuple, Protocol, TypeAlias
 from urllib.parse import urlsplit
-from urllib.request import urlopen
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -179,7 +174,9 @@ class PaddleOcrAdapter:
             PaddleOCR = importlib.import_module("paddleocr").PaddleOCR
             self._pipeline = PaddleOCR(
                 lang="korean",
+                text_detection_model_name="PP-OCRv5_server_det",
                 text_detection_model_dir=str(detection_model),
+                text_recognition_model_name="korean_PP-OCRv5_mobile_rec",
                 text_recognition_model_dir=str(recognition_model),
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
@@ -195,7 +192,7 @@ class PaddleOcrAdapter:
         try:
             array = self._numpy.frombuffer(
                 image.rgb_bytes, dtype=self._numpy.uint8
-            ).reshape((image.height, image.width, 3))
+            ).reshape((image.height, image.width, 3))[:, :, ::-1].copy()
             output: list[AdapterLine] = []
             for result in self._pipeline.predict(array):
                 payload = result.json
@@ -243,18 +240,6 @@ def create_paddle_adapter(lock: ModelLock, model_root: Path) -> OcrAdapter:
     return PaddleOcrAdapter(
         detection_model=detection_model, recognition_model=recognition_model
     )
-
-
-def download_locked_archive(source_url: str) -> bytes:
-    """Build-only official archive fetcher; runtime extraction never calls it."""
-    try:
-        with urlopen(source_url, timeout=120) as response:
-            content = response.read()
-            if not isinstance(content, bytes):
-                raise ModelLockError("locked model download was not bytes")
-            return content
-    except OSError as error:
-        raise ModelLockError("cannot download locked model archive") from error
 
 
 class ReviewEntry(BaseModel):
@@ -465,79 +450,6 @@ def validate_installed_models(lock: ModelLock, model_root: Path) -> None:
                 raise ModelLockError("model file SHA-256 mismatch")
 
 
-def _validate_archive_members(archive: tarfile.TarFile) -> dict[str, tarfile.TarInfo]:
-    members: dict[str, tarfile.TarInfo] = {}
-    for member in archive.getmembers():
-        if "\\" in member.name:
-            raise ModelLockError("model archive member path is unsafe")
-        path = PurePosixPath(member.name)
-        if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
-            raise ModelLockError("model archive member path is unsafe")
-        normalized = path.as_posix().rstrip("/")
-        if member.issym() or member.islnk() or member.isdev():
-            raise ModelLockError("model archive member type is unsafe")
-        if normalized in members:
-            raise ModelLockError("duplicate model archive member")
-        members[normalized] = member
-    return members
-
-
-def prepare_model_staging(
-    lock: ModelLock, target: Path, fetch: Callable[[str], bytes]
-) -> None:
-    """Build-only download, verify, and atomic preparation of locked model files."""
-    if target.exists() or target.is_symlink():
-        raise ModelLockError("model staging target must not already exist")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    workspace = Path(
-        tempfile.mkdtemp(prefix=f".{target.name}.locked-models-", dir=target.parent)
-    )
-    prepared = workspace / "prepared"
-    prepared.mkdir()
-    try:
-        for model in lock.models:
-            try:
-                archive_bytes = fetch(model.source_url)
-            except (OSError, ValueError) as error:
-                raise ModelLockError("cannot download locked model archive") from error
-            if hashlib.sha256(archive_bytes).hexdigest() != model.archive_sha256:
-                raise ModelLockError("model archive SHA-256 mismatch")
-            try:
-                with tarfile.open(
-                    fileobj=io.BytesIO(archive_bytes), mode="r:*"
-                ) as archive:
-                    members = _validate_archive_members(archive)
-                    model_directory = prepared / model.name
-                    model_directory.mkdir()
-                    for locked_file in model.files:
-                        archive_path = f"{model.name}/{locked_file.path}"
-                        member = members.get(archive_path)
-                        if member is None or not member.isfile():
-                            raise ModelLockError("missing locked file in model archive")
-                        stream = archive.extractfile(member)
-                        if stream is None:
-                            raise ModelLockError(
-                                "cannot read locked file from model archive"
-                            )
-                        content = stream.read()
-                        if hashlib.sha256(content).hexdigest() != locked_file.sha256:
-                            raise ModelLockError("model file SHA-256 mismatch")
-                        destination = model_directory / locked_file.path
-                        destination.parent.mkdir(parents=True, exist_ok=True)
-                        destination.write_bytes(content)
-            except (OSError, tarfile.TarError) as error:
-                raise ModelLockError("cannot parse locked model archive") from error
-        validate_installed_models(lock, prepared)
-        os.replace(prepared, target)
-    except (ModelLockError, OSError):
-        shutil.rmtree(workspace, ignore_errors=True)
-        raise
-    try:
-        workspace.rmdir()
-    except OSError as error:
-        raise ModelLockError("cannot clean model preparation workspace") from error
-
-
 def _row_center(line: AdapterLine) -> float:
     return (line.bbox[1] + line.bbox[3]) / 2.0
 
@@ -581,6 +493,67 @@ def sort_reading_order(
     left = [line for line in lines if line.bbox[0] < midpoint]
     right = [line for line in lines if line.bbox[0] >= midpoint]
     return _sort_one_column(left) + _sort_one_column(right)
+
+
+def _scale_lines_to_pdf_points(
+    lines: tuple[AdapterLine, ...],
+    *,
+    page_rect: Any,
+    derotation_matrix: Any,
+    raster_width: int,
+    raster_height: int,
+) -> tuple[tuple[AdapterLine, ...], float, float]:
+    """Convert rotated raster pixels to local unrotated PDF-point coordinates."""
+    rect_x0 = float(page_rect.x0)
+    rect_y0 = float(page_rect.y0)
+    rect_x1 = float(page_rect.x1)
+    rect_y1 = float(page_rect.y1)
+    rotated_width = rect_x1 - rect_x0
+    rotated_height = rect_y1 - rect_y0
+    matrix = tuple(float(value) for value in derotation_matrix)
+    if len(matrix) != 6:
+        raise ValueError("page derotation matrix is invalid")
+    a, b, c, d, e, f = matrix
+
+    def derotate(x: float, y: float) -> tuple[float, float]:
+        return (x * a + y * c + e, x * b + y * d + f)
+
+    page_corners = tuple(
+        derotate(x, y)
+        for x in (rect_x0, rect_x1)
+        for y in (rect_y0, rect_y1)
+    )
+    page_x0 = min(point[0] for point in page_corners)
+    page_y0 = min(point[1] for point in page_corners)
+    page_width = max(point[0] for point in page_corners) - page_x0
+    page_height = max(point[1] for point in page_corners) - page_y0
+    x_scale = rotated_width / raster_width
+    y_scale = rotated_height / raster_height
+
+    point_lines: list[AdapterLine] = []
+    for line in lines:
+        x0, y0, x1, y1 = line.bbox
+        rotated_corners = (
+            (rect_x0 + x0 * x_scale, rect_y0 + y0 * y_scale),
+            (rect_x0 + x0 * x_scale, rect_y0 + y1 * y_scale),
+            (rect_x0 + x1 * x_scale, rect_y0 + y0 * y_scale),
+            (rect_x0 + x1 * x_scale, rect_y0 + y1 * y_scale),
+        )
+        page_points = tuple(derotate(x, y) for x, y in rotated_corners)
+        point_lines.append(
+            AdapterLine(
+                text=line.text,
+                bbox=(
+                    min(point[0] for point in page_points) - page_x0,
+                    min(point[1] for point in page_points) - page_y0,
+                    max(point[0] for point in page_points) - page_x0,
+                    max(point[1] for point in page_points) - page_y0,
+                ),
+                confidence=line.confidence,
+                field_type=line.field_type,
+            )
+        )
+    return tuple(point_lines), page_width, page_height
 
 
 def _render_hash(pixmap: Any, *, render_dpi: int) -> str:
@@ -671,11 +644,11 @@ def _raw_ocr_page(
     document: SourceDocument,
     pdf_page_index: int,
     page_label: str | None,
-    pixmap: Any,
+    page_width: float,
+    page_height: float,
     render_sha256: str,
     lines: tuple[AdapterLine, ...],
 ) -> RawPage:
-    ordered = sort_reading_order(lines, page_width=float(pixmap.width))
     raw_lines = tuple(
         RawLine(
             bbox=BoundingBox.from_tuple(line.bbox),
@@ -690,10 +663,10 @@ def _raw_ocr_page(
                 ),
             ),
         )
-        for line in ordered
+        for line in lines
     )
     page_box = BoundingBox(
-        x0=0.0, y0=0.0, x1=float(pixmap.width), y1=float(pixmap.height)
+        x0=0.0, y0=0.0, x1=page_width, y1=page_height
     )
     return RawPage(
         doc_id=document.doc_id,
@@ -701,8 +674,8 @@ def _raw_ocr_page(
         extraction_source="ocr",
         pdf_page_index=pdf_page_index,
         page_label=page_label,
-        page_width=float(pixmap.width),
-        page_height=float(pixmap.height),
+        page_width=page_width,
+        page_height=page_height,
         render_sha256=render_sha256,
         raw_blocks=(RawBlock(bbox=page_box, lines=raw_lines),),
     )
@@ -749,7 +722,19 @@ def extract_pages(
             document.edition_year, pdf_page_index, policy=document.page_numbering
         )
         try:
-            pixmap = pages[pdf_page_index - 1].get_pixmap(
+            page = pages[pdf_page_index - 1]
+            page_rect = page.rect
+            rotated_width = float(page_rect.width)
+            rotated_height = float(page_rect.height)
+            if (
+                not math.isfinite(rotated_width)
+                or not math.isfinite(rotated_height)
+                or rotated_width <= 0
+                or rotated_height <= 0
+            ):
+                raise ValueError("page point geometry is invalid")
+            derotation_matrix = page.derotation_matrix
+            pixmap = page.get_pixmap(
                 dpi=policy.render_dpi, alpha=False
             )
             if int(pixmap.n) != 3:
@@ -795,13 +780,24 @@ def extract_pages(
                 )
             )
             continue
+        ordered_pixel_lines = sort_reading_order(
+            adapter_lines, page_width=float(pixmap.width)
+        )
+        point_lines, page_width, page_height = _scale_lines_to_pdf_points(
+            ordered_pixel_lines,
+            page_rect=page_rect,
+            derotation_matrix=derotation_matrix,
+            raster_width=int(pixmap.width),
+            raster_height=int(pixmap.height),
+        )
         raw_page = _raw_ocr_page(
             document=document,
             pdf_page_index=pdf_page_index,
             page_label=label,
-            pixmap=pixmap,
+            page_width=page_width,
+            page_height=page_height,
             render_sha256=render_sha256,
-            lines=adapter_lines,
+            lines=point_lines,
         )
         critical_policy, critical_fields, review_status = _critical_review(
             document.edition_year
@@ -819,7 +815,7 @@ def extract_pages(
                 quality_flags=policy.quality_flags,
                 raw_page=raw_page,
                 review_queue=_review_queue(
-                    adapter_lines,
+                    point_lines,
                     source_sha256=source_sha256,
                     pdf_page_index=pdf_page_index,
                 ),

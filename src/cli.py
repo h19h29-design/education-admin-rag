@@ -19,10 +19,8 @@ from src.ingestion.extract_ocr import (
     OcrAdapterError,
     OcrExtractionError,
     create_paddle_adapter,
-    download_locked_archive,
     extract_ocr_document,
     load_model_lock,
-    prepare_model_staging,
     validate_installed_models,
     write_ocr_jsonl,
 )
@@ -240,23 +238,6 @@ def extract_native(
         raise typer.Exit(code=1)
 
 
-@app.command("prepare-ocr-models")
-def prepare_ocr_models(
-    lock_path: Path = typer.Option(  # noqa: B008 - Typer declares CLI parameters this way.
-        Path("config/models.lock.json"), "--lock", exists=True, dir_okay=False, readable=True
-    ),
-    output: Path = typer.Option(..., "--output", file_okay=False),  # noqa: B008
-) -> None:
-    """Build-only preparation of hash-locked official OCR model archives."""
-    try:
-        lock = load_model_lock(lock_path)
-        prepare_model_staging(lock, output, download_locked_archive)
-    except (ModelLockError, OSError) as error:
-        typer.echo(f"models=0 failed=1 error={error}")
-        raise typer.Exit(code=1) from error
-    typer.echo(f"models={len(lock.models)} failed=0")
-
-
 @app.command("validate-ocr-models")
 def validate_ocr_models(
     lock_path: Path = typer.Option(  # noqa: B008 - Typer declares CLI parameters this way.
@@ -332,21 +313,19 @@ def extract_ocr(
         typer.echo(f"documents=0 pages=0 extracted=0 quarantined=0 failed=1 error={error}")
         raise typer.Exit(code=1) from error
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    workspace = Path(tempfile.mkdtemp(prefix=f".{output.name}.promotion-", dir=output.parent))
-    staging = workspace / "new-output"
-    staging.mkdir()
-    promotion_started = False
+    managed_output = output / f"{document.doc_id}.jsonl"
     try:
+        output.mkdir(parents=True, exist_ok=True)
+        unmanaged = sorted(
+            path.name for path in output.iterdir() if path != managed_output
+        )
+        if unmanaged:
+            raise OcrExtractionError("unmanaged output file prevents OCR extraction")
         records = extract_ocr_document(source, document, page_indexes, adapter, image_digest)
-        write_ocr_jsonl(staging / f"{document.doc_id}.jsonl", records)
+        write_ocr_jsonl(managed_output, records)
         extracted = sum(record.status == "extracted" for record in records)
         quarantined = sum(record.status == "quarantined" for record in records)
-        promotion_started = True
-        _replace_output_directory(staging, output)
     except (OcrExtractionError, NativeExtractionError, ValueError, OSError) as error:
-        if not promotion_started:
-            shutil.rmtree(workspace, ignore_errors=True)
         typer.echo("documents=1 pages=0 extracted=0 quarantined=0 failed=1 error=" + str(error))
         raise typer.Exit(code=1) from error
     typer.echo(
