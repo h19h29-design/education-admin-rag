@@ -1,9 +1,14 @@
+import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
+import sqlite3
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn, cast
 
 import typer
 from pydantic import BaseModel
@@ -31,8 +36,67 @@ from src.ingestion.manifest import (
     resolve_source,
     verify_source,
 )
+from src.ingestion.review import (
+    ReviewConflictError,
+    ReviewError,
+    ReviewPurpose,
+    ReviewStore,
+    ReviewValidationError,
+    RunMode,
+    SegmentManifest,
+    validate_review_reason,
+)
 
 app = typer.Typer(no_args_is_help=True)
+review_app = typer.Typer(no_args_is_help=True)
+app.add_typer(review_app, name="review")
+
+
+def _current_os_actor() -> str:
+    """Bind CLI review actions to the effective operating-system account."""
+    effective_uid = os.geteuid()
+    try:
+        username = pwd.getpwuid(effective_uid).pw_name
+    except KeyError as error:
+        raise ReviewValidationError("effective OS account is not resolvable") from error
+    return f"uid:{effective_uid}:{username}"
+
+
+_review_actor_provider: Callable[[], str] = _current_os_actor
+
+
+def _review_actor(declared_reviewer_id: str | None) -> str:
+    try:
+        actor = _review_actor_provider()
+    except (ReviewError, OSError):
+        _review_cli_fail("actor_resolution_failed", exit_code=2)
+    actor_parts = actor.split(":", maxsplit=2)
+    pwd_username = (
+        actor_parts[2]
+        if len(actor_parts) == 3
+        and actor_parts[0] == "uid"
+        and actor_parts[1].isdecimal()
+        else None
+    )
+    if declared_reviewer_id is not None and declared_reviewer_id not in {
+        actor,
+        pwd_username,
+    }:
+        _review_cli_fail("actor_mismatch", exit_code=2)
+    return actor
+
+
+def _review_cli_fail(
+    code: str, *, exit_code: int = 1, updated: int = 0
+) -> NoReturn:
+    typer.echo(f"updated={updated} failed=1 error_code={code}")
+    raise typer.Exit(code=exit_code)
+
+
+def _safe_review_error(error: BaseException, *, updated: int = 0) -> NoReturn:
+    if isinstance(error, ReviewError):
+        _review_cli_fail(error.code, updated=updated)
+    _review_cli_fail("storage_error", updated=updated)
 
 
 @app.callback()
@@ -43,6 +107,263 @@ def main() -> None:
 @app.command()
 def version() -> None:
     typer.echo("education-admin-rag 0.1.0")
+
+
+@review_app.command("verify-fields")
+def review_verify_fields(
+    database: Path = typer.Option(  # noqa: B008 - Typer declares CLI parameters this way.
+        ..., "--db", exists=True, dir_okay=False, readable=True, writable=True
+    ),
+    case_id: str = typer.Option(..., "--case-id"),
+    content_sha256: str = typer.Option(..., "--content-sha256"),
+    reason: str = typer.Option(..., "--reason"),
+    reviewer_id: str | None = typer.Option(None, "--reviewer-id"),
+) -> None:
+    """Attest that every critical field matches a content-addressed candidate."""
+    actor = _review_actor(reviewer_id)
+    try:
+        with ReviewStore(database) as store:
+            store.verify_critical_fields(
+                case_id,
+                reviewer_id=actor,
+                reviewed_content_sha256=content_sha256,
+                reason=reason,
+            )
+    except (ReviewError, sqlite3.Error, OSError) as error:
+        _safe_review_error(error)
+    typer.echo(f"updated=1 case_id={case_id} status=needs_review failed=0")
+
+
+@review_app.command("approve-search")
+def review_approve_search(
+    database: Path = typer.Option(  # noqa: B008
+        ..., "--db", exists=True, dir_okay=False, readable=True, writable=True
+    ),
+    case_id: str = typer.Option(..., "--case-id"),
+    content_sha256: str = typer.Option(..., "--content-sha256"),
+    reason: str = typer.Option(..., "--reason"),
+    reviewer_id: str | None = typer.Option(None, "--reviewer-id"),
+) -> None:
+    """Approve a critical-field-verified case for staff search only."""
+    actor = _review_actor(reviewer_id)
+    try:
+        with ReviewStore(database) as store:
+            store.approve_search(
+                case_id,
+                reviewer_id=actor,
+                reviewed_content_sha256=content_sha256,
+                reason=reason,
+            )
+    except (ReviewError, sqlite3.Error, OSError) as error:
+        _safe_review_error(error)
+    typer.echo(f"updated=1 case_id={case_id} status=search_approved failed=0")
+
+
+@review_app.command("approve-answer")
+def review_approve_answer(
+    database: Path = typer.Option(  # noqa: B008
+        ..., "--db", exists=True, dir_okay=False, readable=True, writable=True
+    ),
+    case_id: str = typer.Option(..., "--case-id"),
+    content_sha256: str = typer.Option(..., "--content-sha256"),
+    reason: str = typer.Option(..., "--reason"),
+    content_verified: bool = typer.Option(False, "--content-verified"),
+    basis_verified: bool = typer.Option(False, "--basis-verified"),
+    privacy_verified: bool = typer.Option(False, "--privacy-verified"),
+    reviewer_id: str | None = typer.Option(None, "--reviewer-id"),
+) -> None:
+    """Approve answer use after an independent reviewer confirms all three gates."""
+    if not all((content_verified, basis_verified, privacy_verified)):
+        _review_cli_fail("verification_required", exit_code=2)
+    actor = _review_actor(reviewer_id)
+    try:
+        with ReviewStore(database) as store:
+            store.approve_answer(
+                case_id,
+                reviewer_id=actor,
+                reviewed_content_sha256=content_sha256,
+                reason=reason,
+                content_verified=content_verified,
+                basis_verified=basis_verified,
+                privacy_verified=privacy_verified,
+            )
+    except (ReviewError, sqlite3.Error, OSError) as error:
+        _safe_review_error(error)
+    typer.echo(f"updated=1 case_id={case_id} status=approved failed=0")
+
+
+@review_app.command("reject")
+def review_reject(
+    database: Path = typer.Option(  # noqa: B008
+        ..., "--db", exists=True, dir_okay=False, readable=True, writable=True
+    ),
+    case_id: str = typer.Option(..., "--case-id"),
+    content_sha256: str = typer.Option(..., "--content-sha256"),
+    reason: str = typer.Option(..., "--reason"),
+    reviewer_id: str | None = typer.Option(None, "--reviewer-id"),
+) -> None:
+    """Reject one nonterminal candidate, making the review state terminal."""
+    actor = _review_actor(reviewer_id)
+    try:
+        with ReviewStore(database) as store:
+            store.reject(
+                case_id,
+                reviewer_id=actor,
+                reviewed_content_sha256=content_sha256,
+                reason=reason,
+            )
+    except (ReviewError, sqlite3.Error, OSError) as error:
+        _safe_review_error(error)
+    typer.echo(f"updated=1 case_id={case_id} status=rejected failed=0")
+
+
+def _load_review_manifest(path: Path, expected_sha256: str) -> SegmentManifest:
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise ReviewValidationError("manifest cannot be read") from error
+    actual_sha256 = hashlib.sha256(raw).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ReviewValidationError("manifest hash mismatch")
+    return SegmentManifest.from_bytes(raw)
+
+
+@review_app.command("run")
+def review_run(
+    mode: str = typer.Option(..., "--mode"),
+    database: Path = typer.Option(  # noqa: B008
+        ..., "--db", exists=True, dir_okay=False, readable=True, writable=True
+    ),
+    manifest: Path = typer.Option(  # noqa: B008
+        ..., "--manifest", exists=True, dir_okay=False, readable=True
+    ),
+    manifest_sha256: str = typer.Option(..., "--manifest-sha256"),
+    reason: str = typer.Option(..., "--reason"),
+    content_verified: bool = typer.Option(False, "--content-verified"),
+    basis_verified: bool = typer.Option(False, "--basis-verified"),
+    privacy_verified: bool = typer.Option(False, "--privacy-verified"),
+    reviewer_id: str | None = typer.Option(None, "--reviewer-id"),
+) -> None:
+    """Review every content-addressed case in a canonical segment manifest."""
+    updated = 0
+    if mode not in {"critical-fields-all", "answer-and-basis-all"}:
+        _review_cli_fail("invalid_mode", exit_code=2)
+    if mode == "answer-and-basis-all" and not all(
+        (content_verified, basis_verified, privacy_verified)
+    ):
+        _review_cli_fail("verification_required", exit_code=2)
+    actor = _review_actor(reviewer_id)
+    try:
+        reason = validate_review_reason(reason)
+        parsed = _load_review_manifest(manifest, manifest_sha256)
+        with ReviewStore(database) as store:
+            canonical_cases = tuple(
+                store.canonical_reference(reference.case_id)
+                for reference in parsed.cases
+            )
+        for supplied, canonical in zip(parsed.cases, canonical_cases, strict=True):
+            if supplied.content_sha256 != canonical.content_sha256:
+                raise ReviewConflictError("canonical content binding mismatch")
+        with ReviewStore(database) as store:
+            completed_cases = tuple(
+                store.run_case_complete(
+                    cast(RunMode, mode),
+                    reference=reference,
+                    manifest_sha256=manifest_sha256,
+                )
+                for reference in canonical_cases
+            )
+        for reference, completed in zip(
+            canonical_cases, completed_cases, strict=True
+        ):
+            if completed:
+                continue
+            typer.echo(
+                f"case_id={reference.case_id} content_sha256={reference.content_sha256}"
+            )
+            for location in reference.source_locations:
+                bbox = ",".join(f"{coordinate:g}" for coordinate in location.bbox)
+                typer.echo(
+                    f"page_id={location.page_id} bbox={bbox} "
+                    f"reason_code={location.reason_code} count={location.count}"
+                )
+            try:
+                confirmed = typer.confirm("confirm reviewed metadata", default=False)
+            except typer.Abort:
+                _review_cli_fail(
+                    "confirmation_required", exit_code=2, updated=updated
+                )
+            if not confirmed:
+                _review_cli_fail(
+                    "confirmation_required", exit_code=2, updated=updated
+                )
+            with ReviewStore(database) as store:
+                updated += store.run_mode(
+                    cast(RunMode, mode),
+                    cases=(reference,),
+                    reviewer_id=actor,
+                    reason=reason,
+                    content_verified=content_verified,
+                    basis_verified=basis_verified,
+                    privacy_verified=privacy_verified,
+                    manifest_sha256=manifest_sha256,
+                )
+    except (ReviewError, sqlite3.Error, OSError) as error:
+        _safe_review_error(error, updated=updated)
+    typer.echo(f"updated={updated} mode={mode} failed=0")
+
+
+@review_app.command("approve-search-batch")
+def review_approve_search_batch(
+    database: Path = typer.Option(  # noqa: B008
+        ..., "--db", exists=True, dir_okay=False, readable=True, writable=True
+    ),
+    manifest: Path = typer.Option(  # noqa: B008
+        ..., "--manifest", exists=True, dir_okay=False, readable=True
+    ),
+    manifest_sha256: str = typer.Option(..., "--manifest-sha256"),
+    reason: str = typer.Option(..., "--reason"),
+    reviewer_id: str | None = typer.Option(None, "--reviewer-id"),
+) -> None:
+    """Atomically search-approve every case in one canonical hashed segment."""
+    actor = _review_actor(reviewer_id)
+    try:
+        raw = manifest.read_bytes()
+        with ReviewStore(database) as store:
+            updated = store.approve_search_batch(
+                raw,
+                manifest_sha256=manifest_sha256,
+                reviewer_id=actor,
+                reason=reason,
+            )
+    except (ReviewError, sqlite3.Error, OSError) as error:
+        _safe_review_error(error)
+    typer.echo(f"updated={updated} failed=0")
+
+
+@review_app.command("assert-ready")
+def review_assert_ready(
+    database: Path = typer.Option(  # noqa: B008
+        ..., "--db", exists=True, dir_okay=False, readable=True, writable=True
+    ),
+    purpose: str = typer.Option("answer", "--purpose"),
+) -> None:
+    """Fail unless every queued case is eligible, emitting blocker counts only."""
+    if purpose not in {"search", "answer"}:
+        _review_cli_fail("invalid_purpose", exit_code=2)
+    try:
+        with ReviewStore(database) as store:
+            report = store.assert_ready(purpose=cast(ReviewPurpose, purpose))
+    except (ReviewError, sqlite3.Error, OSError) as error:
+        _safe_review_error(error)
+    blockers = ",".join(f"{code}:{count}" for code, count in report.blockers.items())
+    failed = int(not report.ready)
+    typer.echo(
+        f"ready={int(report.ready)} total={report.total} eligible={report.eligible} "
+        f"blockers={blockers or 'none'} failed={failed}"
+    )
+    if not report.ready:
+        raise typer.Exit(code=1)
 
 
 @app.command("verify-sources")

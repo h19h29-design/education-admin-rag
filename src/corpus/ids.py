@@ -11,7 +11,33 @@ from datetime import UTC, datetime
 _WHITESPACE = re.compile(r"\s+")
 _SAFE_CASE_NO = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
 _RESERVED_DUPLICATE_SUFFIX = re.compile(r"^.+-p[1-9][0-9]*-[0-9a-f]{8}$")
+_RESERVED_OPAQUE_CASE_NO = re.compile(r"^opaque-[0-9a-f]{12}$")
+_DUPLICATE_CASE_COMPONENT = re.compile(
+    r"^(?P<base>.+)-p[1-9][0-9]*-[0-9a-f]{8}$"
+)
+_DUPLICATE_LIKE_CASE_COMPONENT = re.compile(
+    r"^(?:.+-)?p[0-9]+-[0-9a-f]{8}$"
+)
+_HASHED_BUSINESS_SLUG = re.compile(r"^[0-9a-f]{10}$")
 _HEX_SHA = re.compile(r"^[0-9a-fA-F]+$")
+_CANONICAL_CASE_ID = re.compile(
+    r"^senqa-(?P<year>[0-9]{4})-(?P<body>[a-z0-9]+(?:-[a-z0-9]+)*)$"
+)
+_SENSITIVE_COMPACT_NUMBER = re.compile(r"[0-9]{10,64}")
+_SENSITIVE_GROUPED_NUMBER = re.compile(
+    r"(?:"
+    r"[0-9]{6}-[1-8][0-9]{6}|"
+    r"[0-9]{2,6}(?:-[0-9]{2,6}){2,5}"
+    r")"
+)
+_SENSITIVE_PROVIDER_TOKEN = re.compile(
+    r"(?:"
+    r"(?:akia|asia)[a-z0-9]{16}|"
+    r"sk-(?:proj-|ant-)?[a-z0-9-]{16,256}|"
+    r"xox[baprs]-[a-z0-9-]{16,255}|"
+    r"(?:sk|rk)-(?:live|test)-[a-z0-9-]{16,255}"
+    r")"
+)
 
 # These source-facing Korean labels are intentionally fixed.  New labels use a
 # deterministic hash until a reviewed vocabulary update adds an explicit slug.
@@ -48,6 +74,9 @@ _BUSINESS_SLUGS = {
     "학교회계 예결산": "school-accounting-budget-settlement",
     "학교회계 지출": "school-accounting-expenditure",
 }
+_REGISTERED_BUSINESS_SLUGS = tuple(
+    sorted(frozenset(_BUSINESS_SLUGS.values()), key=len, reverse=True)
+)
 
 
 def _normalized_text(value: str, *, label: str) -> str:
@@ -74,11 +103,94 @@ def _normalize_case_number(case_no: str) -> str:
     normalized = _normalized_text(case_no, label="case number").replace(" ", "-")
     if not _SAFE_CASE_NO.fullmatch(normalized):
         raise ValueError("case number must contain only letters, numbers, and single hyphens")
-    if _RESERVED_DUPLICATE_SUFFIX.fullmatch(normalized.lower()):
+    canonical = normalized.lower()
+    if _RESERVED_DUPLICATE_SUFFIX.fullmatch(canonical):
         raise ValueError("case number uses a reserved duplicate suffix")
-    if normalized.isdigit():
-        return str(int(normalized))
-    return normalized.lower()
+    if _RESERVED_OPAQUE_CASE_NO.fullmatch(canonical):
+        raise ValueError("case number uses a reserved opaque form")
+    if _case_number_requires_rejection(canonical):
+        raise ValueError("case number is not eligible for a canonical ID")
+    if canonical.isdigit():
+        return str(int(canonical))
+    return canonical
+
+
+def _case_number_requires_rejection(value: str) -> bool:
+    compact_digits = value.replace("-", "")
+    return bool(
+        (len(compact_digits) >= 10 and compact_digits.isdigit())
+        or _SENSITIVE_COMPACT_NUMBER.search(value)
+        or _SENSITIVE_GROUPED_NUMBER.search(value)
+        or _SENSITIVE_PROVIDER_TOKEN.search(value)
+        or len(value) > 64
+        or any(len(component) >= 24 for component in value.split("-"))
+    )
+
+
+def _consume_business_slug(value: str) -> tuple[str, str] | None:
+    for slug in _REGISTERED_BUSINESS_SLUGS:
+        prefix = f"{slug}-"
+        if value.startswith(prefix):
+            return slug, value[len(prefix) :]
+    if (
+        len(value) > 10
+        and value[10] == "-"
+        and _HASHED_BUSINESS_SLUG.fullmatch(value[:10])
+    ):
+        return value[:10], value[11:]
+    return None
+
+
+def _is_canonical_case_component(value: str) -> bool:
+    duplicate = _DUPLICATE_CASE_COMPONENT.fullmatch(value)
+    if duplicate is not None:
+        base = duplicate.group("base")
+    elif _DUPLICATE_LIKE_CASE_COMPONENT.fullmatch(value):
+        return False
+    else:
+        base = value
+
+    try:
+        return _normalize_case_number(base) == base
+    except ValueError:
+        return False
+
+
+def _canonical_body_components(body: str) -> tuple[str, str, str] | None:
+    duplicate = _DUPLICATE_CASE_COMPONENT.fullmatch(body)
+    if duplicate is None:
+        base_body = body
+        duplicate_suffix = ""
+    else:
+        base_body = duplicate.group("base")
+        duplicate_suffix = body[len(base_body) :]
+
+    domain = _consume_business_slug(base_body)
+    if domain is None:
+        return None
+    domain_slug, after_domain = domain
+    part = _consume_business_slug(after_domain)
+    if part is None:
+        return None
+    part_slug, case_component = part
+    return domain_slug, part_slug, case_component + duplicate_suffix
+
+
+def _has_canonical_body(body: str) -> bool:
+    components = _canonical_body_components(body)
+    return components is not None and _is_canonical_case_component(components[2])
+
+
+def validate_case_id(case_id: str) -> str:
+    """Validate a bounded opaque canonical ID without echoing rejected input."""
+    if not isinstance(case_id, str) or len(case_id) > 200:
+        raise ValueError("invalid canonical case ID")
+    match = _CANONICAL_CASE_ID.fullmatch(case_id)
+    if match is None or not 1900 <= int(match.group("year")) <= 2100:
+        raise ValueError("invalid canonical case ID")
+    if not _has_canonical_body(match.group("body")):
+        raise ValueError("invalid canonical case ID")
+    return case_id
 
 
 def make_case_id(
@@ -94,12 +206,19 @@ def make_case_id(
     """Build a stable case ID, adding a source anchor only for duplicate numbers."""
     if not 1900 <= edition_year <= 2100:
         raise ValueError("edition year must be between 1900 and 2100")
-    case_id = (
-        f"senqa-{edition_year}-{_business_slug(domain)}-{_business_slug(part)}-"
-        f"{_normalize_case_number(case_no)}"
-    )
+    domain_slug = _business_slug(domain)
+    part_slug = _business_slug(part)
+    canonical_case_number = _normalize_case_number(case_no)
+    body = f"{domain_slug}-{part_slug}-{canonical_case_number}"
+    if _canonical_body_components(body) != (
+        domain_slug,
+        part_slug,
+        canonical_case_number,
+    ):
+        raise ValueError("business labels and case number form an ambiguous canonical case ID")
+    case_id = f"senqa-{edition_year}-{body}"
     if not duplicate:
-        return case_id
+        return validate_case_id(case_id)
     if isinstance(start_page, bool) or not isinstance(start_page, int) or start_page < 1:
         raise ValueError("duplicate start page must be a positive integer")
     if title is None:
@@ -108,7 +227,7 @@ def make_case_id(
         suffix = title_hash(title)
     except ValueError as error:
         raise ValueError("duplicate case IDs require a valid start page and title") from error
-    return f"{case_id}-p{start_page}-{suffix}"
+    return validate_case_id(f"{case_id}-p{start_page}-{suffix}")
 
 
 @dataclass
@@ -140,8 +259,10 @@ class IssuedIdRegistry:
 
 
 def _validate_issued_id(case_id: str) -> None:
-    if not case_id or case_id != case_id.strip():
-        raise ValueError("case ID must be a nonblank stable identifier")
+    try:
+        validate_case_id(case_id)
+    except ValueError as error:
+        raise ValueError("case ID must be a valid canonical identifier") from error
 
 
 def make_release_id(released_at: datetime, git_sha: str) -> str:

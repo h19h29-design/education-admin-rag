@@ -25,6 +25,7 @@ from src.ingestion.extract_common import (
 )
 from src.ingestion.extract_native import DOCUMENT_IO_ERRORS, PAGE_EXTRACTION_ERRORS
 from src.ingestion.manifest import SourceDocument
+from src.ingestion.policy import OCR_LOW_CONFIDENCE_THRESHOLD
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PACKAGE_VERSIONS = {"paddleocr": "3.7.0", "paddlepaddle": "3.1.1"}
@@ -33,8 +34,6 @@ _MUTABLE_REVISIONS = {"latest", "main", "master", "head"}
 _IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DOCUMENT_NUMBER_RE = re.compile(r"^[0-9A-Za-z가-힣\s-]+$")
 _OCR_RENDER_HASH_PREFIX = b"sen-qa-ocr-render-v1\0rgb8\0"
-_LOW_CONFIDENCE_THRESHOLD = 0.85
-
 FieldType = Literal[
     "title",
     "question",
@@ -168,8 +167,7 @@ class PaddleOcrAdapter:
 
     def __init__(self, *, detection_model: Path, recognition_model: Path) -> None:
         try:
-            import numpy as numpy_module
-
+            numpy_module = importlib.import_module("numpy")
             self._numpy = numpy_module
             PaddleOCR = importlib.import_module("paddleocr").PaddleOCR
             self._pipeline = PaddleOCR(
@@ -583,7 +581,7 @@ def _review_queue(
     entries: list[ReviewEntry] = []
     for line in lines:
         reason: Literal["low-confidence", "invalid-document-number"] | None = None
-        if line.confidence < _LOW_CONFIDENCE_THRESHOLD:
+        if line.confidence < OCR_LOW_CONFIDENCE_THRESHOLD:
             reason = "low-confidence"
         elif line.field_type == "document_number" and not _valid_document_number(
             line.text

@@ -390,6 +390,53 @@ def test_paddle_adapter_selects_locked_model_names_and_preserves_result_schema(
     captured: dict[str, object] = {}
     predicted_images: list[object] = []
 
+    class FakeRasterArray:
+        def __init__(self, values: list[int]) -> None:
+            self.values = values
+
+        def reshape(self, shape: tuple[int, int, int]) -> FakeRasterArray:
+            assert shape == (1, 1, 3)
+            return self
+
+        def __getitem__(self, key: object) -> FakeRasterArray:
+            assert key == (slice(None), slice(None), slice(None, None, -1))
+            return FakeRasterArray(list(reversed(self.values)))
+
+        def copy(self) -> FakeRasterArray:
+            return FakeRasterArray(self.values.copy())
+
+        def tolist(self) -> list[list[list[int]]]:
+            return [[self.values]]
+
+    class FakeVector:
+        def __init__(self, values: list[float]) -> None:
+            self.values = values
+
+        def min(self) -> float:
+            return min(self.values)
+
+        def max(self) -> float:
+            return max(self.values)
+
+    class FakePoints:
+        def __init__(self, values: object) -> None:
+            self.values = values
+            self.ndim = 2
+            self.shape = (4, 2)
+
+        def __getitem__(self, key: object) -> FakeVector:
+            rows = self.values
+            assert isinstance(rows, list)
+            assert isinstance(key, tuple) and key[0] == slice(None)
+            column = key[1]
+            assert isinstance(column, int)
+            return FakeVector([float(row[column]) for row in rows])
+
+    fake_numpy = SimpleNamespace(
+        uint8=object(),
+        frombuffer=lambda values, dtype: FakeRasterArray(list(values)),
+        asarray=lambda values, dtype: FakePoints(values),
+    )
     class CapturingPaddleOcr:
         def __init__(self, **kwargs: object) -> None:
             captured.update(kwargs)
@@ -411,7 +458,9 @@ def test_paddle_adapter_selects_locked_model_names_and_preserves_result_schema(
     monkeypatch.setattr(
         ocr_module.importlib,
         "import_module",
-        lambda name: SimpleNamespace(PaddleOCR=CapturingPaddleOcr),
+        lambda name: fake_numpy
+        if name == "numpy"
+        else SimpleNamespace(PaddleOCR=CapturingPaddleOcr),
     )
     detection_model = tmp_path / "PP-OCRv5_server_det_infer"
     recognition_model = tmp_path / "korean_PP-OCRv5_mobile_rec_infer"
