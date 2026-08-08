@@ -184,7 +184,7 @@ git add .python-version pyproject.toml uv.lock .gitignore docker/ingestion.Docke
 git commit -m "build: scaffold corpus pipeline"
 ```
 
-## Task 1A: 기존 노출 키 차단과 history-aware secret gate
+## Task 2: 기존 노출 키 차단과 history-aware secret gate
 
 **Files:**
 
@@ -242,7 +242,7 @@ git add 교육행정_AI_Launcher.html tests/security/test_no_client_ai_secret.py
 git commit -m "security: disable exposed client AI integration"
 ```
 
-## Task 2: 원본 6권 manifest와 변경 탐지
+## Task 3: 원본 6권 manifest와 변경 탐지
 
 **Files:**
 
@@ -358,7 +358,7 @@ git add data/manifests/sen_qa_sources.json src/ingestion/manifest.py tests/inges
 git commit -m "feat: verify source document manifest"
 ```
 
-## Task 3: 정규 데이터 모델, 상태 불변식, 안정적 ID
+## Task 4: 정규 데이터 모델, 상태 불변식, 안정적 ID
 
 **Files:**
 
@@ -464,7 +464,7 @@ git add src/corpus/models.py src/corpus/ids.py data/schemas/document.schema.json
 git commit -m "feat: define canonical corpus contracts"
 ```
 
-## Task 4: 공통 page JSONL과 2020~2022 native 추출
+## Task 5: 공통 page JSONL과 2020~2022 native 추출
 
 **Files:**
 
@@ -534,7 +534,7 @@ git add src/ingestion/extract_common.py src/ingestion/extract_native.py tests/fi
 git commit -m "feat: extract native PDF pages with provenance"
 ```
 
-## Task 5: 2023~2025 전체 페이지 PaddleOCR 추출
+## Task 6: 2023~2025 전체 페이지 PaddleOCR 추출
 
 **Files:**
 
@@ -606,7 +606,7 @@ git add config/models.lock.json docker/ingestion.Dockerfile src/ingestion/extrac
 git commit -m "feat: extract OCR pages with locked models"
 ```
 
-## Task 6: 정규화, 개인정보 분류, 품질 게이트
+## Task 7: 정규화, 개인정보 분류, 품질 게이트
 
 **Files:**
 
@@ -707,7 +707,7 @@ git add src/ingestion/normalize.py src/ingestion/privacy.py src/ingestion/qualit
 git commit -m "feat: gate corpus quality and privacy"
 ```
 
-## Task 7: 연도별 사례 경계 파서와 페이지 연속성
+## Task 8: 연도별 사례 경계 파서와 페이지 연속성
 
 **Files:**
 
@@ -793,7 +793,7 @@ git add src/ingestion/parse_common.py src/ingestion/parse_2020.py src/ingestion/
 git commit -m "feat: parse yearly question answer layouts"
 ```
 
-## Task 8: canonical corpus, 법령·관계·역할 기반 청킹
+## Task 9: canonical corpus, 법령·관계·역할 기반 청킹
 
 **Files:**
 
@@ -838,7 +838,7 @@ uv run pytest tests/corpus/test_relations.py tests/corpus/test_chunking.py tests
 
 - [ ] **Step 3: chunk token counter가 사용할 `bge-m3` tokenizer를 lock한다.**
 
-network-enabled model-lock 단계에서 `BAAI/bge-m3`의 40자리 commit SHA와 tokenizer/model 파일 SHA-256을 `config/models.lock.json`에 기록한다. 이 단계에서는 image를 만들지 않고 lock과 검증된 staging cache만 생성하며, Task 10에서 같은 파일을 indexer image에 bake한다. `main`, `latest`, 빈 revision을 거부하며 unit test는 lock에 맞춘 작은 fake tokenizer를 사용한다. 실제 tokenizer cache가 lock과 다르면 corpus build 전 실패한다.
+network-enabled model-lock 단계에서 `BAAI/bge-m3`의 40자리 commit SHA와 tokenizer/model 파일 SHA-256을 `config/models.lock.json`에 기록한다. 이 단계에서는 image를 만들지 않고 lock과 검증된 staging cache만 생성하며, Task 11에서 같은 파일을 indexer image에 bake한다. `main`, `latest`, 빈 revision을 거부하며 unit test는 lock에 맞춘 작은 fake tokenizer를 사용한다. 실제 tokenizer cache가 lock과 다르면 corpus build 전 실패한다.
 
 - [ ] **Step 4: 역할 기반 chunker를 구현한다.**
 
@@ -864,7 +864,7 @@ git add config/models.lock.json src/corpus/relations.py src/corpus/chunking.py s
 git commit -m "feat: build reproducible canonical corpus"
 ```
 
-## Task 9: SQLite FTS5 한글 lexical 색인
+## Task 10: SQLite FTS5 한글 lexical 색인
 
 **Files:**
 
@@ -915,7 +915,7 @@ git add config/retrieval.toml src/retrieval/query.py src/retrieval/lexical.py te
 git commit -m "feat: add Korean lexical retrieval"
 ```
 
-## Task 10: 고정 `bge-m3` 임베딩과 Qdrant release collection
+## Task 11: 고정 `bge-m3` 임베딩과 Qdrant release collection
 
 **Files:**
 
@@ -951,7 +951,7 @@ def test_restricted_chunk_is_never_upserted(fake_qdrant, restricted_chunk) -> No
 uv run pytest tests/retrieval/test_dense.py -q
 ```
 
-- [ ] **Step 3: Task 8에서 고정한 `BAAI/bge-m3` cache를 offline 검증한다.**
+- [ ] **Step 3: Task 9에서 고정한 `BAAI/bge-m3` cache를 offline 검증한다.**
 
 `docker/indexer.Dockerfile`은 digest로 고정한 Python base에서 `config/models.lock.json`의 40자리 commit SHA만 내려받아 encoder/tokenizer를 image에 bake하고 파일별 SHA-256을 재검사한다. runtime은 `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `--network none`으로 시작하며 `main`, `latest`, 비어 있는 revision, cache miss를 모두 실패시킨다. tokenizer revision과 encoder revision이 다르면 dense build를 시작하지 않는다.
 
@@ -994,7 +994,7 @@ git add config/models.lock.json src/cli.py src/retrieval/dense.py tests/retrieva
 git commit -m "feat: build versioned dense index"
 ```
 
-## Task 11: Hybrid RRF 검색 계약과 근거 span 반환
+## Task 12: Hybrid RRF 검색 계약과 근거 span 반환
 
 **Files:**
 
@@ -1075,7 +1075,7 @@ git add src/retrieval/fusion.py src/retrieval/service.py data/schemas/search-res
 git commit -m "feat: expose grounded hybrid search contract"
 ```
 
-## Task 12: 200문항 골드셋과 수집·검색 평가
+## Task 13: 200문항 골드셋과 수집·검색 평가
 
 **Files:**
 
@@ -1138,7 +1138,7 @@ git add data/eval/retrieval-dev.jsonl data/eval/retrieval-blind.jsonl src/evalua
 git commit -m "test: add corpus and retrieval release gates"
 ```
 
-## Task 13: 레거시 매핑, release 전환, 백업·복구 자동화
+## Task 14: 레거시 매핑, release 전환, 백업·복구 자동화
 
 **Files:**
 
@@ -1248,7 +1248,7 @@ git add src/release.py src/corpus/legacy.py config/backup-recipients.txt config/
 git commit -m "feat: automate corpus release and recovery"
 ```
 
-## Task 14: PDF 6권 전체 수집, 사람 검수, NAS 성능 출시 게이트
+## Task 15: PDF 6권 전체 수집, 사람 검수, NAS 성능 출시 게이트
 
 **Files:**
 
@@ -1323,7 +1323,7 @@ set +a
 bash scripts/evaluate-release.sh
 ```
 
-Expected: 기존 substring 검색, lexical, dense, hybrid 네 방식을 같은 200문항으로 비교하고 hybrid가 Task 12의 전체·연도별·근거 span·무응답 기준을 모두 통과한다. 보고서는 2023, 2024, 2025 OCR 품질군을 따로 보여준다. 하나라도 미달하면 alias를 바꾸지 않는다.
+Expected: 기존 substring 검색, lexical, dense, hybrid 네 방식을 같은 200문항으로 비교하고 hybrid가 Task 13의 전체·연도별·근거 span·무응답 기준을 모두 통과한다. 보고서는 2023, 2024, 2025 OCR 품질군을 따로 보여준다. 하나라도 미달하면 alias를 바꾸지 않는다.
 
 - [ ] **Step 6: DS925+ warm 성능을 24GB RAM 환경에서 측정한다.**
 
