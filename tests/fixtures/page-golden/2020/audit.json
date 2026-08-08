@@ -1,0 +1,135 @@
+{
+  "schema_version": "senqa-synthetic-page-layout/v2",
+  "doc_id": "synthetic-2020-audit",
+  "edition_year": 2020,
+  "extraction_source": "native",
+  "pages": [
+    {
+      "pdf_page_index": 50,
+      "page_label": "50",
+      "page_role_hint": "body",
+      "lines": [
+        {
+          "text": "대분류: 계약",
+          "bbox": [
+            80,
+            60,
+            320,
+            80
+          ],
+          "confidence": 1,
+          "font": "SyntheticDomain",
+          "size": 12
+        },
+        {
+          "text": "편: 계약 일반",
+          "bbox": [
+            250,
+            85,
+            500,
+            110
+          ],
+          "confidence": 1,
+          "font": "SyntheticHeading",
+          "size": 18
+        },
+        {
+          "text": "소주제: 합성 소주제",
+          "bbox": [
+            80,
+            120,
+            400,
+            140
+          ],
+          "confidence": 1,
+          "font": "SyntheticSubtopic",
+          "size": 12
+        },
+        {
+          "text": "4",
+          "bbox": [
+            73,
+            150,
+            93,
+            180
+          ],
+          "confidence": 1,
+          "font": "SyntheticNumber",
+          "size": 16
+        },
+        {
+          "text": "합성 감사 제목",
+          "bbox": [
+            117,
+            150,
+            522,
+            185
+          ],
+          "confidence": 1,
+          "font": "",
+          "size": 10
+        },
+        {
+          "text": "사례 유형: 감사",
+          "bbox": [
+            80,
+            210,
+            300,
+            232
+          ],
+          "confidence": 1,
+          "font": "SyntheticBody",
+          "size": 11
+        },
+        {
+          "text": "감사 사실: 합성 감사 사실입니다.",
+          "bbox": [
+            80,
+            245,
+            525,
+            273
+          ],
+          "confidence": 1,
+          "font": "SyntheticBody",
+          "size": 11
+        },
+        {
+          "text": "• 합성 감사 답변입니다.",
+          "bbox": [
+            80,
+            285,
+            525,
+            320
+          ],
+          "confidence": 1,
+          "font": "SyntheticBody",
+          "size": 11
+        },
+        {
+          "text": "관련근거 합성 감사 근거입니다.",
+          "bbox": [
+            80,
+            335,
+            525,
+            370
+          ],
+          "confidence": 1,
+          "font": "SyntheticBody",
+          "size": 11
+        },
+        {
+          "text": "19편",
+          "bbox": [
+            574,
+            110,
+            590,
+            690
+          ],
+          "confidence": 1,
+          "font": "SyntheticNav",
+          "size": 7
+        }
+      ]
+    }
+  ]
+}

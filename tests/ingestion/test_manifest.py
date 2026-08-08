@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import traceback
 from pathlib import Path
 from typing import Any
 
 import pymupdf as fitz
 import pytest
+from pydantic import ValidationError
 from typer.testing import CliRunner, Result
 
 from src.cli import app
+from src.ingestion.extract_common import revalidate_source_document
 from src.ingestion.manifest import (
     ManifestError,
     PageNumberingPolicy,
     SourceDocument,
+    SourceManifest,
     load_manifest,
     page_label,
     resolve_source,
@@ -63,6 +67,26 @@ def _expected_document(path: Path, **updates: object) -> SourceDocument:
     }
     base.update(updates)
     return SourceDocument.model_validate(base)
+
+
+def _document_payload_with_page_count(path: Path, page_count: int) -> dict[str, object]:
+    payload = _expected_document(path).model_dump(mode="json")
+    payload["pdf_page_count"] = page_count
+    payload["page_size_profiles"] = (
+        {
+            "start_pdf_page": 1,
+            "end_pdf_page": page_count,
+            "width_pt": 612.0,
+            "height_pt": 792.0,
+        },
+    )
+    payload["page_numbering"] = {
+        "mode": "offset",
+        "body_start_pdf_page": 1,
+        "body_end_pdf_page": page_count,
+        "offset": 0,
+    }
+    return payload
 
 
 def _manifest_payload() -> dict[str, object]:
@@ -127,6 +151,135 @@ def test_manifest_contains_exactly_2020_through_2025() -> None:
     docs = load_manifest(MANIFEST_PATH)
     assert [doc.edition_year for doc in docs] == [2020, 2021, 2022, 2023, 2024, 2025]
     assert [doc.pdf_page_count for doc in docs] == [302, 383, 386, 168, 324, 314]
+
+
+def test_source_document_accepts_the_supported_page_count_ceiling(
+    tmp_path: Path,
+) -> None:
+    """Catches an off-by-one that rejects the documented corpus safety ceiling."""
+    document = SourceDocument.model_validate(
+        _document_payload_with_page_count(tmp_path / "book.pdf", 10_000)
+    )
+
+    assert document.pdf_page_count == 10_000
+    assert document.page_size_profiles[-1].end_pdf_page == 10_000
+
+
+def test_source_document_rejects_page_count_above_ceiling_value_free(
+    tmp_path: Path,
+) -> None:
+    """Catches an unbounded manifest count or disclosure of its rejected value."""
+    rejected_count = 10_001
+
+    with pytest.raises(ValidationError) as captured:
+        SourceDocument.model_validate(
+            _document_payload_with_page_count(tmp_path / "book.pdf", rejected_count)
+        )
+
+    error = captured.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    diagnostics = str(error) + repr(error) + "".join(traceback.format_exception(error))
+    assert str(rejected_count) not in diagnostics
+
+
+def test_recursive_source_document_revalidation_inherits_page_count_ceiling(
+    tmp_path: Path,
+) -> None:
+    """Catches model_construct bypassing the public document safety boundary."""
+    document = _expected_document(tmp_path / "book.pdf")
+    oversized_profile = type(document.page_size_profiles[0]).model_validate(
+        {
+            **document.page_size_profiles[0].model_dump(),
+            "end_pdf_page": 10_001,
+        }
+    )
+    oversized_numbering = type(document.page_numbering).model_validate(
+        {
+            **document.page_numbering.model_dump(),
+            "body_end_pdf_page": 10_001,
+        }
+    )
+    forged = SourceDocument.model_construct(
+        **{
+            **document.__dict__,
+            "pdf_page_count": 10_001,
+            "page_size_profiles": (oversized_profile,),
+            "page_numbering": oversized_numbering,
+        }
+    )
+
+    assert revalidate_source_document(forged) is None
+
+
+def test_manifest_validation_and_loader_hide_nested_rejected_input(
+    tmp_path: Path,
+) -> None:
+    """Catches nested manifest failures retaining source values in error chains."""
+    payload = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    first = payload["documents"][0]
+    first["official_title"] = SENSITIVE_SENTINEL
+    first["pdf_page_count"] = 10_001
+    first["page_size_profiles"][-1]["end_pdf_page"] = 10_001
+    first["page_numbering"]["body_end_pdf_page"] = 10_001
+
+    with pytest.raises(ValidationError) as direct:
+        SourceManifest.model_validate(payload)
+
+    direct_surfaces = (
+        str(direct.value),
+        repr(direct.value),
+        "".join(traceback.format_exception(direct.value)),
+    )
+    assert all(
+        SENSITIVE_SENTINEL not in surface and "10001" not in surface
+        for surface in direct_surfaces
+    )
+
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ManifestError, match="manifest validation failed") as loaded:
+        load_manifest(manifest)
+
+    loaded_surfaces = (
+        str(loaded.value),
+        repr(loaded.value),
+        "".join(traceback.format_exception(loaded.value)),
+    )
+    assert all(
+        SENSITIVE_SENTINEL not in surface and "10001" not in surface
+        for surface in loaded_surfaces
+    )
+    assert loaded.value.__cause__ is None
+    assert loaded.value.__context__ is None
+
+
+@pytest.mark.parametrize("failure", ["missing", "invalid-utf8"])
+def test_manifest_read_failures_do_not_retain_path_or_exception_chain(
+    tmp_path: Path, failure: str
+) -> None:
+    """Catches fixed read errors retaining a sensitive manifest path in context."""
+    sentinel = "PRIVATE-MANIFEST-PATH"
+    manifest = tmp_path / f"{sentinel}.json"
+    if failure == "invalid-utf8":
+        manifest.write_bytes(b"\xff")
+    expected = (
+        "manifest validation failed"
+        if failure == "invalid-utf8"
+        else "cannot read manifest file"
+    )
+
+    with pytest.raises(ManifestError, match=expected) as captured:
+        load_manifest(manifest)
+
+    surfaces = (
+        str(captured.value),
+        repr(captured.value),
+        "".join(traceback.format_exception(captured.value)),
+    )
+    assert all(sentinel not in surface for surface in surfaces)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
 
 
 @pytest.mark.parametrize("case", ["truncated", "replaced", "duplicate", "reordered"])

@@ -1,0 +1,128 @@
+{
+  "cases": [
+    {
+      "case_no": "9",
+      "case_type": "qa",
+      "title": "합성 마지막 제목",
+      "question": "합성 마지막 질문?",
+      "answer": "합성 마지막 답변입니다.",
+      "facts": null,
+      "basis_text": "합성 마지막 근거입니다.\n합성 마지막 참고입니다.",
+      "target_text": "합성 대상",
+      "situation_text": "합성 마지막 상황입니다.",
+      "source_spans": [
+        {
+          "pdf_page_index": 60,
+          "page_label": "60",
+          "bbox": [
+            72,
+            150,
+            190,
+            178
+          ],
+          "text_sha256": "56ecedc52f8cd1b428646dd88acd9d13b72f065b65ce38833fc9265e97ec471b"
+        },
+        {
+          "pdf_page_index": 60,
+          "page_label": "60",
+          "bbox": [
+            195,
+            150,
+            525,
+            180
+          ],
+          "text_sha256": "d5497bffdbe5a5f5b63aaff6a08b01d5c46f39cd15ecf9412265a96fde354062"
+        },
+        {
+          "pdf_page_index": 60,
+          "page_label": "60",
+          "bbox": [
+            80,
+            210,
+            525,
+            235
+          ],
+          "text_sha256": "8bb73db5b6190b6c98f049b0e495babb6509cd8f6537c183d4b60c5b7047a574"
+        },
+        {
+          "pdf_page_index": 60,
+          "page_label": "60",
+          "bbox": [
+            80,
+            245,
+            525,
+            275
+          ],
+          "text_sha256": "51647d67e33374a056f0a071a5323ca2c7d883b40a5d5b75bf15eab49eb90bc2"
+        },
+        {
+          "pdf_page_index": 60,
+          "page_label": "60",
+          "bbox": [
+            80,
+            290,
+            525,
+            315
+          ],
+          "text_sha256": "3ce3ec5d08b47476c53e233c7fe02263b824383618e38830adcc6b2f7f5974d4"
+        },
+        {
+          "pdf_page_index": 60,
+          "page_label": "60",
+          "bbox": [
+            80,
+            325,
+            525,
+            360
+          ],
+          "text_sha256": "8342a94e6213cdc2961fcc19f9ca8a99f944858821a598aed76c7c89ea1ab569"
+        },
+        {
+          "pdf_page_index": 60,
+          "page_label": "60",
+          "bbox": [
+            80,
+            375,
+            525,
+            405
+          ],
+          "text_sha256": "2a07d69ae5bedf34f34ee00275787012ecd5eb4da1d360b814d8cfcf9597a7d8"
+        },
+        {
+          "pdf_page_index": 60,
+          "page_label": "60",
+          "bbox": [
+            80,
+            415,
+            525,
+            445
+          ],
+          "text_sha256": "7b83d4337858f2a5908968371ec0cf2892bd1a4d8db1ec097d6753e970cfa5c5"
+        }
+      ],
+      "review_status": "machine_extracted",
+      "critical_field_review": "sampling_required",
+      "layout_segment_id": "synthetic-2025-segment-a",
+      "search_eligible": false,
+      "answer_eligible": false
+    }
+  ],
+  "quarantines": [],
+  "transitions": [
+    {
+      "pdf_page_index": 60,
+      "role": "domain",
+      "value": "계약"
+    },
+    {
+      "pdf_page_index": 60,
+      "role": "part",
+      "value": "계약 일반"
+    },
+    {
+      "pdf_page_index": 60,
+      "role": "subtopic",
+      "value": "합성 소주제"
+    }
+  ]
+}

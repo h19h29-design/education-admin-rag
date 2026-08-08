@@ -1,0 +1,179 @@
+{
+  "cases": [
+    {
+      "case_no": "2",
+      "case_type": "qa",
+      "title": "합성 연속 제목",
+      "question": "합성 연속 질문?",
+      "answer": "합성 연속 답변\n합성 연속 답변입니다.",
+      "facts": null,
+      "basis_text": "다음 페이지의 참고자료입니다.",
+      "target_text": null,
+      "situation_text": null,
+      "source_spans": [
+        {
+          "pdf_page_index": 41,
+          "page_label": "41",
+          "bbox": [
+            121,
+            151,
+            516,
+            178
+          ],
+          "text_sha256": "dba67fe92cae88591c87d4a42aa718c5e068a6418dc33da5e1d2673a3fce2085"
+        },
+        {
+          "pdf_page_index": 41,
+          "page_label": "41",
+          "bbox": [
+            88,
+            158,
+            103,
+            178
+          ],
+          "text_sha256": "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35"
+        },
+        {
+          "pdf_page_index": 41,
+          "page_label": "41",
+          "bbox": [
+            121,
+            210,
+            525,
+            240
+          ],
+          "text_sha256": "6330d674d5d7af9f64fbe7c77fd1c398b37c0aff51b9e3ba414dca27fbf5bc3a"
+        },
+        {
+          "pdf_page_index": 41,
+          "page_label": "41",
+          "bbox": [
+            80,
+            255,
+            525,
+            290
+          ],
+          "text_sha256": "50dbf06a283af86fd224a2d2a3fac8edbb4756fd50c4cf140264631e50f80789"
+        },
+        {
+          "pdf_page_index": 42,
+          "page_label": "42",
+          "bbox": [
+            80,
+            50,
+            525,
+            85
+          ],
+          "text_sha256": "e74beda5d6bf9bd28cd38c4bb1aac17babf9f5a07b431f7b7415895c019ef103"
+        },
+        {
+          "pdf_page_index": 42,
+          "page_label": "42",
+          "bbox": [
+            80,
+            100,
+            525,
+            135
+          ],
+          "text_sha256": "6da3bc53af3864a272f84a8f9e0c4449adf2f0262264e413e3276839dc96e5eb"
+        }
+      ],
+      "review_status": "machine_extracted",
+      "critical_field_review": "not_applicable",
+      "layout_segment_id": null,
+      "search_eligible": false,
+      "answer_eligible": false
+    },
+    {
+      "case_no": "3",
+      "case_type": "qa",
+      "title": "합성 다음 제목",
+      "question": "합성 다음 질문?",
+      "answer": "합성 다음 답변입니다.",
+      "facts": null,
+      "basis_text": "합성 다음 참고입니다.",
+      "target_text": null,
+      "situation_text": null,
+      "source_spans": [
+        {
+          "pdf_page_index": 42,
+          "page_label": "42",
+          "bbox": [
+            121,
+            311,
+            516,
+            338
+          ],
+          "text_sha256": "a3d85bc45cd2034d760f02d72e818a868c90e52cb7b52ac1221e58faed22ac2b"
+        },
+        {
+          "pdf_page_index": 42,
+          "page_label": "42",
+          "bbox": [
+            88,
+            318,
+            103,
+            338
+          ],
+          "text_sha256": "4e07408562bedb8b60ce05c1decfe3ad16b72230967de01f640b7e4729b49fce"
+        },
+        {
+          "pdf_page_index": 42,
+          "page_label": "42",
+          "bbox": [
+            121,
+            370,
+            525,
+            400
+          ],
+          "text_sha256": "973ee8adb8e7bf4c1a433ccd93a766ed0c1bda3dab68b6e6b4bd8bd5cffca3dd"
+        },
+        {
+          "pdf_page_index": 42,
+          "page_label": "42",
+          "bbox": [
+            80,
+            415,
+            525,
+            450
+          ],
+          "text_sha256": "78c629dd3d7cb0ec2c1083b0788128e318928c7c21617003d948d4b68507d8b4"
+        },
+        {
+          "pdf_page_index": 42,
+          "page_label": "42",
+          "bbox": [
+            80,
+            465,
+            525,
+            500
+          ],
+          "text_sha256": "64c2159e6a80857c12a3930fa55656c2359d2178537fcf0342a112d30552b78a"
+        }
+      ],
+      "review_status": "machine_extracted",
+      "critical_field_review": "not_applicable",
+      "layout_segment_id": null,
+      "search_eligible": false,
+      "answer_eligible": false
+    }
+  ],
+  "quarantines": [],
+  "transitions": [
+    {
+      "pdf_page_index": 41,
+      "role": "domain",
+      "value": "계약"
+    },
+    {
+      "pdf_page_index": 41,
+      "role": "part",
+      "value": "계약 일반"
+    },
+    {
+      "pdf_page_index": 41,
+      "role": "subtopic",
+      "value": "합성 소주제"
+    }
+  ]
+}

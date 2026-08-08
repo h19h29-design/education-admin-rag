@@ -1,0 +1,128 @@
+{
+  "cases": [
+    {
+      "case_no": "1",
+      "case_type": "qa",
+      "title": "합성 첫 제목",
+      "question": "합성 첫 질문?",
+      "answer": "합성 첫 답변입니다.",
+      "facts": null,
+      "basis_text": "합성 첫 근거입니다.\n합성 첫 참고입니다.",
+      "target_text": "합성 대상",
+      "situation_text": "합성 첫 상황입니다.",
+      "source_spans": [
+        {
+          "pdf_page_index": 10,
+          "page_label": "10",
+          "bbox": [
+            72,
+            150,
+            190,
+            178
+          ],
+          "text_sha256": "a5615863a1477e0a76ac3b2eb4f82090ca59f8813187526a1da42006f5972411"
+        },
+        {
+          "pdf_page_index": 10,
+          "page_label": "10",
+          "bbox": [
+            195,
+            150,
+            525,
+            180
+          ],
+          "text_sha256": "5585f26415496b091bdbc795d644be0b07ce1fba87aded0d6b5323e6ac810ef3"
+        },
+        {
+          "pdf_page_index": 10,
+          "page_label": "10",
+          "bbox": [
+            80,
+            210,
+            525,
+            235
+          ],
+          "text_sha256": "36be6a8fc07b24336bb91ab4f5207ca127571c5763231bf553387692815c455e"
+        },
+        {
+          "pdf_page_index": 10,
+          "page_label": "10",
+          "bbox": [
+            80,
+            245,
+            525,
+            275
+          ],
+          "text_sha256": "c632de45fec11d7db17dbe12661a16326a04dc66d23ca81f31603d4793643c23"
+        },
+        {
+          "pdf_page_index": 10,
+          "page_label": "10",
+          "bbox": [
+            80,
+            290,
+            525,
+            315
+          ],
+          "text_sha256": "3ce3ec5d08b47476c53e233c7fe02263b824383618e38830adcc6b2f7f5974d4"
+        },
+        {
+          "pdf_page_index": 10,
+          "page_label": "10",
+          "bbox": [
+            80,
+            325,
+            525,
+            360
+          ],
+          "text_sha256": "fb817b6813e8b0cafd90f6087e1e107965d5cee1918882853db2846507862327"
+        },
+        {
+          "pdf_page_index": 10,
+          "page_label": "10",
+          "bbox": [
+            80,
+            375,
+            525,
+            405
+          ],
+          "text_sha256": "6451ac9b27f6f982f24114d5991a5bc685245356cac3c475985efdc339fc9b79"
+        },
+        {
+          "pdf_page_index": 10,
+          "page_label": "10",
+          "bbox": [
+            80,
+            415,
+            525,
+            445
+          ],
+          "text_sha256": "e69d9a2b6a32880706185c1613006851f5dc6ef544a5b750906a82327e94c9a6"
+        }
+      ],
+      "review_status": "machine_extracted",
+      "critical_field_review": "sampling_required",
+      "layout_segment_id": "synthetic-2025-segment-a",
+      "search_eligible": false,
+      "answer_eligible": false
+    }
+  ],
+  "quarantines": [],
+  "transitions": [
+    {
+      "pdf_page_index": 10,
+      "role": "domain",
+      "value": "계약"
+    },
+    {
+      "pdf_page_index": 10,
+      "role": "part",
+      "value": "계약 일반"
+    },
+    {
+      "pdf_page_index": 10,
+      "role": "subtopic",
+      "value": "합성 소주제"
+    }
+  ]
+}

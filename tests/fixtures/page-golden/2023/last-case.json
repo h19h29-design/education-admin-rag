@@ -1,0 +1,138 @@
+{
+  "schema_version": "senqa-synthetic-page-layout/v2",
+  "doc_id": "synthetic-2023-last-case",
+  "edition_year": 2023,
+  "extraction_source": "ocr",
+  "pages": [
+    {
+      "pdf_page_index": 60,
+      "page_label": "60",
+      "page_role_hint": "body",
+      "lines": [
+        {
+          "text": "대분류: 계약",
+          "bbox": [
+            80,
+            60,
+            320,
+            80
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticDomain",
+          "size": 12
+        },
+        {
+          "text": "편: 계약 일반",
+          "bbox": [
+            250,
+            85,
+            500,
+            110
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticHeading",
+          "size": 18
+        },
+        {
+          "text": "소주제: 합성 소주제",
+          "bbox": [
+            80,
+            120,
+            400,
+            140
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticSubtopic",
+          "size": 12
+        },
+        {
+          "text": "사례 번호: 9",
+          "bbox": [
+            72,
+            150,
+            190,
+            178
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticNumberBox",
+          "size": 16
+        },
+        {
+          "text": "제목: 합성 마지막 제목",
+          "bbox": [
+            195,
+            150,
+            525,
+            180
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticTitle",
+          "size": 16,
+          "semantic_hint": "title"
+        },
+        {
+          "text": "질문: 합성 마지막 질문?",
+          "bbox": [
+            80,
+            210,
+            525,
+            240
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticBody",
+          "size": 11,
+          "semantic_hint": "question"
+        },
+        {
+          "text": "대상: 합성 대상",
+          "bbox": [
+            80,
+            255,
+            525,
+            280
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticBody",
+          "size": 11
+        },
+        {
+          "text": "답변: 합성 마지막 답변입니다.",
+          "bbox": [
+            80,
+            290,
+            525,
+            325
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticBody",
+          "size": 11
+        },
+        {
+          "text": "근거: 합성 마지막 근거입니다.",
+          "bbox": [
+            80,
+            340,
+            525,
+            370
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticBody",
+          "size": 11,
+          "semantic_hint": "law_name"
+        },
+        {
+          "text": "참고자료: 합성 마지막 참고입니다.",
+          "bbox": [
+            80,
+            380,
+            525,
+            410
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticBody",
+          "size": 11
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+# Deny the repository by default. Release builds still provide a commit-bound
+# git archive; this is a second fail-closed boundary for any local build.
+**
+
+# Exact local inputs used by docker/ingestion.Dockerfile.
+!pyproject.toml
+!uv.lock
+
+# Docker applies a negated parent to its descendants. Re-close each reviewed
+# source directory before allowing only its direct Python modules.
+!src/
+src/*
+!src/*.py
+!src/corpus/
+src/corpus/*
+!src/corpus/*.py
+!src/evaluation/
+src/evaluation/*
+!src/evaluation/*.py
+!src/ingestion/
+src/ingestion/*
+!src/ingestion/*.py
+!src/retrieval/
+src/retrieval/*
+!src/retrieval/*.py
+src/**/*.py/**
+
+!config/models.lock.json
+!data/manifests/sen_qa_sources.json
+!docker/ingestion.Dockerfile
+!docker/prepare_ocr_models.py
+
+# Keep sensitive or generated file classes closed even inside an allowed tree.
+**/.git
+**/.git/
+**/.git/**
+**/artifacts
+**/artifacts/
+**/artifacts/**
+**/docs
+**/docs/
+**/docs/**
+**/tests
+**/tests/
+**/tests/**
+**/.env*
+**/*.[pP][dD][fF]
+**/*.[jJ][sS][oO][nN][lL]
+**/*.[sS][qQ][lL][iI][tT][eE]*
+**/*.[dD][bB]
+**/*.[kK][eE][yY]
+**/*.[pP][eE][mM]
+**/*.[pP]12
+**/*.[pP][fF][xX]
+**/__[pP][yY][cC][aA][cC][hH][eE]__
+**/*.[pP][yY][cC]
+**/*.[pP][yY][oO]

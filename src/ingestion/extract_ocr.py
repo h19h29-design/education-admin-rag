@@ -4,24 +4,35 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import inspect
 import json
 import math
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, NamedTuple, Protocol, TypeAlias
+from types import MappingProxyType
+from typing import Any, Final, Literal, NamedTuple, Protocol, TypeAlias
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from src.ingestion.extract_common import (
+    APPROVED_LAYOUT_DETECTOR_VERSION,
+    PAGE_RECORD_SCHEMA_VERSION,
     BoundingBox,
+    LayoutEvidence,
+    LayoutRegion,
     RawBlock,
     RawLine,
     RawPage,
     RawSpan,
+    SemanticHint,
+    exact_declared_field_mapping,
     printed_page_label,
+    revalidate_raw_page,
+    revalidate_source_document,
 )
 from src.ingestion.extract_native import DOCUMENT_IO_ERRORS, PAGE_EXTRACTION_ERRORS
 from src.ingestion.manifest import SourceDocument
@@ -34,16 +45,10 @@ _MUTABLE_REVISIONS = {"latest", "main", "master", "head"}
 _IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DOCUMENT_NUMBER_RE = re.compile(r"^[0-9A-Za-z가-힣\s-]+$")
 _OCR_RENDER_HASH_PREFIX = b"sen-qa-ocr-render-v1\0rgb8\0"
-FieldType = Literal[
-    "title",
-    "question",
-    "amount",
-    "date",
-    "law_name",
-    "article",
-    "document_number",
-    "ocr_line",
-]
+_LAYOUT_SEGMENT_REGISTRY_HASH_PREFIX = b"sen-qa-layout-segment-registry-v1\0"
+_LAYOUT_SEGMENT_ID_HASH_PREFIX = b"sen-qa-layout-segment-id-v1\0"
+LAYOUT_SEGMENT_REGISTRY_POLICY_VERSION: Final = "layout-segment-registry-v1"
+FieldType = SemanticHint
 CriticalFieldType = Literal[
     "title", "question", "amount", "date", "law_name", "article"
 ]
@@ -54,6 +59,35 @@ _CRITICAL_FIELD_TYPES: tuple[CriticalFieldType, ...] = (
     "date",
     "law_name",
     "article",
+)
+
+
+class LayoutSegmentRegistryEntry(NamedTuple):
+    """One checked-in approved document-body segment."""
+
+    doc_id: str
+    source_sha256: str
+    segment_start_pdf_page: int
+    segment_end_pdf_page: int
+
+
+APPROVED_LAYOUT_SEGMENT_REGISTRY: Final[Mapping[int, LayoutSegmentRegistryEntry]] = (
+    MappingProxyType(
+        {
+            2024: LayoutSegmentRegistryEntry(
+                doc_id="sen-qa-2024",
+                source_sha256="fc1494eff8ee3fe9b53606dd5f55468d8ec254b9d2d661fba6c5e4b46daa99ed",
+                segment_start_pdf_page=7,
+                segment_end_pdf_page=323,
+            ),
+            2025: LayoutSegmentRegistryEntry(
+                doc_id="sen-qa-2025",
+                source_sha256="9a1a7b0ebf1346b540c97d9990dd3b43c647ce397322ff0fabe6d2de84c0ce03",
+                segment_start_pdf_page=7,
+                segment_end_pdf_page=313,
+            ),
+        }
+    )
 )
 
 
@@ -110,12 +144,159 @@ class OcrExtractionError(Exception):
     """Sanitized document-level OCR extraction failure."""
 
 
+class LayoutDetectionError(Exception):
+    """Expected raster-layout failure whose source detail must not escape."""
+
+
 class RasterImage(NamedTuple):
     """Dependency-free RGB raster passed to an injected OCR adapter."""
 
     width: int
     height: int
     rgb_bytes: bytes
+
+
+class RasterLayoutRegion(BaseModel):
+    """One detector result in half-open rendered-pixel coordinates."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, hide_input_in_errors=True
+    )
+
+    region_type: Literal["card"] = "card"
+    bbox: tuple[float, float, float, float]
+    evidence: Literal["raster-border"] = "raster-border"
+
+    @model_validator(mode="after")
+    def has_finite_positive_geometry(self) -> RasterLayoutRegion:
+        x0, y0, x1, y1 = self.bbox
+        if not all(math.isfinite(value) for value in self.bbox) or x0 >= x1 or y0 >= y1:
+            raise ValueError("raster layout region must have finite positive geometry")
+        return self
+
+
+class LayoutDetector(Protocol):
+    """Injectable complete-page detector used independently of OCR recognition."""
+
+    version: str
+
+    def detect(self, image: RasterImage) -> tuple[RasterLayoutRegion, ...]:
+        """Return deterministically ordered regions without recognized text."""
+
+
+class GreenCardBorderDetector:
+    """Detect paired thin green horizontal borders without OCR or source text."""
+
+    __slots__ = ()
+
+    version = APPROVED_LAYOUT_DETECTOR_VERSION
+    _MIN_ROW_DENSITY = 0.45
+    _MIN_BORDER_WIDTH = 0.70
+    _MAX_BORDER_THICKNESS = 0.012
+    _MIN_CARD_HEIGHT = 0.10
+    _MAX_CARD_HEIGHT = 0.30
+    _MAX_X_EDGE_DRIFT = 0.08
+
+    def detect(self, image: RasterImage) -> tuple[RasterLayoutRegion, ...]:
+        expected_size = image.width * image.height * 3
+        if (
+            image.width <= 0
+            or image.height <= 0
+            or len(image.rgb_bytes) != expected_size
+        ):
+            raise LayoutDetectionError("raster layout input is invalid")
+        samples = memoryview(image.rgb_bytes)
+        horizontal_step = max(1, image.width // 1200)
+        sampled_columns = len(range(0, image.width, horizontal_step))
+        minimum_green = max(1, math.ceil(sampled_columns * self._MIN_ROW_DENSITY))
+        dense_rows: list[tuple[int, int, int]] = []
+        for y in range(image.height):
+            best_count = 0
+            best_x0: int | None = None
+            best_x1: int | None = None
+            run_count = 0
+            run_x0: int | None = None
+            last_green_x: int | None = None
+            row_offset = y * image.width * 3
+            for x in range(0, image.width, horizontal_step):
+                offset = row_offset + x * 3
+                red = samples[offset]
+                green = samples[offset + 1]
+                blue = samples[offset + 2]
+                if green >= 80 and green >= red + 12 and green >= blue + 8:
+                    if (
+                        run_x0 is None
+                        or last_green_x is None
+                        or x > last_green_x + horizontal_step * 2
+                    ):
+                        run_count = 0
+                        run_x0 = x
+                    run_count += 1
+                    last_green_x = x
+                    if run_count > best_count:
+                        best_count = run_count
+                        best_x0 = run_x0
+                        best_x1 = min(image.width, x + horizontal_step)
+            if (
+                best_count >= minimum_green
+                and best_x0 is not None
+                and best_x1 is not None
+            ):
+                dense_rows.append((y, best_x0, best_x1))
+
+        runs: list[tuple[int, int, int, int]] = []
+        for y, x0, x1 in dense_rows:
+            if not runs or y != runs[-1][1]:
+                runs.append((y, y + 1, x0, x1))
+            else:
+                start, _, run_x0, run_x1 = runs[-1]
+                runs[-1] = (start, y + 1, min(run_x0, x0), max(run_x1, x1))
+
+        max_thickness = max(1, math.ceil(image.height * self._MAX_BORDER_THICKNESS))
+        thin_runs = [
+            run
+            for run in runs
+            if run[1] - run[0] <= max_thickness
+            and run[3] - run[2] >= image.width * self._MIN_BORDER_WIDTH
+        ]
+        minimum_height = image.height * self._MIN_CARD_HEIGHT
+        maximum_height = image.height * self._MAX_CARD_HEIGHT
+        maximum_edge_drift = image.width * self._MAX_X_EDGE_DRIFT
+        regions: list[RasterLayoutRegion] = []
+        index = 0
+        while index + 1 < len(thin_runs):
+            top = thin_runs[index]
+            bottom = thin_runs[index + 1]
+            height = ((bottom[0] + bottom[1]) - (top[0] + top[1])) / 2.0
+            intervening_thick_run = any(
+                run[0] >= top[1]
+                and run[1] <= bottom[0]
+                and run[1] - run[0] > max_thickness
+                for run in runs
+            )
+            matching_edges = (
+                abs(top[2] - bottom[2]) <= maximum_edge_drift
+                and abs(top[3] - bottom[3]) <= maximum_edge_drift
+            )
+            if (
+                minimum_height <= height <= maximum_height
+                and matching_edges
+                and not intervening_thick_run
+            ):
+                regions.append(
+                    RasterLayoutRegion(
+                        bbox=(
+                            float(min(top[2], bottom[2])),
+                            float(top[0]),
+                            float(max(top[3], bottom[3])),
+                            float(bottom[1]),
+                        )
+                    )
+                )
+                index += 2
+            else:
+                index += 1
+        return tuple(regions)
 
 
 class AdapterLine(BaseModel):
@@ -188,9 +369,11 @@ class PaddleOcrAdapter:
 
     def recognize(self, image: RasterImage) -> tuple[AdapterLine, ...]:
         try:
-            array = self._numpy.frombuffer(
-                image.rgb_bytes, dtype=self._numpy.uint8
-            ).reshape((image.height, image.width, 3))[:, :, ::-1].copy()
+            array = (
+                self._numpy.frombuffer(image.rgb_bytes, dtype=self._numpy.uint8)
+                .reshape((image.height, image.width, 3))[:, :, ::-1]
+                .copy()
+            )
             output: list[AdapterLine] = []
             for result in self._pipeline.predict(array):
                 payload = result.json
@@ -243,7 +426,9 @@ def create_paddle_adapter(lock: ModelLock, model_root: Path) -> OcrAdapter:
 class ReviewEntry(BaseModel):
     """Privacy-safe pointer to a field requiring human review."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, hide_input_in_errors=True
+    )
 
     location_id: str = Field(pattern=r"^loc-[0-9a-f]{32}$")
     field_type: FieldType
@@ -254,29 +439,59 @@ class ReviewEntry(BaseModel):
 class CriticalFieldStatus(BaseModel):
     """A parser-blocking critical-field review marker."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, hide_input_in_errors=True
+    )
 
     field_type: CriticalFieldType
     status: Literal["unverified", "sampling_required"]
     review_required: bool
 
 
+class LayoutSegmentProvenance(BaseModel):
+    """Stable text-free grouping used by the annual layout review policy."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, hide_input_in_errors=True
+    )
+
+    segment_id: str = Field(pattern=r"^layout-segment-[0-9a-f]{32}$")
+    segment_key: Literal["approved-document-body"]
+    segment_start_pdf_page: int = Field(ge=1)
+    segment_end_pdf_page: int = Field(ge=1)
+    registry_policy_version: Literal["layout-segment-registry-v1"]
+    registry_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    detector_version: Literal["green-card-border-v1"]
+    region_count: int = Field(ge=0)
+    sampling_status: Literal["all_cases_required", "sampling_required"]
+
+    @model_validator(mode="after")
+    def has_ordered_registry_range(self) -> LayoutSegmentProvenance:
+        if self.segment_start_pdf_page > self.segment_end_pdf_page:
+            raise ValueError("layout segment registry range must be ordered")
+        return self
+
+
 class ExtractedOcrPageRecord(BaseModel):
     """Successful OCR page with immutable source, raster, and review provenance."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, hide_input_in_errors=True
+    )
 
+    schema_version: Literal[2]
     status: Literal["extracted"] = "extracted"
     doc_id: str
     edition_year: int
     pdf_page_index: int = Field(ge=1)
     page_label: str | None
-    source_sha256: str
-    render_sha256: str
-    render_dpi: int
-    image_digest: str
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    render_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    render_dpi: int = Field(gt=0)
+    image_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     quality_flags: tuple[str, ...]
     raw_page: RawPage
+    layout_segment_provenance: LayoutSegmentProvenance | None
     review_queue: tuple[ReviewEntry, ...]
     critical_review_policy: Literal[
         "all-fields-human-verification", "stratified-sample-with-layout-escalation"
@@ -286,26 +501,203 @@ class ExtractedOcrPageRecord(BaseModel):
     search_eligible: Literal[False] = False
     answer_eligible: Literal[False] = False
 
+    @model_validator(mode="after")
+    def has_matching_raw_provenance(self) -> ExtractedOcrPageRecord:
+        policy = ocr_policy(self.edition_year)
+        if (
+            self.render_dpi != policy.render_dpi
+            or self.quality_flags != policy.quality_flags
+        ):
+            raise ValueError("OCR run provenance does not match edition policy")
+        if (
+            self.doc_id != self.raw_page.doc_id
+            or self.edition_year != self.raw_page.edition_year
+            or self.pdf_page_index != self.raw_page.pdf_page_index
+            or self.page_label != self.raw_page.page_label
+            or self.render_sha256 != self.raw_page.render_sha256
+            or self.raw_page.extraction_source != "ocr"
+        ):
+            raise ValueError("OCR page envelope does not match raw provenance")
+        if self.edition_year == 2023:
+            if self.raw_page.layout_evidence.status != "not_applicable":
+                raise ValueError(
+                    "OCR page layout evidence does not match edition policy"
+                )
+        elif self.raw_page.layout_evidence.status == "not_applicable":
+            raise ValueError("OCR page layout evidence does not match edition policy")
+        evidence = self.raw_page.layout_evidence
+        if evidence.status in {"failed", "not_detected", "detected"} and (
+            evidence.detector_version != APPROVED_LAYOUT_DETECTOR_VERSION
+        ):
+            raise ValueError("OCR page layout detector is not approved")
+        registry_entry = APPROVED_LAYOUT_SEGMENT_REGISTRY.get(self.edition_year)
+        expected_segment = (
+            _layout_segment_provenance(
+                self.edition_year,
+                self.raw_page,
+                source_sha256=self.source_sha256,
+                segment_start_pdf_page=registry_entry.segment_start_pdf_page,
+                segment_end_pdf_page=registry_entry.segment_end_pdf_page,
+            )
+            if registry_entry is not None
+            else None
+        )
+        if self.layout_segment_provenance != expected_segment:
+            raise ValueError(
+                "OCR layout segment provenance does not match raw evidence"
+            )
+        (
+            expected_critical_policy,
+            expected_critical_fields,
+            expected_review_status,
+        ) = _critical_review(
+            self.edition_year,
+            evidence,
+            registry_segment_available=expected_segment is not None,
+        )
+        if (
+            self.critical_review_policy != expected_critical_policy
+            or self.critical_fields != expected_critical_fields
+            or self.review_status != expected_review_status
+        ):
+            raise ValueError(
+                "OCR critical review status does not match fail-closed policy"
+            )
+        expected_review_queue = _review_queue_from_raw_page(
+            self.raw_page,
+            source_sha256=self.source_sha256,
+        )
+        if self.review_queue != expected_review_queue:
+            raise ValueError("OCR review queue does not match raw provenance")
+        return self
+
 
 class QuarantinedOcrPageRecord(BaseModel):
     """Sanitized failed-page record; recognized text and exception detail are excluded."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, hide_input_in_errors=True
+    )
 
+    schema_version: Literal[2]
     status: Literal["quarantined"] = "quarantined"
     doc_id: str
     edition_year: int
     pdf_page_index: int = Field(ge=1)
     page_label: str | None
-    source_sha256: str
-    render_sha256: str | None
-    render_dpi: int
-    image_digest: str
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    render_sha256: str | None = Field(pattern=r"^[0-9a-f]{64}$")
+    render_dpi: int = Field(gt=0)
+    image_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     quality_flags: tuple[str, ...]
-    reason_code: Literal["page-render-failed", "ocr-adapter-failed"]
+    reason_code: Literal[
+        "page-render-failed", "ocr-adapter-failed", "ocr-provenance-invalid"
+    ]
+
+    @model_validator(mode="after")
+    def matches_edition_policy(self) -> QuarantinedOcrPageRecord:
+        policy = ocr_policy(self.edition_year)
+        if (
+            self.render_dpi != policy.render_dpi
+            or self.quality_flags != policy.quality_flags
+        ):
+            raise ValueError("OCR run provenance does not match edition policy")
+        if (self.reason_code == "page-render-failed") != (self.render_sha256 is None):
+            raise ValueError("OCR quarantine reason does not match render provenance")
+        return self
 
 
 OcrPageRecord: TypeAlias = ExtractedOcrPageRecord | QuarantinedOcrPageRecord
+
+
+def _revalidate_review_entry(value: object) -> ReviewEntry | None:
+    fields = exact_declared_field_mapping(value, ReviewEntry)
+    if fields is None:
+        return None
+    try:
+        return ReviewEntry.model_validate(fields)
+    except (TypeError, ValueError):
+        return None
+
+
+def _revalidate_critical_field(value: object) -> CriticalFieldStatus | None:
+    fields = exact_declared_field_mapping(value, CriticalFieldStatus)
+    if fields is None:
+        return None
+    try:
+        return CriticalFieldStatus.model_validate(fields)
+    except (TypeError, ValueError):
+        return None
+
+
+def _revalidate_layout_segment(
+    value: object,
+) -> LayoutSegmentProvenance | None:
+    fields = exact_declared_field_mapping(value, LayoutSegmentProvenance)
+    if fields is None:
+        return None
+    try:
+        return LayoutSegmentProvenance.model_validate(fields)
+    except (TypeError, ValueError):
+        return None
+
+
+def _revalidate_ocr_record(value: object) -> OcrPageRecord | None:
+    model: type[ExtractedOcrPageRecord | QuarantinedOcrPageRecord]
+    if type(value) is ExtractedOcrPageRecord:
+        model = ExtractedOcrPageRecord
+    elif type(value) is QuarantinedOcrPageRecord:
+        model = QuarantinedOcrPageRecord
+    else:
+        return None
+    fields = exact_declared_field_mapping(value, model)
+    if fields is None:
+        return None
+    if model is ExtractedOcrPageRecord:
+        raw_page = revalidate_raw_page(fields["raw_page"])
+        raw_review_queue = fields["review_queue"]
+        raw_critical_fields = fields["critical_fields"]
+        raw_segment = fields["layout_segment_provenance"]
+        if (
+            raw_page is None
+            or type(raw_review_queue) is not tuple
+            or type(raw_critical_fields) is not tuple
+        ):
+            return None
+        review_queue = tuple(
+            _revalidate_review_entry(item) for item in raw_review_queue
+        )
+        critical_fields = tuple(
+            _revalidate_critical_field(item) for item in raw_critical_fields
+        )
+        if any(item is None for item in review_queue + critical_fields):
+            return None
+        if raw_segment is None:
+            segment = None
+        else:
+            segment = _revalidate_layout_segment(raw_segment)
+            if segment is None:
+                return None
+        fields["raw_page"] = raw_page
+        fields["review_queue"] = tuple(
+            item for item in review_queue if item is not None
+        )
+        fields["critical_fields"] = tuple(
+            item for item in critical_fields if item is not None
+        )
+        fields["layout_segment_provenance"] = segment
+    try:
+        return model.model_validate(fields)
+    except (TypeError, ValueError):
+        return None
+
+
+def validate_ocr_page_record(value: object) -> OcrPageRecord:
+    """Return a recursively rebuilt record or raise a value-free boundary error."""
+    record = _revalidate_ocr_record(value)
+    if record is None:
+        raise OcrExtractionError("OCR page record is invalid")
+    return record
 
 
 class OcrPolicy(NamedTuple):
@@ -502,6 +894,8 @@ def _scale_lines_to_pdf_points(
     raster_height: int,
 ) -> tuple[tuple[AdapterLine, ...], float, float]:
     """Convert rotated raster pixels to local unrotated PDF-point coordinates."""
+    if raster_width <= 0 or raster_height <= 0:
+        raise ValueError("OCR raster geometry is invalid")
     rect_x0 = float(page_rect.x0)
     rect_y0 = float(page_rect.y0)
     rect_x1 = float(page_rect.x1)
@@ -517,9 +911,7 @@ def _scale_lines_to_pdf_points(
         return (x * a + y * c + e, x * b + y * d + f)
 
     page_corners = tuple(
-        derotate(x, y)
-        for x in (rect_x0, rect_x1)
-        for y in (rect_y0, rect_y1)
+        derotate(x, y) for x in (rect_x0, rect_x1) for y in (rect_y0, rect_y1)
     )
     page_x0 = min(point[0] for point in page_corners)
     page_y0 = min(point[1] for point in page_corners)
@@ -531,6 +923,15 @@ def _scale_lines_to_pdf_points(
     point_lines: list[AdapterLine] = []
     for line in lines:
         x0, y0, x1, y1 = line.bbox
+        if (
+            x0 < 0.0
+            or y0 < 0.0
+            or x0 >= x1
+            or y0 >= y1
+            or x1 > raster_width
+            or y1 > raster_height
+        ):
+            raise ValueError("OCR line is outside raster geometry")
         rotated_corners = (
             (rect_x0 + x0 * x_scale, rect_y0 + y0 * y_scale),
             (rect_x0 + x0 * x_scale, rect_y0 + y1 * y_scale),
@@ -538,20 +939,181 @@ def _scale_lines_to_pdf_points(
             (rect_x0 + x1 * x_scale, rect_y0 + y1 * y_scale),
         )
         page_points = tuple(derotate(x, y) for x, y in rotated_corners)
+        point_bbox = (
+            min(point[0] for point in page_points) - page_x0,
+            min(point[1] for point in page_points) - page_y0,
+            max(point[0] for point in page_points) - page_x0,
+            max(point[1] for point in page_points) - page_y0,
+        )
+        if (
+            point_bbox[0] < 0.0
+            or point_bbox[1] < 0.0
+            or point_bbox[0] >= point_bbox[2]
+            or point_bbox[1] >= point_bbox[3]
+            or point_bbox[2] > page_width
+            or point_bbox[3] > page_height
+        ):
+            raise ValueError("OCR line is outside PDF page geometry")
         point_lines.append(
             AdapterLine(
                 text=line.text,
-                bbox=(
-                    min(point[0] for point in page_points) - page_x0,
-                    min(point[1] for point in page_points) - page_y0,
-                    max(point[0] for point in page_points) - page_x0,
-                    max(point[1] for point in page_points) - page_y0,
-                ),
+                bbox=point_bbox,
                 confidence=line.confidence,
                 field_type=line.field_type,
             )
         )
     return tuple(point_lines), page_width, page_height
+
+
+def _scale_raster_bbox_to_pdf_points(
+    bbox: tuple[float, float, float, float],
+    *,
+    page_rect: Any,
+    derotation_matrix: Any,
+    raster_width: int,
+    raster_height: int,
+) -> BoundingBox:
+    """Convert one half-open raster rectangle to local PDF-point coordinates."""
+    rect_x0 = float(page_rect.x0)
+    rect_y0 = float(page_rect.y0)
+    rect_x1 = float(page_rect.x1)
+    rect_y1 = float(page_rect.y1)
+    rotated_width = rect_x1 - rect_x0
+    rotated_height = rect_y1 - rect_y0
+    matrix = tuple(float(value) for value in derotation_matrix)
+    if len(matrix) != 6 or raster_width <= 0 or raster_height <= 0:
+        raise ValueError("page layout transform is invalid")
+    a, b, c, d, e, f = matrix
+
+    def derotate(x: float, y: float) -> tuple[float, float]:
+        return (x * a + y * c + e, x * b + y * d + f)
+
+    page_corners = tuple(
+        derotate(x, y) for x in (rect_x0, rect_x1) for y in (rect_y0, rect_y1)
+    )
+    page_x0 = min(point[0] for point in page_corners)
+    page_y0 = min(point[1] for point in page_corners)
+    x_scale = rotated_width / raster_width
+    y_scale = rotated_height / raster_height
+    x0, y0, x1, y1 = bbox
+    rotated_corners = (
+        (rect_x0 + x0 * x_scale, rect_y0 + y0 * y_scale),
+        (rect_x0 + x0 * x_scale, rect_y0 + y1 * y_scale),
+        (rect_x0 + x1 * x_scale, rect_y0 + y0 * y_scale),
+        (rect_x0 + x1 * x_scale, rect_y0 + y1 * y_scale),
+    )
+    page_points = tuple(derotate(x, y) for x, y in rotated_corners)
+    return BoundingBox(
+        x0=min(point[0] for point in page_points) - page_x0,
+        y0=min(point[1] for point in page_points) - page_y0,
+        x1=max(point[0] for point in page_points) - page_x0,
+        y1=max(point[1] for point in page_points) - page_y0,
+    )
+
+
+def _layout_evidence(
+    edition_year: int,
+    image: RasterImage,
+    detector: LayoutDetector | None,
+    *,
+    page_rect: Any,
+    derotation_matrix: Any,
+) -> LayoutEvidence:
+    """Collect explicit layout evidence without guessing when detection is unavailable."""
+    if edition_year == 2023:
+        return LayoutEvidence()
+    if detector is None:
+        return LayoutEvidence(status="unavailable")
+    try:
+        raster_regions = detector.detect(image)
+    except LayoutDetectionError:
+        return LayoutEvidence(
+            status="failed", detector_version=APPROVED_LAYOUT_DETECTOR_VERSION
+        )
+    if not isinstance(raster_regions, tuple) or any(
+        type(region) is not RasterLayoutRegion for region in raster_regions
+    ):
+        return LayoutEvidence(
+            status="failed", detector_version=APPROVED_LAYOUT_DETECTOR_VERSION
+        )
+    revalidated_regions = tuple(
+        _revalidate_raster_layout_region(region) for region in raster_regions
+    )
+    if any(region is None for region in revalidated_regions):
+        return LayoutEvidence(
+            status="failed", detector_version=APPROVED_LAYOUT_DETECTOR_VERSION
+        )
+    raster_regions = tuple(
+        region for region in revalidated_regions if region is not None
+    )
+    keys = tuple(
+        (region.bbox[1], region.bbox[0], region.bbox[3], region.bbox[2])
+        for region in raster_regions
+    )
+    if (
+        keys != tuple(sorted(keys))
+        or len(keys) != len(set(keys))
+        or any(
+            not all(math.isfinite(value) for value in region.bbox)
+            or region.bbox[0] < 0.0
+            or region.bbox[1] < 0.0
+            or region.bbox[0] >= region.bbox[2]
+            or region.bbox[1] >= region.bbox[3]
+            or region.bbox[2] > image.width
+            or region.bbox[3] > image.height
+            for region in raster_regions
+        )
+    ):
+        return LayoutEvidence(
+            status="failed", detector_version=APPROVED_LAYOUT_DETECTOR_VERSION
+        )
+    if not raster_regions:
+        return LayoutEvidence(
+            status="not_detected",
+            detector_version=APPROVED_LAYOUT_DETECTOR_VERSION,
+        )
+    point_regions = tuple(
+        sorted(
+            (
+                LayoutRegion(
+                    region_type=region.region_type,
+                    bbox=_scale_raster_bbox_to_pdf_points(
+                        region.bbox,
+                        page_rect=page_rect,
+                        derotation_matrix=derotation_matrix,
+                        raster_width=image.width,
+                        raster_height=image.height,
+                    ),
+                    evidence=region.evidence,
+                )
+                for region in raster_regions
+            ),
+            key=lambda region: (
+                region.bbox.y0,
+                region.bbox.x0,
+                region.bbox.y1,
+                region.bbox.x1,
+                region.region_type,
+            ),
+        )
+    )
+    return LayoutEvidence(
+        status="detected",
+        detector_version=APPROVED_LAYOUT_DETECTOR_VERSION,
+        regions=point_regions,
+    )
+
+
+def _revalidate_raster_layout_region(
+    value: object,
+) -> RasterLayoutRegion | None:
+    fields = exact_declared_field_mapping(value, RasterLayoutRegion)
+    if fields is None or type(fields["bbox"]) is not tuple:
+        return None
+    try:
+        return RasterLayoutRegion.model_validate(fields)
+    except (TypeError, ValueError):
+        return None
 
 
 def _render_hash(pixmap: Any, *, render_dpi: int) -> str:
@@ -603,8 +1165,57 @@ def _review_queue(
     return tuple(entries)
 
 
+def _review_queue_from_raw_page(
+    raw_page: RawPage, *, source_sha256: str
+) -> tuple[ReviewEntry, ...]:
+    """Rebuild the value-free review queue from the exact production OCR shape."""
+    if len(raw_page.raw_blocks) != 1:
+        raise ValueError("OCR raw page shape is invalid")
+    page_block = raw_page.raw_blocks[0]
+    if page_block.bbox != BoundingBox(
+        x0=0.0,
+        y0=0.0,
+        x1=raw_page.page_width,
+        y1=raw_page.page_height,
+    ):
+        raise ValueError("OCR raw page shape is invalid")
+    lines: list[AdapterLine] = []
+    for raw_line in page_block.lines:
+        if len(raw_line.spans) != 1:
+            raise ValueError("OCR raw page shape is invalid")
+        span = raw_line.spans[0]
+        if (
+            raw_line.bbox != span.bbox
+            or raw_line.confidence != span.confidence
+            or span.semantic_hint is None
+            or span.bbox.x0 < 0.0
+            or span.bbox.y0 < 0.0
+            or span.bbox.x0 >= span.bbox.x1
+            or span.bbox.y0 >= span.bbox.y1
+            or span.bbox.x1 > raw_page.page_width
+            or span.bbox.y1 > raw_page.page_height
+        ):
+            raise ValueError("OCR raw page shape is invalid")
+        lines.append(
+            AdapterLine(
+                text=span.text,
+                bbox=(span.bbox.x0, span.bbox.y0, span.bbox.x1, span.bbox.y1),
+                confidence=span.confidence,
+                field_type=span.semantic_hint,
+            )
+        )
+    return _review_queue(
+        tuple(lines),
+        source_sha256=source_sha256,
+        pdf_page_index=raw_page.pdf_page_index,
+    )
+
+
 def _critical_review(
     edition_year: int,
+    layout_evidence: LayoutEvidence,
+    *,
+    registry_segment_available: bool = True,
 ) -> tuple[
     Literal[
         "all-fields-human-verification", "stratified-sample-with-layout-escalation"
@@ -623,17 +1234,83 @@ def _critical_review(
             ),
             "needs_review",
         )
+    review_required = (
+        layout_evidence.status != "not_detected" or not registry_segment_available
+    )
     return (
         "stratified-sample-with-layout-escalation",
         tuple(
             CriticalFieldStatus(
                 field_type=field_type,
                 status="sampling_required",
-                review_required=False,
+                review_required=review_required,
             )
             for field_type in _CRITICAL_FIELD_TYPES
         ),
-        "machine_extracted",
+        "needs_review" if review_required else "machine_extracted",
+    )
+
+
+def _layout_segment_provenance(
+    edition_year: int,
+    raw_page: RawPage,
+    *,
+    source_sha256: str,
+    segment_start_pdf_page: int,
+    segment_end_pdf_page: int,
+) -> LayoutSegmentProvenance | None:
+    evidence = raw_page.layout_evidence
+    if edition_year not in (2024, 2025):
+        return None
+    registry_entry = APPROVED_LAYOUT_SEGMENT_REGISTRY.get(edition_year)
+    if (
+        registry_entry is None
+        or raw_page.doc_id != registry_entry.doc_id
+        or source_sha256 != registry_entry.source_sha256
+        or segment_start_pdf_page != registry_entry.segment_start_pdf_page
+        or segment_end_pdf_page != registry_entry.segment_end_pdf_page
+    ):
+        return None
+    if not (
+        1 <= segment_start_pdf_page <= raw_page.pdf_page_index <= segment_end_pdf_page
+    ):
+        return None
+    sampling_status: Literal["all_cases_required", "sampling_required"] = (
+        "all_cases_required" if edition_year == 2024 else "sampling_required"
+    )
+    registry_payload = {
+        "detector_version": APPROVED_LAYOUT_DETECTOR_VERSION,
+        "doc_id": raw_page.doc_id,
+        "edition_year": edition_year,
+        "policy_version": LAYOUT_SEGMENT_REGISTRY_POLICY_VERSION,
+        "sampling_status": sampling_status,
+        "segment_end_pdf_page": segment_end_pdf_page,
+        "segment_key": "approved-document-body",
+        "segment_start_pdf_page": segment_start_pdf_page,
+        "source_sha256": source_sha256,
+    }
+    registry_sha256 = hashlib.sha256(
+        _LAYOUT_SEGMENT_REGISTRY_HASH_PREFIX
+        + json.dumps(
+            registry_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    ).hexdigest()
+    return LayoutSegmentProvenance(
+        segment_id="layout-segment-"
+        + hashlib.sha256(
+            _LAYOUT_SEGMENT_ID_HASH_PREFIX + registry_sha256.encode("ascii")
+        ).hexdigest()[:32],
+        segment_key="approved-document-body",
+        segment_start_pdf_page=segment_start_pdf_page,
+        segment_end_pdf_page=segment_end_pdf_page,
+        registry_policy_version=LAYOUT_SEGMENT_REGISTRY_POLICY_VERSION,
+        registry_sha256=registry_sha256,
+        detector_version=APPROVED_LAYOUT_DETECTOR_VERSION,
+        region_count=len(evidence.regions),
+        sampling_status=sampling_status,
     )
 
 
@@ -646,6 +1323,7 @@ def _raw_ocr_page(
     page_height: float,
     render_sha256: str,
     lines: tuple[AdapterLine, ...],
+    layout_evidence: LayoutEvidence,
 ) -> RawPage:
     raw_lines = tuple(
         RawLine(
@@ -658,14 +1336,13 @@ def _raw_ocr_page(
                     font="",
                     size=line.bbox[3] - line.bbox[1],
                     confidence=line.confidence,
+                    semantic_hint=line.field_type,
                 ),
             ),
         )
         for line in lines
     )
-    page_box = BoundingBox(
-        x0=0.0, y0=0.0, x1=page_width, y1=page_height
-    )
+    page_box = BoundingBox(x0=0.0, y0=0.0, x1=page_width, y1=page_height)
     return RawPage(
         doc_id=document.doc_id,
         edition_year=document.edition_year,
@@ -676,6 +1353,16 @@ def _raw_ocr_page(
         page_height=page_height,
         render_sha256=render_sha256,
         raw_blocks=(RawBlock(bbox=page_box, lines=raw_lines),),
+        layout_evidence=layout_evidence,
+    )
+
+
+def _is_approved_layout_detector(detector: LayoutDetector) -> bool:
+    version = inspect.getattr_static(detector, "version", None)
+    return (
+        type(detector) is GreenCardBorderDetector
+        and type(version) is str
+        and version == APPROVED_LAYOUT_DETECTOR_VERSION
     )
 
 
@@ -687,6 +1374,7 @@ def extract_pages(
     adapter: OcrAdapter,
     source_sha256: str,
     image_digest: str,
+    layout_detector: LayoutDetector | None = None,
 ) -> tuple[OcrPageRecord, ...]:
     """Render and OCR selected complete pages, quarantining expected page failures."""
     if document.extraction_method != "ocr" or document.edition_year not in (
@@ -713,6 +1401,11 @@ def extract_pages(
         or document.pdf_page_count != len(pages)
     ):
         raise ValueError("page selection is invalid")
+    if layout_detector is not None and (
+        document.edition_year == 2023
+        or not _is_approved_layout_detector(layout_detector)
+    ):
+        raise OcrExtractionError("layout detector is not approved")
 
     records: list[OcrPageRecord] = []
     for pdf_page_index in page_indexes:
@@ -732,14 +1425,13 @@ def extract_pages(
             ):
                 raise ValueError("page point geometry is invalid")
             derotation_matrix = page.derotation_matrix
-            pixmap = page.get_pixmap(
-                dpi=policy.render_dpi, alpha=False
-            )
+            pixmap = page.get_pixmap(dpi=policy.render_dpi, alpha=False)
             if int(pixmap.n) != 3:
                 raise OSError("render did not produce RGB8")
         except PAGE_EXTRACTION_ERRORS:
             records.append(
                 QuarantinedOcrPageRecord(
+                    schema_version=PAGE_RECORD_SCHEMA_VERSION,
                     doc_id=document.doc_id,
                     edition_year=document.edition_year,
                     pdf_page_index=pdf_page_index,
@@ -754,17 +1446,17 @@ def extract_pages(
             )
             continue
         render_sha256 = _render_hash(pixmap, render_dpi=policy.render_dpi)
+        raster_image = RasterImage(
+            width=int(pixmap.width),
+            height=int(pixmap.height),
+            rgb_bytes=bytes(pixmap.samples),
+        )
         try:
-            adapter_lines = adapter.recognize(
-                RasterImage(
-                    width=int(pixmap.width),
-                    height=int(pixmap.height),
-                    rgb_bytes=bytes(pixmap.samples),
-                )
-            )
+            adapter_lines = adapter.recognize(raster_image)
         except OcrAdapterError:
             records.append(
                 QuarantinedOcrPageRecord(
+                    schema_version=PAGE_RECORD_SCHEMA_VERSION,
                     doc_id=document.doc_id,
                     edition_year=document.edition_year,
                     pdf_page_index=pdf_page_index,
@@ -778,30 +1470,48 @@ def extract_pages(
                 )
             )
             continue
-        ordered_pixel_lines = sort_reading_order(
-            adapter_lines, page_width=float(pixmap.width)
-        )
-        point_lines, page_width, page_height = _scale_lines_to_pdf_points(
-            ordered_pixel_lines,
-            page_rect=page_rect,
-            derotation_matrix=derotation_matrix,
-            raster_width=int(pixmap.width),
-            raster_height=int(pixmap.height),
-        )
-        raw_page = _raw_ocr_page(
-            document=document,
-            pdf_page_index=pdf_page_index,
-            page_label=label,
-            page_width=page_width,
-            page_height=page_height,
-            render_sha256=render_sha256,
-            lines=point_lines,
-        )
-        critical_policy, critical_fields, review_status = _critical_review(
-            document.edition_year
-        )
-        records.append(
-            ExtractedOcrPageRecord(
+        try:
+            ordered_pixel_lines = sort_reading_order(
+                adapter_lines, page_width=float(pixmap.width)
+            )
+            point_lines, page_width, page_height = _scale_lines_to_pdf_points(
+                ordered_pixel_lines,
+                page_rect=page_rect,
+                derotation_matrix=derotation_matrix,
+                raster_width=int(pixmap.width),
+                raster_height=int(pixmap.height),
+            )
+            layout_evidence = _layout_evidence(
+                document.edition_year,
+                raster_image,
+                layout_detector,
+                page_rect=page_rect,
+                derotation_matrix=derotation_matrix,
+            )
+            raw_page = _raw_ocr_page(
+                document=document,
+                pdf_page_index=pdf_page_index,
+                page_label=label,
+                page_width=page_width,
+                page_height=page_height,
+                render_sha256=render_sha256,
+                lines=point_lines,
+                layout_evidence=layout_evidence,
+            )
+            layout_segment = _layout_segment_provenance(
+                document.edition_year,
+                raw_page,
+                source_sha256=source_sha256,
+                segment_start_pdf_page=(document.page_numbering.body_start_pdf_page),
+                segment_end_pdf_page=document.page_numbering.body_end_pdf_page,
+            )
+            critical_policy, critical_fields, review_status = _critical_review(
+                document.edition_year,
+                layout_evidence,
+                registry_segment_available=layout_segment is not None,
+            )
+            record = ExtractedOcrPageRecord(
+                schema_version=PAGE_RECORD_SCHEMA_VERSION,
                 doc_id=document.doc_id,
                 edition_year=document.edition_year,
                 pdf_page_index=pdf_page_index,
@@ -812,6 +1522,7 @@ def extract_pages(
                 image_digest=image_digest,
                 quality_flags=policy.quality_flags,
                 raw_page=raw_page,
+                layout_segment_provenance=layout_segment,
                 review_queue=_review_queue(
                     point_lines,
                     source_sha256=source_sha256,
@@ -821,16 +1532,82 @@ def extract_pages(
                 critical_fields=critical_fields,
                 review_status=review_status,
             )
-        )
+        except (TypeError, ValueError):
+            records.append(
+                QuarantinedOcrPageRecord(
+                    schema_version=PAGE_RECORD_SCHEMA_VERSION,
+                    doc_id=document.doc_id,
+                    edition_year=document.edition_year,
+                    pdf_page_index=pdf_page_index,
+                    page_label=label,
+                    source_sha256=source_sha256,
+                    render_sha256=render_sha256,
+                    render_dpi=policy.render_dpi,
+                    image_digest=image_digest,
+                    quality_flags=policy.quality_flags,
+                    reason_code="ocr-provenance-invalid",
+                )
+            )
+            continue
+        records.append(record)
     return tuple(records)
 
 
-def write_ocr_jsonl(output_path: Path, records: tuple[OcrPageRecord, ...]) -> None:
+def write_ocr_jsonl(
+    output_path: Path,
+    records: tuple[OcrPageRecord, ...],
+    *,
+    document: SourceDocument,
+    expected_image_digest: str,
+    selected_page_indexes: tuple[int, ...],
+) -> None:
     """Atomically write selected OCR page records in deterministic page order."""
+    approved_document = revalidate_source_document(document)
+    if (
+        approved_document is None
+        or approved_document.extraction_method != "ocr"
+        or approved_document.edition_year not in _OCR_POLICIES
+        or approved_document.render_dpi
+        != _OCR_POLICIES[approved_document.edition_year].render_dpi
+    ):
+        raise OcrExtractionError("approved OCR document contract is invalid")
+    if (
+        type(expected_image_digest) is not str
+        or _IMAGE_DIGEST_RE.fullmatch(expected_image_digest) is None
+    ):
+        raise OcrExtractionError("approved OCR image digest is invalid")
+    if (
+        type(selected_page_indexes) is not tuple
+        or not selected_page_indexes
+        or any(type(index) is not int for index in selected_page_indexes)
+        or tuple(sorted(selected_page_indexes)) != selected_page_indexes
+        or len(set(selected_page_indexes)) != len(selected_page_indexes)
+        or selected_page_indexes[0] < 1
+        or selected_page_indexes[-1] > approved_document.pdf_page_count
+    ):
+        raise OcrExtractionError("approved OCR selected pages are invalid")
+    records = tuple(validate_ocr_page_record(record) for record in records)
     ordered = sorted(records, key=lambda record: record.pdf_page_index)
-    indexes = [record.pdf_page_index for record in ordered]
-    if not indexes or indexes != sorted(set(indexes)):
-        raise ValueError("OCR page records must have unique page indexes")
+    indexes = tuple(record.pdf_page_index for record in ordered)
+    if indexes != selected_page_indexes:
+        raise OcrExtractionError("OCR page records do not match selected pages")
+    policy = _OCR_POLICIES[approved_document.edition_year]
+    if any(
+        record.doc_id != approved_document.doc_id
+        or record.edition_year != approved_document.edition_year
+        or record.source_sha256 != approved_document.sha256
+        or record.render_dpi != policy.render_dpi
+        or record.image_digest != expected_image_digest
+        or record.quality_flags != policy.quality_flags
+        or record.page_label
+        != printed_page_label(
+            approved_document.edition_year,
+            record.pdf_page_index,
+            policy=approved_document.page_numbering,
+        )
+        for record in ordered
+    ):
+        raise OcrExtractionError("OCR page records do not match approved run")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     rendered = "".join(
         json.dumps(
@@ -851,12 +1628,12 @@ def write_ocr_jsonl(output_path: Path, records: tuple[OcrPageRecord, ...]) -> No
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_name, output_path)
-    except OSError as error:
+    except OSError:
         try:
             os.unlink(temporary_name)
         except FileNotFoundError:
             pass
-        raise ValueError("cannot write OCR extraction output") from error
+        raise OcrExtractionError("cannot write OCR extraction output") from None
 
 
 def extract_ocr_document(
@@ -867,12 +1644,37 @@ def extract_ocr_document(
     image_digest: str,
 ) -> tuple[OcrPageRecord, ...]:
     """Open one verified PDF and extract selected pages while it remains live."""
+    approved_document = revalidate_source_document(document)
+    if approved_document is None:
+        raise OcrExtractionError("approved document contract is invalid") from None
+    document = approved_document
+    if (
+        document.extraction_method != "ocr"
+        or document.edition_year not in _OCR_POLICIES
+        or document.render_dpi != _OCR_POLICIES[document.edition_year].render_dpi
+    ):
+        raise OcrExtractionError("approved OCR document contract is invalid") from None
+    if (
+        type(image_digest) is not str
+        or _IMAGE_DIGEST_RE.fullmatch(image_digest) is None
+    ):
+        raise OcrExtractionError("approved OCR image digest is invalid") from None
+    if (
+        type(page_indexes) is not tuple
+        or not page_indexes
+        or any(type(index) is not int for index in page_indexes)
+        or tuple(sorted(page_indexes)) != page_indexes
+        or len(set(page_indexes)) != len(page_indexes)
+        or page_indexes[0] < 1
+        or page_indexes[-1] > document.pdf_page_count
+    ):
+        raise OcrExtractionError("approved OCR selected pages are invalid") from None
     try:
         import pymupdf
 
         pdf: Any = pymupdf.open(source_path)  # type: ignore[no-untyped-call]
-    except DOCUMENT_IO_ERRORS as error:
-        raise OcrExtractionError("cannot open approved OCR source PDF") from error
+    except DOCUMENT_IO_ERRORS:
+        raise OcrExtractionError("cannot open approved OCR source PDF") from None
     try:
         if len(pdf) != document.pdf_page_count:
             raise OcrExtractionError("approved OCR source page count changed")
@@ -884,9 +1686,14 @@ def extract_ocr_document(
             adapter=adapter,
             source_sha256=document.sha256,
             image_digest=image_digest,
+            layout_detector=(
+                GreenCardBorderDetector()
+                if document.edition_year in (2024, 2025)
+                else None
+            ),
         )
     finally:
         try:
             pdf.close()
-        except DOCUMENT_IO_ERRORS as error:
-            raise OcrExtractionError("cannot close approved OCR source PDF") from error
+        except DOCUMENT_IO_ERRORS:
+            raise OcrExtractionError("cannot close approved OCR source PDF") from None

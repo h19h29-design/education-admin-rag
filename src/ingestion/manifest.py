@@ -6,7 +6,7 @@ import hashlib
 import unicodedata
 from datetime import date
 from pathlib import Path, PurePath
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 import pymupdf
 from pydantic import (
@@ -21,6 +21,9 @@ from pydantic import (
 PAGE_SIZE_TOLERANCE_PT = 0.01
 """Maximum harmless PDF point-coordinate rounding difference (1/100 point)."""
 
+MAX_SUPPORTED_PDF_PAGE_COUNT: Final = 10_000
+"""Corpus safety ceiling; reviewed originals are under 400 pages."""
+
 APPROVED_EDITION_YEARS = (2020, 2021, 2022, 2023, 2024, 2025)
 EDITION_SEQUENCE_ERROR = "manifest must contain exactly editions 2020 through 2025 in order"
 PDF_LIBRARY_ERRORS = (OSError, RuntimeError, ValueError)
@@ -33,7 +36,9 @@ class ManifestError(Exception):
 class PageSizeProfile(BaseModel):
     """A contiguous PDF-page range that shares an expected media-box size."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(
+        extra="forbid", strict=True, hide_input_in_errors=True
+    )
 
     start_pdf_page: int = Field(ge=1)
     end_pdf_page: int = Field(ge=1)
@@ -50,7 +55,9 @@ class PageSizeProfile(BaseModel):
 class PageNumberingPolicy(BaseModel):
     """Maps a PDF page to a safe body-page label."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(
+        extra="forbid", strict=True, hide_input_in_errors=True
+    )
 
     mode: Literal["offset"]
     body_start_pdf_page: int = Field(ge=1)
@@ -69,7 +76,7 @@ class PageNumberingPolicy(BaseModel):
 class SourceDocument(BaseModel):
     """The complete approved contract for one original source PDF."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
 
     doc_id: str = Field(min_length=1)
     edition_year: int = Field(ge=1900, le=2100)
@@ -81,7 +88,7 @@ class SourceDocument(BaseModel):
     source_filename: str = Field(min_length=1)
     source_relpath: str = Field(min_length=1)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    pdf_page_count: int = Field(gt=0)
+    pdf_page_count: int = Field(gt=0, le=MAX_SUPPORTED_PDF_PAGE_COUNT)
     page_size_profiles: tuple[PageSizeProfile, ...] = Field(min_length=1)
     extraction_method: Literal["native", "ocr"]
     source_dpi: int | None = Field(default=None, gt=0)
@@ -120,7 +127,9 @@ class SourceDocument(BaseModel):
 class SourceManifest(BaseModel):
     """Strict manifest envelope with unique, chronological editions."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(
+        extra="forbid", strict=True, hide_input_in_errors=True
+    )
 
     documents: tuple[SourceDocument, ...] = Field(min_length=1)
 
@@ -137,17 +146,27 @@ class SourceManifest(BaseModel):
 
 def load_manifest(manifest_path: Path) -> tuple[SourceDocument, ...]:
     """Load a JSON manifest without allowing unknown or malformed fields."""
+    manifest_text: str | None = None
+    read_error_message: str | None = None
     try:
         manifest_text = manifest_path.read_text(encoding="utf-8")
-    except UnicodeError as error:
-        raise ManifestError("manifest validation failed") from error
-    except OSError as error:
-        raise ManifestError("cannot read manifest file") from error
+    except UnicodeError:
+        read_error_message = "manifest validation failed"
+    except OSError:
+        read_error_message = "cannot read manifest file"
+    if read_error_message is not None or manifest_text is None:
+        raise ManifestError(read_error_message or "cannot read manifest file") from None
+    validation_message: str | None = None
     try:
         manifest = SourceManifest.model_validate_json(manifest_text)
     except ValidationError as error:
-        message = EDITION_SEQUENCE_ERROR if EDITION_SEQUENCE_ERROR in str(error) else "manifest validation failed"
-        raise ManifestError(message) from error
+        validation_message = (
+            EDITION_SEQUENCE_ERROR
+            if EDITION_SEQUENCE_ERROR in str(error)
+            else "manifest validation failed"
+        )
+    if validation_message is not None:
+        raise ManifestError(validation_message) from None
     return manifest.documents
 
 

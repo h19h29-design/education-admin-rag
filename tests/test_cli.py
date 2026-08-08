@@ -1,4 +1,5 @@
 import hashlib
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -17,6 +18,12 @@ from src.ingestion.review import (
     ReviewValidationError,
     SegmentManifest,
     VerifiedCanonicalReviewRegistry,
+)
+from tests.ingestion.test_parse_metadata import (
+    _native_quarantine_records,
+    _ocr_quarantine_record,
+    _write_jsonl,
+    _write_manifest,
 )
 
 CONTENT_A = "a" * 64
@@ -623,6 +630,195 @@ def test_review_cli_run_reports_commits_before_a_later_state_conflict(
     with ReviewStore(database) as store:
         assert store.get(CASE_1).review_status == "search_approved"
         assert store.get(CASE_2).review_status == "rejected"
+
+
+def test_parse_metadata_cli_emits_one_canonical_value_free_json_line(
+    tmp_path: Path,
+) -> None:
+    """Catches the integration command printing input paths or extractor content."""
+    manifest_path, documents = _write_manifest(tmp_path)
+    input_path = tmp_path / "PRIVATE-INPUT-PATH.jsonl"
+    _write_jsonl(input_path, _native_quarantine_records(documents[0]))
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "parse-metadata",
+            "--input",
+            str(input_path),
+            "--manifest",
+            str(manifest_path),
+            "--year",
+            "2020",
+            "--pages",
+            "all",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert result.stdout.count("\n") == 1
+    payload = json.loads(result.stdout)
+    assert payload["metadata_schema"] == "sen-qa-parse-metadata-v1"
+    assert payload["record_counts"]["quarantined"] == 2
+    assert str(input_path) not in result.stdout
+    assert "PRIVATE-INPUT-PATH" not in result.stdout
+    assert result.stdout.strip() == json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def test_parse_metadata_cli_errors_are_fixed_and_source_value_free(
+    tmp_path: Path,
+) -> None:
+    """Catches JSON/Pydantic details escaping through stdout, stderr, or Exit context."""
+    manifest_path, _ = _write_manifest(tmp_path)
+    sentinel = "PRIVATE-RAW-SENTINEL"
+    input_path = tmp_path / f"{sentinel}.jsonl"
+    input_path.write_text('{"status":"' + sentinel + '"}\n', encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "parse-metadata",
+            "--input",
+            str(input_path),
+            "--manifest",
+            str(manifest_path),
+            "--year",
+            "2020",
+            "--pages",
+            "all",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout.strip() == "failed=1 error_code=input_invalid"
+    assert result.stderr == ""
+    assert sentinel not in result.stdout + result.stderr
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+    chain: list[BaseException] = []
+    current: BaseException | None = result.exception
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    disclosed = "".join(str(error) + repr(error) for error in chain)
+    assert sentinel not in disclosed
+    assert str(input_path) not in disclosed
+
+
+def test_parse_metadata_cli_deep_json_has_one_fixed_cause_free_error(
+    tmp_path: Path,
+) -> None:
+    """Catches JSON recursion errors escaping Click's fixed public boundary."""
+    manifest_path, _ = _write_manifest(tmp_path)
+    input_path = tmp_path / "deep.jsonl"
+    input_path.write_bytes(b"[" * 2000 + b"0" + b"]" * 2000 + b"\n")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "parse-metadata",
+            "--input",
+            str(input_path),
+            "--manifest",
+            str(manifest_path),
+            "--year",
+            "2020",
+            "--pages",
+            "all",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout.strip() == "failed=1 error_code=input_invalid"
+    assert result.stderr == ""
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_parse_metadata_cli_canonical_failure_has_one_fixed_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches final Pydantic/JSON rendering failures escaping the CLI boundary."""
+    manifest_path, documents = _write_manifest(tmp_path)
+    input_path = tmp_path / "native.jsonl"
+    _write_jsonl(input_path, _native_quarantine_records(documents[0]))
+
+    def fail_canonical(metadata: object) -> bytes:
+        del metadata
+        raise OverflowError("PRIVATE-CANONICAL-FAILURE")
+
+    monkeypatch.setattr(cli_module, "canonical_metadata_bytes", fail_canonical)
+    result = CliRunner().invoke(
+        app,
+        [
+            "parse-metadata",
+            "--input",
+            str(input_path),
+            "--manifest",
+            str(manifest_path),
+            "--year",
+            "2020",
+            "--pages",
+            "all",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout.strip() == "failed=1 error_code=parse_failed"
+    assert result.stderr == ""
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_parse_metadata_cli_requires_matching_ocr_image_digest(
+    tmp_path: Path,
+) -> None:
+    """Catches OCR metadata running without binding the ingestion container image."""
+    manifest_path, documents = _write_manifest(tmp_path)
+    digest = "sha256:" + "d" * 64
+    input_path = tmp_path / "ocr.jsonl"
+    _write_jsonl(
+        input_path,
+        (_ocr_quarantine_record(documents[-1], image_digest=digest),),
+    )
+    command = [
+        "parse-metadata",
+        "--input",
+        str(input_path),
+        "--manifest",
+        str(manifest_path),
+        "--year",
+        "2025",
+        "--pages",
+        "2",
+    ]
+    runner = CliRunner()
+
+    missing = runner.invoke(
+        app,
+        command,
+        env={"SEN_QA_INGESTION_IMAGE_DIGEST": ""},
+    )
+    matched = runner.invoke(
+        app,
+        command,
+        env={"SEN_QA_INGESTION_IMAGE_DIGEST": digest},
+    )
+
+    assert missing.exit_code == 1
+    assert missing.stdout.strip() == "failed=1 error_code=image_digest_invalid"
+    assert matched.exit_code == 0
+    assert json.loads(matched.stdout)["extraction_source"] == "ocr"
 
 
 def test_review_cli_reject_is_terminal_and_minimal(
