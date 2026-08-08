@@ -602,7 +602,7 @@ test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' education-admi
 SEN_QA_INGESTION_IMAGE_SIZE_BYTES="$(docker image inspect --format '{{.Size}}' education-admin-ingestion:corpus-v1)"
 test "$SEN_QA_INGESTION_IMAGE_SIZE_BYTES" -le 2500000000
 docker image inspect --format 'SEN_QA_INGESTION_IMAGE_DIGEST={{.Id}}' education-admin-ingestion:corpus-v1 > artifacts/build/ingestion.env
-docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -c 'import cv2, paddle, paddleocr, paddlex, pymupdf, pydantic, typer; print("runtime-imports=ok")'
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -c 'import cv2, paddle, paddleocr, paddlex, pymupdf, pydantic, typer; assert paddle.__version__ == "3.1.1", paddle.__version__; print("runtime-imports=ok")'
 docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -c 'import importlib.metadata as metadata, importlib.util as util; modules=("torch", "sentence_transformers", "transformers", "qdrant_client", "triton"); present=[name for name in modules if util.find_spec(name) is not None]; distributions={dist.metadata["Name"].lower() for dist in metadata.distributions() if dist.metadata["Name"]}; accelerator=sorted(name for name in distributions if name.startswith(("nvidia-", "cuda-"))); assert not present, present; assert not accelerator, accelerator; print("index-stack=absent")'
 docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli validate-ocr-models
 docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" --env-file artifacts/build/ingestion.env -e SEN_QA_SOURCE_ROOT=/sources --mount "type=bind,src=$SEN_QA_BUILDER_SOURCE_ROOT,dst=/sources,readonly" --mount "type=bind,src=$SEN_QA_OCR_SMOKE_DIR,dst=/work/artifacts/ocr-smoke" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli extract-ocr --year 2025 --pages 13 --output /work/artifacts/ocr-smoke
@@ -613,7 +613,7 @@ cmp artifacts/build/ocr-smoke-run-1.sha256 artifacts/build/ocr-smoke-run-2.sha25
 docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli validate-ocr-models
 ```
 
-`SEN_QA_INGESTION_IMAGE_DIGEST`에는 바로 앞에서 기록한 local content digest가 env file로 전달된다. Build만 네트워크를 사용하며 runtime은 host 소유 출력 디렉터리와 같은 non-root UID/GID로 실행한다. Expected: Docker server와 final image가 linux/amd64이고 image size가 2,500,000,000 bytes 이하이며, OCR runtime module은 모두 import되고 index/CUDA stack module과 `nvidia-*`/`cuda-*` distribution은 하나도 없다. network가 차단된 read-only container에서 locked-model 검증과 실제 page-13 CPU 예측이 성공한다. 두 실행의 JSONL hash가 같고 page JSON에는 PDF-point bbox/confidence, `render_dpi=300`, source/render hash, review flags, image digest가 기록된다. 두 실행 전후 locked-model 검증이 모두 통과해야 한다. Docker/buildx가 없으면 host 명령으로 우회하지 않고 Linux builder 준비 작업으로 차단한다.
+`SEN_QA_INGESTION_IMAGE_DIGEST`에는 바로 앞에서 기록한 local content digest가 env file로 전달된다. Build만 네트워크를 사용하며 runtime은 host 소유 출력 디렉터리와 같은 non-root UID/GID로 실행한다. Expected: Docker server와 final image가 linux/amd64이고 image size가 2,500,000,000 bytes 이하이며, OCR runtime module은 모두 import되고 `paddle.__version__`은 정확히 `3.1.1`이며, index/CUDA stack module과 `nvidia-*`/`cuda-*` distribution은 하나도 없다. network가 차단된 read-only container에서 locked-model 검증과 실제 page-13 CPU 예측이 성공한다. 두 실행의 JSONL hash가 같고 page JSON에는 PDF-point bbox/confidence, `render_dpi=300`, source/render hash, review flags, image digest가 기록된다. 두 실행 전후 locked-model 검증이 모두 통과해야 한다. Docker/buildx가 없으면 host 명령으로 우회하지 않고 Linux builder 준비 작업으로 차단한다.
 
 - [ ] **Step 8: 커밋한다.**
 
@@ -964,8 +964,10 @@ def test_restricted_chunk_is_never_upserted(fake_qdrant, restricted_chunk) -> No
 - [ ] **Step 2: 실패를 확인한다.**
 
 ```bash
-uv run pytest tests/retrieval/test_dense.py -q
+uv run --extra index pytest tests/retrieval/test_dense.py -q
 ```
+
+Expected: clean host environment에서도 `index` extra가 선택되어 `sentence-transformers`와 `qdrant-client`를 사용할 수 있다.
 
 - [ ] **Step 3: Task 9에서 고정한 `BAAI/bge-m3` cache를 offline 검증한다.**
 
@@ -991,13 +993,13 @@ Expected: Docker server가 사용 가능하다. `docker-compose.index.yml`의 Qd
 - [ ] **Step 7: indexer image offline smoke와 Qdrant integration을 실행한다.**
 
 ```bash
-uv run pytest tests/retrieval/test_dense.py -q
+uv run --extra index pytest tests/retrieval/test_dense.py -q
 mkdir -p artifacts/build
 docker buildx build --platform linux/amd64 --load --network default -f docker/indexer.Dockerfile -t education-admin-indexer:corpus-v1 .
 docker image inspect --format 'SEN_QA_INDEXER_IMAGE_DIGEST={{.Id}}' education-admin-indexer:corpus-v1 > artifacts/build/indexer.env
 docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=512m --env-file artifacts/build/indexer.env education-admin-indexer:corpus-v1 /opt/venv/bin/python -m src.cli dense-smoke --text "학교회계 제12조"
 docker compose -f docker-compose.index.yml up -d qdrant
-uv run pytest -m qdrant tests/retrieval/test_dense.py -q
+uv run --extra index pytest -m qdrant tests/retrieval/test_dense.py -q
 docker compose -f docker-compose.index.yml stop qdrant
 ```
 
