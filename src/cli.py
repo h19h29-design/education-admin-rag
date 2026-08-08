@@ -1,4 +1,14 @@
+import os
+from pathlib import Path
+
 import typer
+
+from src.ingestion.manifest import (
+    ManifestError,
+    load_manifest,
+    resolve_source,
+    verify_source,
+)
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -11,6 +21,43 @@ def main() -> None:
 @app.command()
 def version() -> None:
     typer.echo("education-admin-rag 0.1.0")
+
+
+@app.command("verify-sources")
+def verify_sources(
+    manifest: Path = typer.Option(  # noqa: B008 - Typer declares CLI parameters this way.
+        ..., "--manifest", exists=True, dir_okay=False, readable=True
+    ),
+) -> None:
+    """Verify every approved original PDF under SEN_QA_SOURCE_ROOT."""
+    source_root_value = os.environ.get("SEN_QA_SOURCE_ROOT")
+    if not source_root_value:
+        typer.echo("SEN_QA_SOURCE_ROOT is required")
+        raise typer.Exit(code=2)
+
+    try:
+        documents = load_manifest(manifest)
+    except ManifestError as error:
+        typer.echo(f"verified=0 changed=0 failed=0 error={error}")
+        raise typer.Exit(code=1) from error
+
+    verified = 0
+    changed = 0
+    failed = 0
+    for document in documents:
+        try:
+            verify_source(resolve_source(Path(source_root_value), document), document)
+        except ManifestError as error:
+            failed += 1
+            if "mismatch" in str(error):
+                changed += 1
+            typer.echo(f"failed document={document.doc_id} reason={error}")
+        else:
+            verified += 1
+
+    typer.echo(f"verified={verified} changed={changed} failed={failed}")
+    if failed:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":
