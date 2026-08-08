@@ -21,6 +21,15 @@ require_full_history() {
   fi
 }
 
+require_no_gitleaksignore() {
+  local ignored_path
+  ignored_path="$(find "$repo_root" -path "$repo_root/.git" -prune -o -name '.gitleaksignore' -print -quit)"
+  if [[ -n "$ignored_path" ]]; then
+    printf '%s\n' 'BLOCKED: repository-controlled .gitleaksignore files are not permitted.' >&2
+    exit 2
+  fi
+}
+
 artifact_for_platform() {
   case "$(uname -s)-$(uname -m)" in
     Darwin-arm64)
@@ -48,13 +57,11 @@ artifact_for_platform() {
 
 print_metadata() {
   local report="$1"
-  jq -r '.[] | [.Fingerprint, .Commit, .File, .RuleID] | @tsv' "$report" \
-    | while IFS=$'\t' read -r fingerprint commit path rule_id; do
-        printf 'finding fingerprint=%s commit=%s path=%s rule=%s\n' "$fingerprint" "$commit" "$path" "$rule_id"
-      done
+  jq -r '.[] | "finding fingerprint=\(.Fingerprint // "") commit=\(.Commit // "") path=\(.File // "") rule=\(.RuleID // "")"' "$report"
 }
 
 require_full_history
+require_no_gitleaksignore
 artifact_for_platform
 cd "$repo_root"
 
@@ -78,7 +85,7 @@ tar -xzf "$archive" -C "$scanner_tmp"
 chmod 700 "$scanner"
 
 current_exit=0
-"$scanner" dir "$repo_root" --config "$scanner_config" --redact=100 \
+"$scanner" dir "$repo_root" --config "$scanner_config" --redact=100 --ignore-gitleaks-allow \
   --report-format json --report-path "$current_report" >/dev/null 2>&1 || current_exit=$?
 if [[ "$current_exit" -gt 1 ]]; then
   printf 'Gitleaks working-tree scan failed with exit code %s.\n' "$current_exit" >&2
@@ -91,7 +98,7 @@ if [[ "$current_exit" -eq 1 ]]; then
 fi
 
 history_exit=0
-"$scanner" git --config "$scanner_config" --redact=100 \
+"$scanner" git --config "$scanner_config" --redact=100 --ignore-gitleaks-allow \
   --report-format json --report-path "$history_report" >/dev/null 2>&1 || history_exit=$?
 if [[ "$history_exit" -gt 1 ]]; then
   printf 'Gitleaks history scan failed with exit code %s.\n' "$history_exit" >&2
