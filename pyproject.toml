@@ -14,7 +14,7 @@ dependencies = [
 [project.optional-dependencies]
 ocr = [
     "paddleocr; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "paddlepaddle; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "paddlepaddle==3.1.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [dependency-groups]

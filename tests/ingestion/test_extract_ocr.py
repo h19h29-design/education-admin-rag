@@ -8,6 +8,7 @@ import json
 import subprocess
 import sys
 import tarfile
+import tomllib
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,7 +49,7 @@ def _valid_model_lock_payload() -> dict[str, object]:
     return {
         "schema_version": 1,
         "language": "korean",
-        "packages": {"paddleocr": "3.7.0", "paddlepaddle": "3.3.1"},
+        "packages": {"paddleocr": "3.7.0", "paddlepaddle": "3.1.1"},
         "models": [
             {
                 "name": "detector",
@@ -249,11 +250,36 @@ def test_ocr_render_policies_are_fixed() -> None:
 
 def test_checked_in_model_lock_matches_frozen_runtime_packages() -> None:
     """Catches model metadata drifting from the exact uv.lock/runtime packages."""
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    uv_lock = tomllib.loads(Path("uv.lock").read_text(encoding="utf-8"))
     lock = load_model_lock(Path("config/models.lock.json"))
+    paddle_package = next(
+        package
+        for package in uv_lock["package"]
+        if package["name"] == "paddlepaddle"
+    )
+    cp311_linux_wheel = next(
+        wheel
+        for wheel in paddle_package["wheels"]
+        if "cp311-cp311-manylinux1_x86_64.whl" in wheel["url"]
+    )
 
+    assert (
+        "paddlepaddle==3.1.1; sys_platform == 'linux' and "
+        "platform_machine == 'x86_64'"
+        in project["project"]["optional-dependencies"]["ocr"]
+    )
+    assert paddle_package["version"] == "3.1.1"
+    assert {
+        key: cp311_linux_wheel[key] for key in ("url", "hash", "size")
+    } == {
+        "url": "https://files.pythonhosted.org/packages/78/e5/8c8a2a73a745d38433711ef8c54bc4326fe0e763ed4468e87f7e9e0fb837/paddlepaddle-3.1.1-cp311-cp311-manylinux1_x86_64.whl",
+        "hash": "sha256:36c6a768d31486c100e1be14404f8fc57565283f0df90b7142d2560100fe86ef",
+        "size": 187453011,
+    }
     assert lock.language == "korean"
     assert lock.packages.paddleocr == "3.7.0"
-    assert lock.packages.paddlepaddle == "3.3.1"
+    assert lock.packages.paddlepaddle == "3.1.1"
     assert {model.name for model in lock.models} == {
         "PP-OCRv5_server_det_infer",
         "korean_PP-OCRv5_mobile_rec_infer",

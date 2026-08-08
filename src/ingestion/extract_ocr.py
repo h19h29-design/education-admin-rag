@@ -27,7 +27,7 @@ from src.ingestion.extract_native import DOCUMENT_IO_ERRORS, PAGE_EXTRACTION_ERR
 from src.ingestion.manifest import SourceDocument
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_PACKAGE_VERSIONS = {"paddleocr": "3.7.0", "paddlepaddle": "3.3.1"}
+_PACKAGE_VERSIONS = {"paddleocr": "3.7.0", "paddlepaddle": "3.1.1"}
 _OFFICIAL_MODEL_HOST = "paddle-model-ecology.bj.bcebos.com"
 _MUTABLE_REVISIONS = {"latest", "main", "master", "head"}
 _IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
