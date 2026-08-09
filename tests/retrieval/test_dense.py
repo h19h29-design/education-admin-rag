@@ -24,12 +24,14 @@ from src.retrieval.dense import (
     DenseIndex,
     DensePoint,
     DenseSearchFilters,
+    build_dense_candidate,
 )
 from tests.retrieval.test_lexical import (
     CASE_PUBLIC,
     _case,
     _chunk,
     _document,
+    _write_canonical_database,
 )
 
 LOCK_PATH = Path("config/models.lock.json")
@@ -235,6 +237,31 @@ def test_dense_encoder_builds_points_from_exact_chunk_embedding_text() -> None:
     assert points[0].chunk_id == chunk.chunk_id
     assert points[0].embedding_version == encoder.embedding_version
     assert backend.calls[0]["texts"] == [chunk.embedding_text]
+
+
+def test_dense_candidate_build_reads_canonical_storage_without_alias_mutation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "canonical.sqlite3"
+    _write_canonical_database(database)
+    encoder = DenseEncoder(
+        backend=FakeBackend(),
+        lock=load_embedding_model_lock(LOCK_PATH),
+        batch_size=16,
+    )
+    client = FakeQdrant()
+
+    result = build_dense_candidate(
+        database,
+        client=client,
+        encoder=encoder,
+        release_id=RELEASE_ID,
+    )
+
+    assert result.point_count == 2
+    assert result.collection_name == f"{RELEASE_ID}-bge-m3"
+    assert len(result.sampled_vector_sha256) == 64
+    assert client.alias_operations == []
 
 
 def test_dense_encoder_filters_restricted_content_before_model_execution() -> None:

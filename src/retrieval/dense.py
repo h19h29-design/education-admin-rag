@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import importlib
+import json
 import math
 import re
+import sqlite3
 import struct
 import uuid
 from collections.abc import Iterable
@@ -24,6 +26,7 @@ from src.corpus.chunking import (
     verify_embedding_cache,
 )
 from src.corpus.models import Case, Chunk, Document, SourceSpan
+from src.corpus.storage import StorageError, connect_canonical_storage
 from src.retrieval.query import AccessLevel, CaseType, QueryError, QueryFilters
 
 _RELEASE_RE = re.compile(r"^corpus-[0-9]{14}-[0-9a-f]{8}$")
@@ -34,6 +37,7 @@ _MAX_BATCH_SIZE = 256
 _MAX_TEXT_CHARACTERS = 16_384
 _MAX_POINTS_PER_CALL = 10_000
 _MAX_SOURCE_REFERENCES = 4_096
+_MAX_DENSE_RECORDS = 100_000
 _POINT_NAMESPACE = uuid.UUID("4d8b3e8e-1f41-51c2-88ea-54ddf572304d")
 
 
@@ -986,3 +990,121 @@ class DenseIndex:
                 _raise("dense_search_failed")
             hits.append(hit)
         return tuple(hits)
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value: str) -> NoReturn:
+    raise ValueError("non-finite number")
+
+
+def _load_dense_records(
+    database: Path,
+) -> tuple[tuple[Document, Case, Chunk], ...]:
+    records: list[tuple[Document, Case, Chunk]] = []
+    failed = False
+    try:
+        with connect_canonical_storage(database) as connection:
+            count = connection.execute("SELECT count(*) FROM chunks").fetchone()
+            if (
+                type(count) is not tuple
+                or len(count) != 1
+                or type(count[0]) is not int
+                or count[0] < 1
+                or count[0] > _MAX_DENSE_RECORDS
+            ):
+                failed = True
+            rows: list[tuple[object, object, object]] = []
+            if not failed:
+                rows = cast(
+                    list[tuple[object, object, object]],
+                    connection.execute(
+                        "SELECT d.payload_json,c.payload_json,ch.payload_json "
+                        "FROM chunks AS ch JOIN cases AS c ON c.case_id=ch.case_id "
+                        "JOIN documents AS d "
+                        "ON d.doc_id=json_extract(c.payload_json,'$.doc_id') "
+                        "ORDER BY ch.chunk_id"
+                    ).fetchall(),
+                )
+                if len(rows) != count[0]:
+                    failed = True
+            if not failed:
+                for document_value, case_value, chunk_value in rows:
+                    if any(
+                        type(value) is not str
+                        or len(value.encode("utf-8")) > _MAX_TEXT_CHARACTERS * 16
+                        for value in (document_value, case_value, chunk_value)
+                    ):
+                        failed = True
+                        break
+                    raw_document = cast(str, document_value)
+                    raw_case = cast(str, case_value)
+                    raw_chunk = cast(str, chunk_value)
+                    for raw in (raw_document, raw_case, raw_chunk):
+                        decoded = json.loads(
+                            raw,
+                            object_pairs_hook=_unique_object,
+                            parse_constant=_reject_json_constant,
+                        )
+                        if type(decoded) is not dict:
+                            failed = True
+                            break
+                    if failed:
+                        break
+                    document = Document.model_validate_json(raw_document)
+                    case = Case.model_validate_json(raw_case)
+                    chunk = Chunk.model_validate_json(raw_chunk)
+                    records.append((document, case, chunk))
+    except (
+        StorageError,
+        sqlite3.Error,
+        ValidationError,
+        UnicodeError,
+        TypeError,
+        ValueError,
+    ):
+        failed = True
+    if failed or not records:
+        _raise("dense_records_invalid")
+    return tuple(records)
+
+
+def build_dense_candidate(
+    database: Path,
+    *,
+    client: _DenseStore,
+    encoder: DenseEncoder,
+    release_id: str,
+) -> DenseBuildResult:
+    """Build and verify one versioned dense candidate without alias mutation."""
+    if type(encoder) is not DenseEncoder:
+        _raise("dense_records_invalid")
+    records = _load_dense_records(database)
+    index: DenseIndex | None = None
+    point_count = 0
+    for offset in range(0, len(records), _MAX_BATCH_SIZE):
+        points = encoder.build_points(
+            records[offset : offset + _MAX_BATCH_SIZE],
+            corpus_version=release_id,
+        )
+        if points and index is None:
+            index = DenseIndex(
+                client,
+                release_id=release_id,
+                vector_size=len(points[0].vector),
+                embedding_version=encoder.embedding_version,
+            )
+        if points:
+            if index is None or index.upsert(points) != len(points):
+                _raise("dense_points_invalid")
+            point_count += len(points)
+    if index is None or point_count < 1:
+        _raise("dense_records_invalid")
+    return index.verify(expected_eligible_count=point_count)
