@@ -52,6 +52,8 @@ from src.ingestion.review import (
     SegmentManifest,
     validate_review_reason,
 )
+from src.retrieval.lexical import LexicalError, LexicalIndex
+from src.retrieval.query import QueryError
 
 app = typer.Typer(no_args_is_help=True)
 review_app = typer.Typer(no_args_is_help=True)
@@ -111,6 +113,33 @@ def main() -> None:
 @app.command()
 def version() -> None:
     typer.echo("education-admin-rag 0.1.0")
+
+
+@app.command("inspect-lexical-plan")
+def inspect_lexical_plan(
+    database: Path = typer.Option(  # noqa: B008 - Typer declares CLI parameters this way.
+        ..., "--db", exists=True, dir_okay=False, readable=True
+    ),
+    query: str = typer.Option(..., "--query"),
+) -> None:
+    """Emit only value-free FTS execution-plan metadata."""
+    error_code: str | None = None
+    plan = None
+    try:
+        plan = LexicalIndex(database).inspect_plan(query)
+    except (LexicalError, QueryError) as error:
+        error_code = error.code
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        error_code = "inspect_failed"
+    if error_code is not None or plan is None:
+        typer.echo(f"failed=1 error_code={error_code or 'inspect_failed'}")
+        raise SystemExit(1) from None
+    typer.echo(
+        f"uses_fts={int(plan.uses_fts)} "
+        f"full_table_scan={int(plan.full_table_scan)} "
+        f"restricted_candidates={plan.restricted_candidates} "
+        f"plan_steps={plan.plan_steps} failed=0"
+    )
 
 
 @review_app.command("verify-fields")

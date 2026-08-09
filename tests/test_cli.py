@@ -19,12 +19,14 @@ from src.ingestion.review import (
     SegmentManifest,
     VerifiedCanonicalReviewRegistry,
 )
+from src.retrieval.lexical import build_lexical_index
 from tests.ingestion.test_parse_metadata import (
     _native_quarantine_records,
     _ocr_quarantine_record,
     _write_jsonl,
     _write_manifest,
 )
+from tests.retrieval.test_lexical import _write_canonical_database
 
 CONTENT_A = "a" * 64
 CONTENT_B = "b" * 64
@@ -73,6 +75,45 @@ def test_module_entrypoint_reports_version() -> None:
     )
     assert completed.returncode == 0
     assert completed.stdout.strip() == "education-admin-rag 0.1.0"
+
+
+def test_inspect_lexical_plan_reports_only_safe_plan_metadata(tmp_path: Path) -> None:
+    canonical = tmp_path / "canonical.sqlite3"
+    index = tmp_path / "lexical.sqlite3"
+    _write_canonical_database(canonical)
+    build_lexical_index(canonical, index)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "inspect-lexical-plan",
+            "--db",
+            str(index),
+            "--query",
+            "학교회계 제12조 PRIVATE_QUERY_SENTINEL",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.startswith(
+        "uses_fts=1 full_table_scan=0 restricted_candidates=0 plan_steps="
+    )
+    assert result.stdout.rstrip().endswith("failed=0")
+    assert "PRIVATE_QUERY_SENTINEL" not in result.stdout
+
+
+def test_inspect_lexical_plan_sanitizes_invalid_index_error(tmp_path: Path) -> None:
+    invalid = tmp_path / "invalid.sqlite3"
+    invalid.write_text("PRIVATE_INDEX_SENTINEL", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app,
+        ["inspect-lexical-plan", "--db", str(invalid), "--query", "학교회계"],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout.strip() == "failed=1 error_code=index_invalid"
+    assert "PRIVATE_INDEX_SENTINEL" not in result.stdout
 
 
 def _queued_database(tmp_path: Path) -> Path:
