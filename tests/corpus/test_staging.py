@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Literal
 
@@ -179,6 +180,12 @@ def test_prepare_review_batch_binds_raw_spans_quality_and_registry() -> None:
         batch.registry.cases[0].content_sha256 == batch.envelopes[0].fingerprint_sha256
     )
     assert batch.assessments[0].case_id == case.case_id
+    assert batch.document_page_counts["fixture-2023"].model_dump() == {
+        "failed": 0,
+        "quarantined": 0,
+        "succeeded": 1,
+    }
+    assert len(batch.manifest_sha256) == 64
     assert {item.reason_code for item in batch.assessments[0].findings} == {
         "critical-fields-unverified"
     }
@@ -202,6 +209,17 @@ def test_review_package_is_owner_only_no_clobber_and_enqueues_every_case(
     assert package == tmp_path / "review"
     assert (package.stat().st_mode & 0o777) == 0o700
     assert ((package / "registry.json").stat().st_mode & 0o777) == 0o600
+    documents = json.loads((package / "documents.json").read_text())
+    evidence = json.loads((package / "ingestion-evidence.json").read_text())
+    assert documents["documents"][0]["doc_id"] == "fixture-2023"
+    assert documents["schema_version"] == "sen-qa-review-documents/v1"
+    assert evidence["document_page_counts"] == {
+        "fixture-2023": {"failed": 0, "quarantined": 0, "succeeded": 1}
+    }
+    assert evidence["manifest_sha256"] == batch.manifest_sha256
+    assert evidence["schema_version"] == "sen-qa-ingestion-evidence/v1"
+    assert ((package / "documents.json").stat().st_mode & 0o777) == 0o600
+    assert ((package / "ingestion-evidence.json").stat().st_mode & 0o777) == 0o600
     assert (
         (package / "candidates" / f"{batch.cases[0].case_id}.json").stat().st_mode
         & 0o777

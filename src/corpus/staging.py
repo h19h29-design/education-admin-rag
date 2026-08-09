@@ -17,7 +17,7 @@ from typing import NoReturn, cast
 
 from src.corpus.chunking import ChunkRole, RoleSource, role_source_manifest_bytes
 from src.corpus.ids import make_case_id
-from src.corpus.models import Case, Document, SourceSpan
+from src.corpus.models import Case, Document, DocumentPageCounts, SourceSpan
 from src.corpus.storage import (
     VerifiedPromotionEnvelope,
     load_promotion_envelope,
@@ -72,6 +72,8 @@ class PreparedReviewBatch:
     registry: VerifiedCanonicalReviewRegistry
     parser_authority_sha256: str
     raw_authority_sha256: str
+    manifest_sha256: str
+    document_page_counts: dict[str, DocumentPageCounts]
     quarantine_count: int
 
 
@@ -236,6 +238,16 @@ def _canonical_document(source: SourceDocument, ingestion_version: str) -> Docum
         ),
         ingestion_version=ingestion_version,
     )
+
+
+def _document_manifest_sha256(source: SourceDocument) -> str:
+    payload = json.dumps(
+        source.model_dump(mode="json"),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(b"sen-qa-source-document-v1\0" + payload).hexdigest()
 
 
 def _span_key(span: SourceSpan) -> tuple[object, ...]:
@@ -421,7 +433,7 @@ def _prepare_review_batch(
     if sum(len(page.lines) for page in approved_pages) > _MAX_LINES:
         _raise("staging_input_invalid")
     page_indexes = tuple(page.pdf_page_index for page in approved_pages)
-    if page_indexes != tuple(sorted(set(page_indexes))):
+    if page_indexes != tuple(range(1, approved_document.pdf_page_count + 1)):
         _raise("staging_input_invalid")
     if any(
         page.doc_id != approved_document.doc_id
@@ -586,6 +598,24 @@ def _prepare_review_batch(
     object.__setattr__(batch, "registry", verified_registry)
     object.__setattr__(batch, "parser_authority_sha256", parser_authority_sha256)
     object.__setattr__(batch, "raw_authority_sha256", raw_authority_sha256)
+    object.__setattr__(
+        batch, "manifest_sha256", _document_manifest_sha256(approved_document)
+    )
+    object.__setattr__(
+        batch,
+        "document_page_counts",
+        {
+            approved_document.doc_id: DocumentPageCounts(
+                succeeded=sum(
+                    page.page_status == "extracted" for page in approved_pages
+                ),
+                quarantined=sum(
+                    page.page_status == "quarantined" for page in approved_pages
+                ),
+                failed=0,
+            )
+        },
+    )
     object.__setattr__(batch, "quarantine_count", len(result.quarantines))
     return batch
 
@@ -636,6 +666,9 @@ def _prepare_review_corpus(
     ordered_runs = tuple(sorted(checked_runs, key=lambda run: run.document.doc_id))
     document_ids = tuple(run.document.doc_id for run in ordered_runs)
     if document_ids != tuple(sorted(set(document_ids))):
+        _raise("staging_input_invalid")
+    manifest_bytes = ordered_runs[0].manifest_bytes
+    if any(run.manifest_bytes != manifest_bytes for run in ordered_runs):
         _raise("staging_input_invalid")
     try:
         authority_rows = [
@@ -712,6 +745,20 @@ def _prepare_review_corpus(
     object.__setattr__(batch, "registry", verified_registry)
     object.__setattr__(batch, "parser_authority_sha256", parser_authority_sha256)
     object.__setattr__(batch, "raw_authority_sha256", raw_authority_sha256)
+    object.__setattr__(
+        batch,
+        "manifest_sha256",
+        hashlib.sha256(manifest_bytes).hexdigest(),
+    )
+    object.__setattr__(
+        batch,
+        "document_page_counts",
+        {
+            doc_id: count
+            for item in batches
+            for doc_id, count in item.document_page_counts.items()
+        },
+    )
     object.__setattr__(
         batch,
         "quarantine_count",
@@ -917,8 +964,10 @@ def _revalidate_batch(value: object) -> PreparedReviewBatch | None:
     expected_fields = {
         "assessments",
         "cases",
+        "document_page_counts",
         "documents",
         "envelopes",
+        "manifest_sha256",
         "parser_authority_sha256",
         "quarantine_count",
         "raw_authority_sha256",
@@ -942,8 +991,11 @@ def _revalidate_batch(value: object) -> PreparedReviewBatch | None:
         or fields["quarantine_count"] < 0
         or not isinstance(fields["parser_authority_sha256"], str)
         or not isinstance(fields["raw_authority_sha256"], str)
+        or not isinstance(fields["manifest_sha256"], str)
+        or type(fields["document_page_counts"]) is not dict
         or _SHA256_RE.fullmatch(fields["parser_authority_sha256"]) is None
         or _SHA256_RE.fullmatch(fields["raw_authority_sha256"]) is None
+        or _SHA256_RE.fullmatch(fields["manifest_sha256"]) is None
     ):
         return None
     documents = tuple(
@@ -958,6 +1010,17 @@ def _revalidate_batch(value: object) -> PreparedReviewBatch | None:
     approved_documents = cast(tuple[Document, ...], documents)
     approved_cases = cast(tuple[Case, ...], cases)
     approved_assessments = cast(tuple[QualityAssessment, ...], assessments)
+    page_counts: dict[str, DocumentPageCounts] = {}
+    for doc_id, raw_count in cast(
+        dict[object, object], fields["document_page_counts"]
+    ).items():
+        count_fields = _exact_fields(raw_count, DocumentPageCounts)
+        if not isinstance(doc_id, str) or count_fields is None:
+            return None
+        try:
+            page_counts[doc_id] = DocumentPageCounts.model_validate(count_fields)
+        except (TypeError, ValueError):
+            return None
     envelopes: list[VerifiedPromotionEnvelope] = []
     for raw_envelope, case in zip(raw_envelopes, approved_cases, strict=True):
         if type(raw_envelope) is not VerifiedPromotionEnvelope:
@@ -1029,6 +1092,13 @@ def _revalidate_batch(value: object) -> PreparedReviewBatch | None:
     document_ids = tuple(document.doc_id for document in approved_documents)
     if (
         document_ids != tuple(sorted(set(document_ids)))
+        or set(page_counts) != set(document_ids)
+        or any(
+            count.succeeded + count.quarantined + count.failed
+            != document.pdf_page_count
+            for document in approved_documents
+            for count in (page_counts[document.doc_id],)
+        )
         or {case.doc_id for case in approved_cases} != set(document_ids)
         or checked_registry.cases != expected_references
         or any(
@@ -1055,6 +1125,8 @@ def _revalidate_batch(value: object) -> PreparedReviewBatch | None:
         "raw_authority_sha256",
         fields["raw_authority_sha256"],
     )
+    object.__setattr__(checked_batch, "manifest_sha256", fields["manifest_sha256"])
+    object.__setattr__(checked_batch, "document_page_counts", page_counts)
     object.__setattr__(checked_batch, "quarantine_count", fields["quarantine_count"])
     return checked_batch
 
@@ -1084,6 +1156,47 @@ def _write_review_package(root: Path, *, release_id: str, batch: object) -> Path
         os.mkdir(candidates_dir, 0o700)
         os.chmod(candidates_dir, 0o700)
         _write_private(package / "registry.json", approved_batch.registry.to_bytes())
+        document_payload = {
+            "documents": [
+                document.model_dump(mode="json")
+                for document in approved_batch.documents
+            ],
+            "schema_version": "sen-qa-review-documents/v1",
+        }
+        _write_private(
+            package / "documents.json",
+            (
+                json.dumps(
+                    document_payload,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("ascii"),
+        )
+        evidence_payload = {
+            "document_page_counts": {
+                doc_id: count.model_dump(mode="json")
+                for doc_id, count in sorted(approved_batch.document_page_counts.items())
+            },
+            "manifest_sha256": approved_batch.manifest_sha256,
+            "parser_authority_sha256": approved_batch.parser_authority_sha256,
+            "raw_authority_sha256": approved_batch.raw_authority_sha256,
+            "schema_version": "sen-qa-ingestion-evidence/v1",
+        }
+        _write_private(
+            package / "ingestion-evidence.json",
+            (
+                json.dumps(
+                    evidence_payload,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("ascii"),
+        )
         for case, envelope in zip(
             approved_batch.cases, approved_batch.envelopes, strict=True
         ):
@@ -1146,6 +1259,7 @@ def _write_review_package(root: Path, *, release_id: str, batch: object) -> Path
         summary = {
             "case_count": len(approved_batch.cases),
             "document_count": len(approved_batch.documents),
+            "manifest_sha256": approved_batch.manifest_sha256,
             "parser_authority_sha256": approved_batch.parser_authority_sha256,
             "quarantine_count": approved_batch.quarantine_count,
             "raw_authority_sha256": approved_batch.raw_authority_sha256,
