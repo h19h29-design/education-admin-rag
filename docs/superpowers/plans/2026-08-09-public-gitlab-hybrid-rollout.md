@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - 공개 GitLab 경로는 `https://gitlab.aigov.go.kr/h19h19/education-admin-rag`다.
-- GitHub 미러는 `https://github.com/weplebong/education-admin-launcher`이며 공개로 전환한다.
+- GitHub 미러는 `https://github.com/h19h29-design/education-admin-rag`이며 공개로 운영한다. 기존 `weplebong/education-admin-launcher`는 관리자 권한이 없어 비공개 legacy remote로 보존한다.
 - GitLab은 공개 원본이고 GitHub는 자동 push mirror다.
 - 원본 PDF, OCR JSONL, canonical SQLite, ReviewStore DB, Qdrant snapshot, private evaluation, backup, key는 GitLab·GitHub·CI 로그·CI artifact에 넣지 않는다.
 - Auto DevOps를 끄고 명시적 `.gitlab-ci.yml`만 사용한다.

@@ -94,3 +94,21 @@ def test_bootstrap_report_is_metadata_only() -> None:
         assert key in text
     assert "/volume" not in text
     assert "PRIVATE" not in text
+
+
+def test_bootstrap_report_matches_verified_public_state() -> None:
+    text = REPORT.read_text(encoding="utf-8")
+
+    for fact in (
+        "project_created=1",
+        "project_visibility=public",
+        "auto_devops_enabled=0",
+        "runner_available=0",
+        "container_registry_enabled=0",
+        "github_mirror_target=h19h29-design/education-admin-rag",
+        "github_visibility=public",
+        "gitlab_main_pushed=0",
+        "milestone_created=1",
+        "work_items_created=4",
+    ):
+        assert fact in text

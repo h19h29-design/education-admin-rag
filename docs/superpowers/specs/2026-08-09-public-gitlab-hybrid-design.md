@@ -4,7 +4,7 @@
 **상태:** 사용자 승인 완료·구현 계획 수립
 **대상 저장소:** 교육행정 질문답변 말뭉치·RAG 기반  
 **공개 GitLab 경로:** `gitlab.aigov.go.kr/h19h19/education-admin-rag`  
-**GitHub 미러:** `github.com/weplebong/education-admin-launcher`
+**GitHub 미러:** `github.com/h19h29-design/education-admin-rag`
 
 ## 1. 결정 요약
 

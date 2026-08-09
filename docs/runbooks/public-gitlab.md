@@ -11,7 +11,8 @@
 - Runner tag: `public-safe`
 - clone: `GIT_DEPTH=0`
 - deployment: disabled
-- GitHub mirror: `weplebong/education-admin-launcher`, public
+- GitHub mirror: `h19h29-design/education-admin-rag`, public
+- legacy GitHub remote: `weplebong/education-admin-launcher`, private and retained read-only
 
 ## Public boundary
 
@@ -59,11 +60,13 @@ GitLab push mirror를 우선 사용한다. GitHub credential은 GitLab secret st
 git remote set-url --push origin \
   https://gitlab.aigov.go.kr/h19h19/education-admin-rag.git
 git remote set-url --add --push origin \
-  https://github.com/weplebong/education-admin-launcher.git
+  https://github.com/h19h29-design/education-admin-rag.git
 git remote get-url --all --push origin
 ```
 
 두 remote의 `main`은 항상 같은 SHA여야 한다.
+
+기존 `weplebong/education-admin-launcher` 저장소는 관리자 권한이 없어 공개 전환하지 않는다. 공개 미러는 관리 권한이 있는 `h19h29-design/education-admin-rag`를 사용하며, 기존 저장소는 `github-legacy` remote로 보존한다.
 
 ## Public-safe CI
 
