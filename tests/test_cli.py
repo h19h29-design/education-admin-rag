@@ -1094,6 +1094,61 @@ def test_parse_metadata_cli_emits_one_canonical_value_free_json_line(
     )
 
 
+def test_stage_review_corpus_cli_reports_only_counts_and_registry_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "raw-pages"
+    input_root.mkdir()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b"{}\n")
+    fingerprint = "f" * 64
+
+    class Registry:
+        fingerprint_sha256 = fingerprint
+
+    class Batch:
+        cases = (object(), object())
+        quarantine_count = 3
+        registry = Registry()
+
+    batch = Batch()
+    monkeypatch.setattr(
+        cli_module,
+        "prepare_review_corpus_from_artifacts",
+        lambda *_args, **_kwargs: batch,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "write_review_package",
+        lambda root, *, release_id, batch: root / "review",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "stage-review-corpus",
+            "--input-root",
+            str(input_root),
+            "--manifest",
+            str(manifest),
+            "--output-root",
+            str(tmp_path),
+            "--release-id",
+            "corpus-20250808123456-deadbeef",
+            "--ingestion-version",
+            "ingestion-v1",
+        ],
+        env={"SEN_QA_INGESTION_IMAGE_DIGEST": "sha256:" + "d" * 64},
+    )
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        f"cases=2 quarantines=3 registry_sha256={fingerprint} failed=0"
+    )
+
+
 def test_parse_metadata_cli_errors_are_fixed_and_source_value_free(
     tmp_path: Path,
 ) -> None:

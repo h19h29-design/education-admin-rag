@@ -180,7 +180,7 @@ def test_runbooks_preserve_predeployment_blockers_and_no_fake_keys() -> None:
         encoding="utf-8"
     )
 
-    assert "candidate_review_bridge_required" in index_runbook
+    assert "stage=review_pending" in index_runbook
     assert "index-attestation.json" in index_runbook
     assert "qdrant_alias_broker_required" in index_runbook
     assert "restore_evaluation_driver_required" in backup_runbook
@@ -214,3 +214,12 @@ def test_index_script_builds_dense_candidate_and_index_attestation() -> None:
     assert "build-dense-index" in script
     assert "index-attestation.json" in script
     assert "dense_index_driver_required" not in script
+
+
+def test_corpus_script_stages_review_registry_before_stopping() -> None:
+    script = Path("scripts/build-corpus.sh").read_text(encoding="utf-8")
+
+    assert "stage-review-corpus" in script
+    assert "--input-root /sen-qa/artifacts/raw-pages" in script
+    assert "stage=review_pending failed=0" in script
+    assert "candidate_review_bridge_required" not in script

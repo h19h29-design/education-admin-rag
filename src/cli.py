@@ -22,6 +22,11 @@ from src.corpus.chunking import (
     verify_embedding_cache,
 )
 from src.corpus.models import Case, CaseRelation, Chunk, Document, LawRef
+from src.corpus.staging import (
+    StagingError,
+    prepare_review_corpus_from_artifacts,
+    write_review_package,
+)
 from src.evaluation.goldset import GoldsetError
 from src.evaluation.release_report import (
     ReleaseReportError,
@@ -1294,6 +1299,41 @@ def parse_metadata(
         typer.echo(f"failed=1 error_code={error_code or 'parse_failed'}")
         raise SystemExit(1) from None
     typer.echo(rendered.decode("ascii"))
+
+
+@app.command("stage-review-corpus")
+def stage_review_corpus(
+    input_root: Path = typer.Option(  # noqa: B008
+        ..., "--input-root", exists=True, file_okay=False, readable=True
+    ),
+    manifest: Path = typer.Option(  # noqa: B008
+        ..., "--manifest", exists=True, dir_okay=False, readable=True
+    ),
+    output_root: Path = typer.Option(  # noqa: B008
+        ..., "--output-root", exists=True, file_okay=False, writable=True
+    ),
+    release_id: str = typer.Option(..., "--release-id"),
+    ingestion_version: str = typer.Option(..., "--ingestion-version"),
+) -> None:
+    """Create one value-free review registry and owner-only review checkpoint."""
+    batch = None
+    try:
+        batch = prepare_review_corpus_from_artifacts(
+            input_root,
+            manifest_path=manifest,
+            ingestion_version=ingestion_version,
+            expected_image_digest=os.environ.get("SEN_QA_INGESTION_IMAGE_DIGEST"),
+        )
+        write_review_package(output_root, release_id=release_id, batch=batch)
+    except (OSError, StagingError, TypeError, ValueError):
+        batch = None
+    if batch is None:
+        typer.echo("failed=1 error_code=review_staging_failed")
+        raise SystemExit(1) from None
+    typer.echo(
+        f"cases={len(batch.cases)} quarantines={batch.quarantine_count} "
+        f"registry_sha256={batch.registry.fingerprint_sha256} failed=0"
+    )
 
 
 _SCHEMA_MODELS: dict[str, type[BaseModel]] = {

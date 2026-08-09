@@ -8,6 +8,7 @@ import os
 import re
 import stat
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NoReturn, Self, cast
 
@@ -44,8 +45,11 @@ from src.ingestion.parse_2024_2025 import (
 from src.ingestion.parse_common import (
     ParserContractError,
     ParseResult,
+    ParserPage,
     VerifiedPageRolePolicy,
     canonical_result_bytes,
+    parser_page_from_native_record,
+    parser_page_from_ocr_record,
 )
 
 _PAGE_SET_HASH_PREFIX = b"sen-qa-page-set-v1\0"
@@ -276,6 +280,18 @@ class ParseMetadata(MetadataModel):
         ) or any(count > case_total for count in self.role_absence_counts.values()):
             raise ValueError("parse metadata role contract is invalid")
         return self
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class VerifiedParseRun:
+    """One manifest/input-bound parse result retained for review staging."""
+
+    document: SourceDocument
+    records: tuple[PageRecord, ...]
+    result: ParseResult
+    pages: tuple[ParserPage, ...]
+    manifest_bytes: bytes
+    input_bytes: bytes
 
 
 class _DuplicateJsonKey(ValueError):
@@ -840,15 +856,15 @@ def _parse_ocr_document(
     )
 
 
-def build_parse_metadata(
+def build_parse_run(
     input_path: Path,
     *,
     manifest_path: Path,
     edition_year: int,
     pages: str,
     expected_image_digest: str | None = None,
-) -> ParseMetadata:
-    """Validate one extractor JSONL and return only aggregate parser diagnostics."""
+) -> VerifiedParseRun:
+    """Validate one extractor JSONL and retain its exact parser staging inputs."""
     if type(edition_year) is not int:
         _raise("selection_invalid")
     loaded_manifest = _manifest(manifest_path, edition_year)
@@ -924,14 +940,60 @@ def build_parse_metadata(
         result = ParseResult()
     if parse_failed:
         _raise("parse_failed")
+    try:
+        role_policy = _page_role_policy(document)
+        if document.extraction_method == "native":
+            pages_for_review = tuple(
+                parser_page_from_native_record(
+                    record,
+                    page_role_policy=role_policy,
+                )
+                for record in cast(tuple[NativePageRecord, ...], records)
+            )
+        else:
+            pages_for_review = tuple(
+                parser_page_from_ocr_record(
+                    record,
+                    page_role_policy=role_policy,
+                )
+                for record in cast(tuple[OcrPageRecord, ...], records)
+            )
+    except (RecursionError, OverflowError, ParserContractError, TypeError, ValueError):
+        _raise("parse_failed")
+    verified = object.__new__(VerifiedParseRun)
+    object.__setattr__(verified, "document", document)
+    object.__setattr__(verified, "records", records)
+    object.__setattr__(verified, "result", result)
+    object.__setattr__(verified, "pages", pages_for_review)
+    object.__setattr__(verified, "manifest_bytes", manifest_bytes)
+    object.__setattr__(verified, "input_bytes", input_bytes)
+    return verified
+
+
+def build_parse_metadata(
+    input_path: Path,
+    *,
+    manifest_path: Path,
+    edition_year: int,
+    pages: str,
+    expected_image_digest: str | None = None,
+) -> ParseMetadata:
+    """Validate one extractor JSONL and return only aggregate parser diagnostics."""
+    run = build_parse_run(
+        input_path,
+        manifest_path=manifest_path,
+        edition_year=edition_year,
+        pages=pages,
+        expected_image_digest=expected_image_digest,
+    )
     metadata: ParseMetadata | None = None
     try:
         metadata = _metadata(
-            document=document,
-            manifest_bytes=manifest_bytes,
-            input_bytes=input_bytes,
-            records=records,
-            result=result,
+            document=run.document,
+            manifest_bytes=run.manifest_bytes,
+            input_bytes=run.input_bytes,
+            records=run.records,
+            result=run.result,
         )
     except (RecursionError, OverflowError, TypeError, ValueError):
         metadata = None

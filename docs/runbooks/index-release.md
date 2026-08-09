@@ -67,12 +67,13 @@ denial.
 ## Build status and human checkpoint
 
 `build-corpus.sh` runs source verification and all 1,877 approved extraction
-pages in network-disabled, read-only containers. It intentionally exits with
-code 3 and `candidate_review_bridge_required` after metadata extraction. The
-current parser APIs provide candidates in memory, but no reviewed production
-driver yet serializes privacy/quality decisions, role-source authority,
-CanonicalReviewRegistry, and ReviewStore in one externally pinned transaction.
-Treating metadata as canonical would bypass the review boundary.
+pages in network-disabled, read-only containers. It then validates the managed
+annual JSONL layout, derives privacy/quality assessments, binds every raw role
+span into a promotion envelope, and writes one owner-only
+`CanonicalReviewRegistry` plus `ReviewStore`. It exits successfully at
+`stage=review_pending`; it does not create canonical storage or an index.
+Unknown files, quarantined source provenance, hash drift, an existing review
+package, or malformed parser input fail closed without printing candidate text.
 
 Likewise, `build-indexes.sh` first requires the canonical DB and an independent
 `review-ready.attestation.json`. It builds the lexical candidate through the
@@ -83,8 +84,8 @@ what it just encoded, then binds those results to the physical canonical and
 lexical database hashes in `index-attestation.json`. It never changes the
 production alias.
 
-The remaining corpus review bridge is a pre-deployment blocker, not an operator
-override point.
+Human review and the separately persisted ready attestation remain mandatory
+pre-deployment checkpoints, not operator override points.
 
 ## Evaluation and verification
 

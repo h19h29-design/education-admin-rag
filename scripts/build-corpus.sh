@@ -48,6 +48,15 @@ for spec in 2023:168 2024:324 2025:314; do
     --output "/sen-qa/artifacts/raw-pages/ocr-$year"
 done
 
-printf 'release_id=%s stage=metadata_extracted failed=1 error_code=candidate_review_bridge_required\n' \
-  "$SEN_QA_RELEASE_ID" >&2
-exit 3
+docker run --rm --network none --read-only --cap-drop ALL \
+  --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+  -e SEN_QA_INGESTION_IMAGE_DIGEST="$SEN_QA_INGESTION_IMAGE_DIGEST" \
+  -v "$RELEASE_ROOT:/sen-qa/artifacts:rw" \
+  "$SEN_QA_INGESTION_IMAGE" stage-review-corpus \
+  --manifest /work/data/manifests/sen_qa_sources.json \
+  --input-root /sen-qa/artifacts/raw-pages \
+  --output-root /sen-qa/artifacts \
+  --release-id "$SEN_QA_RELEASE_ID" \
+  --ingestion-version "image-${SEN_QA_INGESTION_IMAGE_DIGEST#sha256:}"
+
+printf 'release_id=%s stage=review_pending failed=0\n' "$SEN_QA_RELEASE_ID"
