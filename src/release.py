@@ -148,6 +148,8 @@ class IndexReleaseEvidence(_ReleaseModel):
     release_id: str = Field(pattern=r"^corpus-\d{14}-[0-9a-f]{8}$")
     canonical_database_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     lexical_index_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    qdrant_snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    qdrant_snapshot_size: int = Field(gt=0, le=8 * 1024 * 1024 * 1024)
     dense_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     eligible_chunks: int = Field(gt=0, le=1_000_000)
     lexical_chunks: int = Field(gt=0, le=1_000_000)
@@ -481,6 +483,10 @@ def create_restore_attestation(
         or not hmac.compare_digest(
             evaluation.canonical_database_sha256,
             canonical.sha256,
+        )
+        or not hmac.compare_digest(
+            evaluation.retrieval_index_sha256,
+            qdrant.sha256,
         )
     ):
         _raise("restore_evidence_invalid")
@@ -926,6 +932,8 @@ def create_index_release_evidence(
     *,
     canonical_database: Path,
     lexical_index: Path,
+    qdrant_snapshot: Path,
+    expected_qdrant_snapshot_sha256: str,
     dense_result: DenseBuildResult,
     output: Path,
     expected_release_id: str,
@@ -934,15 +942,19 @@ def create_index_release_evidence(
     if (
         not all(
             isinstance(path, Path)
-            for path in (canonical_database, lexical_index, output)
+            for path in (canonical_database, lexical_index, qdrant_snapshot, output)
         )
         or type(expected_release_id) is not str
         or _RELEASE_RE.fullmatch(expected_release_id) is None
+        or type(expected_qdrant_snapshot_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", expected_qdrant_snapshot_sha256) is None
         or type(dense_result) is not DenseBuildResult
     ):
         _raise("index_evidence_invalid")
     canonical_sha256 = _stable_file_sha256(canonical_database)
     lexical_sha256 = _stable_file_sha256(lexical_index)
+    qdrant_sha256 = _stable_file_sha256(qdrant_snapshot)
+    qdrant_size: int | None = None
     failed = False
     canonical_release: object = None
     lexical_metadata = None
@@ -953,14 +965,22 @@ def create_index_release_evidence(
             ).fetchone()
             canonical_release = row[0] if type(row) is tuple and len(row) == 1 else None
         lexical_metadata = inspect_lexical_index(lexical_index)
+        qdrant_details = os.stat(qdrant_snapshot, follow_symlinks=False)
+        qdrant_size = qdrant_details.st_size
     except (StorageError, LexicalError, OSError, sqlite3.Error, TypeError, ValueError):
         failed = True
     if (
         failed
         or canonical_sha256 is None
         or lexical_sha256 is None
+        or qdrant_sha256 is None
+        or qdrant_size is None
+        or qdrant_size <= 0
+        or qdrant_size > 8 * 1024 * 1024 * 1024
         or _stable_file_sha256(canonical_database) != canonical_sha256
         or _stable_file_sha256(lexical_index) != lexical_sha256
+        or _stable_file_sha256(qdrant_snapshot) != qdrant_sha256
+        or not hmac.compare_digest(qdrant_sha256, expected_qdrant_snapshot_sha256)
         or canonical_release != expected_release_id
         or lexical_metadata is None
         or lexical_metadata.release_id != expected_release_id
@@ -983,6 +1003,8 @@ def create_index_release_evidence(
             release_id=expected_release_id,
             canonical_database_sha256=canonical_sha256,
             lexical_index_sha256=lexical_sha256,
+            qdrant_snapshot_sha256=qdrant_sha256,
+            qdrant_snapshot_size=qdrant_size,
             dense_sample_sha256=dense_result.sampled_vector_sha256,
             eligible_chunks=lexical_metadata.indexed_chunks,
             lexical_chunks=lexical_metadata.indexed_chunks,
@@ -1086,6 +1108,7 @@ def assemble_release_verification_evidence(
     canonical_manifest: Path,
     canonical_database: Path,
     lexical_index: Path,
+    qdrant_snapshot: Path,
     index_evidence_path: Path,
     evaluation_report: Path,
     output: Path,
@@ -1101,6 +1124,7 @@ def assemble_release_verification_evidence(
                 canonical_manifest,
                 canonical_database,
                 lexical_index,
+                qdrant_snapshot,
                 index_evidence_path,
                 evaluation_report,
                 output,
@@ -1115,6 +1139,8 @@ def assemble_release_verification_evidence(
     evaluation = _load_exact_evaluation(evaluation_report)
     database_sha256 = _stable_file_sha256(canonical_database)
     lexical_sha256 = _stable_file_sha256(lexical_index)
+    qdrant_sha256 = _stable_file_sha256(qdrant_snapshot)
+    qdrant_size: int | None = None
     if loaded_manifest is None or loaded_index is None or evaluation is None:
         _raise("release_evidence_invalid")
     manifest, manifest_bytes = loaded_manifest
@@ -1131,6 +1157,7 @@ def assemble_release_verification_evidence(
     registry_count = -1
     build_release: object = None
     try:
+        qdrant_size = os.stat(qdrant_snapshot, follow_symlinks=False).st_size
         with connect_canonical_storage(canonical_database) as connection:
             connection.execute("BEGIN")
             build_row = connection.execute(
@@ -1194,14 +1221,20 @@ def assemble_release_verification_evidence(
         failed
         or database_sha256 is None
         or lexical_sha256 is None
+        or qdrant_sha256 is None
+        or qdrant_size is None
         or manifest.release_id != expected_release_id
         or index_evidence.release_id != expected_release_id
         or evaluation.release_id != expected_release_id
         or evaluation.canonical_database_sha256 != database_sha256
+        or evaluation.retrieval_index_sha256 != index_evidence.qdrant_snapshot_sha256
+        or qdrant_sha256 != index_evidence.qdrant_snapshot_sha256
+        or qdrant_size != index_evidence.qdrant_snapshot_size
         or build_release != expected_release_id
         or manifest.database_sha256 != database_sha256
         or index_evidence.canonical_database_sha256 != database_sha256
         or index_evidence.lexical_index_sha256 != lexical_sha256
+        or _stable_file_sha256(qdrant_snapshot) != qdrant_sha256
         or chunk_count != index_evidence.eligible_chunks
         or not cases
         or len(runs) != 1

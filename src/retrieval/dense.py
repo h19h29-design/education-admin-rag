@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import importlib
 import json
 import math
+import os
 import re
 import sqlite3
+import stat
 import struct
 import uuid
 from collections.abc import Iterable
@@ -39,6 +42,7 @@ _MAX_POINTS_PER_CALL = 10_000
 _MAX_SOURCE_REFERENCES = 4_096
 _MAX_DENSE_RECORDS = 100_000
 _MAX_DENSE_SERIALIZED_BYTES = 512 * 1024 * 1024
+_MAX_DENSE_SNAPSHOT_BYTES = 8 * 1024 * 1024 * 1024
 _POINT_NAMESPACE = uuid.UUID("4d8b3e8e-1f41-51c2-88ea-54ddf572304d")
 _APPROVED_QDRANT_URLS = frozenset({"http://qdrant:6333", "http://127.0.0.1:6333"})
 
@@ -63,7 +67,19 @@ class _CountResult(Protocol):
     count: int
 
 
-class _DenseStore(Protocol):
+class _SnapshotDescription(Protocol):
+    name: str
+    checksum: str
+    size: int
+
+
+class _SnapshotStore(Protocol):
+    def create_snapshot(
+        self, collection_name: str, *, wait: bool = True, **kwargs: object
+    ) -> _SnapshotDescription: ...
+
+
+class _DenseStore(_SnapshotStore, Protocol):
     def close(self, **kwargs: object) -> None: ...
 
     def collection_exists(self, collection_name: str, **kwargs: object) -> bool: ...
@@ -526,6 +542,150 @@ class DenseBuildResult:
     embedding_version: str
     point_count: int
     sampled_vector_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class DenseSnapshotResult:
+    collection_name: str
+    sha256: str
+    size: int
+
+
+def _snapshot_http_connection_provider(
+    host: str, port: int, timeout: int
+) -> http.client.HTTPConnection:
+    return http.client.HTTPConnection(host, port, timeout=timeout)
+
+
+def export_dense_snapshot(
+    client: _SnapshotStore,
+    *,
+    qdrant_url: str,
+    collection_name: str,
+    output: Path,
+) -> DenseSnapshotResult:
+    """Create and download one immutable candidate snapshot without alias changes."""
+    if (
+        qdrant_url not in _APPROVED_QDRANT_URLS
+        or type(collection_name) is not str
+        or re.fullmatch(r"corpus-[0-9]{14}-[0-9a-f]{8}-bge-m3", collection_name) is None
+        or not isinstance(output, Path)
+        or output.name in {"", ".", ".."}
+    ):
+        _raise("dense_snapshot_invalid")
+    name: object = None
+    checksum: object = None
+    expected_size: object = None
+    try:
+        description = client.create_snapshot(collection_name, wait=True)
+        name = description.name
+        checksum = description.checksum
+        expected_size = description.size
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        pass
+    if (
+        type(name) is not str
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}", name) is None
+        or type(checksum) is not str
+        or _SHA256_RE.fullmatch(checksum) is None
+        or type(expected_size) is not int
+        or expected_size <= 0
+        or expected_size > _MAX_DENSE_SNAPSHOT_BYTES
+    ):
+        _raise("dense_snapshot_invalid")
+
+    host = "qdrant" if qdrant_url == "http://qdrant:6333" else "127.0.0.1"
+    parent_fd = -1
+    output_fd = -1
+    connection: http.client.HTTPConnection | None = None
+    failed = False
+    written = 0
+    digest = hashlib.sha256()
+    try:
+        parent_fd = os.open(
+            output.parent,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        parent = os.fstat(parent_fd)
+        if not stat.S_ISDIR(parent.st_mode):
+            failed = True
+        if not failed:
+            output_fd = os.open(
+                output.name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            connection = _snapshot_http_connection_provider(host, 6333, 60)
+            connection.request(
+                "GET",
+                f"/collections/{collection_name}/snapshots/{name}",
+            )
+            response = connection.getresponse()
+            if response.status != 200:
+                failed = True
+            while not failed:
+                chunk = response.read(1_048_576)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > expected_size or written > _MAX_DENSE_SNAPSHOT_BYTES:
+                    failed = True
+                    break
+                digest.update(chunk)
+                remaining = memoryview(chunk)
+                while remaining:
+                    count = os.write(output_fd, remaining)
+                    if count <= 0:
+                        failed = True
+                        break
+                    remaining = remaining[count:]
+            os.fsync(output_fd)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        failed = True
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except (OSError, RuntimeError):
+                failed = True
+        if output_fd >= 0:
+            try:
+                os.close(output_fd)
+            except OSError:
+                failed = True
+        if (
+            failed
+            or written != expected_size
+            or not hmac.compare_digest(digest.hexdigest(), checksum)
+        ) and parent_fd >= 0:
+            try:
+                os.unlink(output.name, dir_fd=parent_fd)
+            except OSError:
+                pass
+        if parent_fd >= 0:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                failed = True
+    if (
+        failed
+        or written != expected_size
+        or not hmac.compare_digest(digest.hexdigest(), checksum)
+    ):
+        _raise("dense_snapshot_invalid")
+    return DenseSnapshotResult(
+        collection_name=collection_name,
+        sha256=checksum,
+        size=written,
+    )
 
 
 @dataclass(frozen=True, slots=True)

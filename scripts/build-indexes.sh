@@ -30,6 +30,7 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps indexer \
   build-dense-index \
   --canonical-db /sen-qa/release/canonical/canonical.sqlite3 \
   --lexical-index /sen-qa/release/indexes/lexical.sqlite3 \
+  --snapshot-output /sen-qa/release/indexes/qdrant.snapshot \
   --output /sen-qa/release/indexes/index-attestation.json \
   --release-id "$SEN_QA_RELEASE_ID" \
   --lock /work/config/models.lock.json \

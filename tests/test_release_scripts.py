@@ -160,6 +160,9 @@ def test_restore_attestation_binds_backup_restored_bytes_and_green_evaluation(
         canonical_database_sha256=hashlib.sha256(
             (restored / "canonical.sqlite3").read_bytes()
         ).hexdigest(),
+        retrieval_index_sha256=hashlib.sha256(
+            (restored / "qdrant.snapshot").read_bytes()
+        ).hexdigest(),
         gold_items=gold,
         ingestion_observations=_ingestion(gold),
         retrieval_observations={
@@ -355,11 +358,15 @@ def test_release_evidence_is_derived_from_canonical_index_and_evaluation_bytes(
     lexical = build_lexical_index(
         canonical.bundle_path / "canonical.sqlite3", lexical_path
     )
+    qdrant_snapshot = tmp_path / "qdrant.snapshot"
+    qdrant_snapshot.write_bytes(b"qdrant-snapshot")
+    qdrant_sha256 = hashlib.sha256(qdrant_snapshot.read_bytes()).hexdigest()
     gold = _gold()
     retrieval = _retrieval(gold)
     evaluation = build_release_evaluation_report(
         release_id=RELEASE_ID,
         canonical_database_sha256=canonical.database_sha256,
+        retrieval_index_sha256=qdrant_sha256,
         gold_items=gold,
         ingestion_observations=_ingestion(gold),
         retrieval_observations={
@@ -374,6 +381,8 @@ def test_release_evidence_is_derived_from_canonical_index_and_evaluation_bytes(
         release_id=RELEASE_ID,
         canonical_database_sha256=canonical.database_sha256,
         lexical_index_sha256=hashlib.sha256(lexical_path.read_bytes()).hexdigest(),
+        qdrant_snapshot_sha256=qdrant_sha256,
+        qdrant_snapshot_size=qdrant_snapshot.stat().st_size,
         dense_sample_sha256="4" * 64,
         eligible_chunks=lexical.indexed_chunks,
         lexical_chunks=lexical.indexed_chunks,
@@ -396,6 +405,7 @@ def test_release_evidence_is_derived_from_canonical_index_and_evaluation_bytes(
         canonical_manifest=canonical.bundle_path / "manifest.json",
         canonical_database=canonical.bundle_path / "canonical.sqlite3",
         lexical_index=lexical_path,
+        qdrant_snapshot=qdrant_snapshot,
         index_evidence_path=index_path,
         evaluation_report=evaluation_path,
         output=output,
@@ -427,6 +437,7 @@ def test_release_evidence_is_derived_from_canonical_index_and_evaluation_bytes(
             canonical_manifest=canonical.bundle_path / "manifest.json",
             canonical_database=canonical.bundle_path / "canonical.sqlite3",
             lexical_index=lexical_path,
+            qdrant_snapshot=qdrant_snapshot,
             index_evidence_path=index_path,
             evaluation_report=evaluation_path,
             output=unresolved_output,
@@ -447,6 +458,9 @@ def test_index_evidence_is_written_from_physical_indexes_and_dense_result(
     canonical = canonical_bundle.bundle_path / "canonical.sqlite3"
     lexical_path = tmp_path / "lexical.sqlite3"
     output = tmp_path / "index-attestation.json"
+    qdrant_snapshot = tmp_path / "qdrant.snapshot"
+    qdrant_snapshot.write_bytes(b"qdrant-snapshot")
+    qdrant_sha256 = hashlib.sha256(qdrant_snapshot.read_bytes()).hexdigest()
     lexical = build_lexical_index(canonical, lexical_path)
     dense = DenseBuildResult(
         collection_name=f"{lexical.release_id}-bge-m3",
@@ -459,6 +473,8 @@ def test_index_evidence_is_written_from_physical_indexes_and_dense_result(
     evidence = create_index_release_evidence(
         canonical_database=canonical,
         lexical_index=lexical_path,
+        qdrant_snapshot=qdrant_snapshot,
+        expected_qdrant_snapshot_sha256=qdrant_sha256,
         dense_result=dense,
         output=output,
         expected_release_id=lexical.release_id,
@@ -467,6 +483,7 @@ def test_index_evidence_is_written_from_physical_indexes_and_dense_result(
     assert evidence.lexical_chunks == lexical.indexed_chunks
     assert evidence.dense_points == lexical.indexed_chunks
     assert evidence.dense_sample_sha256 == "6" * 64
+    assert evidence.qdrant_snapshot_sha256 == qdrant_sha256
     assert json.loads(output.read_bytes())["collection_name"] == dense.collection_name
 
     rejected = tmp_path / "rejected-index-attestation.json"
@@ -474,6 +491,8 @@ def test_index_evidence_is_written_from_physical_indexes_and_dense_result(
         create_index_release_evidence(
             canonical_database=canonical,
             lexical_index=lexical_path,
+            qdrant_snapshot=qdrant_snapshot,
+            expected_qdrant_snapshot_sha256=qdrant_sha256,
             dense_result=DenseBuildResult(
                 collection_name=dense.collection_name,
                 release_id=dense.release_id,

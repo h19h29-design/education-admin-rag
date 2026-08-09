@@ -226,6 +226,7 @@ def test_index_script_builds_dense_candidate_and_index_attestation() -> None:
     script = Path("scripts/build-indexes.sh").read_text(encoding="utf-8")
 
     assert "build-dense-index" in script
+    assert "--snapshot-output /sen-qa/release/indexes/qdrant.snapshot" in script
     assert "index-attestation.json" in script
     assert "dense_index_driver_required" not in script
 

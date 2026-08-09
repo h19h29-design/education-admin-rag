@@ -41,6 +41,7 @@ _MAX_OBSERVATION_BYTES = 16 * 1024 * 1024
 _MAX_OBSERVATION_LINE_BYTES = 64 * 1024
 _MAX_CANONICAL_CASES = 1_000_000
 _MAX_CANONICAL_DATABASE_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_RETRIEVAL_INDEX_BYTES = 8 * 1024 * 1024 * 1024
 _ObservationT = TypeVar("_ObservationT", IngestionObservation, RetrievalObservation)
 
 
@@ -115,6 +116,7 @@ class ReleaseEvaluationReport(_ReportModel):
     )
     release_id: str = Field(pattern=r"^corpus-[0-9]{14}-[0-9a-f]{8}$")
     canonical_database_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    retrieval_index_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     gold_items: Literal[200]
     blind_items: Literal[60]
     ingestion_gate: bool
@@ -416,6 +418,7 @@ def build_release_evaluation_report(
     *,
     release_id: str,
     canonical_database_sha256: str,
+    retrieval_index_sha256: str,
     gold_items: object,
     ingestion_observations: object,
     retrieval_observations: object,
@@ -426,6 +429,8 @@ def build_release_evaluation_report(
         or _RELEASE_RE.fullmatch(release_id) is None
         or type(canonical_database_sha256) is not str
         or re.fullmatch(r"[0-9a-f]{64}", canonical_database_sha256) is None
+        or type(retrieval_index_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", retrieval_index_sha256) is None
         or type(gold_items) is not tuple
         or len(gold_items) != 200
         or type(ingestion_observations) is not tuple
@@ -499,6 +504,7 @@ def build_release_evaluation_report(
         return ReleaseEvaluationReport(
             release_id=release_id,
             canonical_database_sha256=canonical_database_sha256,
+            retrieval_index_sha256=retrieval_index_sha256,
             gold_items=200,
             blind_items=60,
             ingestion_gate=ingestion_release_ready(ingestion_metrics),
@@ -692,6 +698,7 @@ def create_release_evaluation_report(
     *,
     release_id: str,
     canonical_database: Path,
+    retrieval_index: Path,
     dev_gold: Path,
     blind_gold: Path,
     blind_labels: Path,
@@ -704,10 +711,24 @@ def create_release_evaluation_report(
         canonical_database,
         max_bytes=_MAX_CANONICAL_DATABASE_BYTES,
     )
+    retrieval_index_sha256 = _stable_file_sha256(
+        retrieval_index,
+        max_bytes=_MAX_RETRIEVAL_INDEX_BYTES,
+    )
     canonical_evidence = load_canonical_evidence(canonical_database)
-    if database_sha256 is None or database_sha256 != _stable_file_sha256(
-        canonical_database,
-        max_bytes=_MAX_CANONICAL_DATABASE_BYTES,
+    if (
+        database_sha256 is None
+        or retrieval_index_sha256 is None
+        or database_sha256
+        != _stable_file_sha256(
+            canonical_database,
+            max_bytes=_MAX_CANONICAL_DATABASE_BYTES,
+        )
+        or retrieval_index_sha256
+        != _stable_file_sha256(
+            retrieval_index,
+            max_bytes=_MAX_RETRIEVAL_INDEX_BYTES,
+        )
     ):
         _raise("evaluation_canonical_invalid")
     gold = load_release_goldsets(
@@ -719,6 +740,7 @@ def create_release_evaluation_report(
     report = build_release_evaluation_report(
         release_id=release_id,
         canonical_database_sha256=database_sha256,
+        retrieval_index_sha256=retrieval_index_sha256,
         gold_items=gold,
         ingestion_observations=load_ingestion_observations(ingestion_path),
         retrieval_observations=load_retrieval_observations(retrieval_paths),

@@ -26,6 +26,7 @@ from src.retrieval.dense import (
     DenseSearchFilters,
     build_dense_candidate,
     create_qdrant_client,
+    export_dense_snapshot,
 )
 from tests.retrieval.test_lexical import (
     CASE_PUBLIC,
@@ -934,6 +935,145 @@ def test_qdrant_client_rejects_nonlocal_endpoints_before_network_io() -> None:
 
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
+
+
+def test_dense_snapshot_is_created_and_downloaded_from_exact_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"synthetic-qdrant-snapshot"
+    checksum = hashlib.sha256(payload).hexdigest()
+    calls: list[tuple[object, ...]] = []
+
+    class Client:
+        def create_snapshot(self, collection_name: str, *, wait: bool) -> object:
+            calls.append(("create", collection_name, wait))
+            return SimpleNamespace(
+                name="candidate.snapshot",
+                checksum=checksum,
+                size=len(payload),
+            )
+
+    class Response:
+        status = 200
+
+        def read(self, amount: int) -> bytes:
+            chunk, self.remaining = self.remaining[:amount], self.remaining[amount:]
+            return chunk
+
+        remaining = payload
+
+    class Connection:
+        def request(self, method: str, path: str) -> None:
+            calls.append(("request", method, path))
+
+        def getresponse(self) -> Response:
+            return Response()
+
+        def close(self) -> None:
+            calls.append(("close",))
+
+    monkeypatch.setattr(
+        dense_module,
+        "_snapshot_http_connection_provider",
+        lambda host, port, timeout: (
+            calls.append(("connect", host, port, timeout)) or Connection()
+        ),
+    )
+    output = tmp_path / "qdrant.snapshot"
+    result = export_dense_snapshot(
+        Client(),
+        qdrant_url="http://qdrant:6333",
+        collection_name=f"{RELEASE_ID}-bge-m3",
+        output=output,
+    )
+
+    assert output.read_bytes() == payload
+    assert result.sha256 == checksum
+    assert result.size == len(payload)
+    assert result.collection_name == f"{RELEASE_ID}-bge-m3"
+    assert calls[:3] == [
+        ("create", f"{RELEASE_ID}-bge-m3", True),
+        ("connect", "qdrant", 6333, 60),
+        (
+            "request",
+            "GET",
+            f"/collections/{RELEASE_ID}-bge-m3/snapshots/candidate.snapshot",
+        ),
+    ]
+    assert calls[-1] == ("close",)
+
+
+def test_dense_snapshot_hash_mismatch_removes_partial_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Client:
+        def create_snapshot(self, collection_name: str, *, wait: bool) -> object:
+            return SimpleNamespace(
+                name="candidate.snapshot",
+                checksum="f" * 64,
+                size=3,
+            )
+
+    class Response:
+        status = 200
+        returned = False
+
+        def read(self, amount: int) -> bytes:
+            if self.returned:
+                return b""
+            self.returned = True
+            return b"bad"
+
+    class Connection:
+        def request(self, method: str, path: str) -> None:
+            pass
+
+        def getresponse(self) -> Response:
+            return Response()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        dense_module,
+        "_snapshot_http_connection_provider",
+        lambda host, port, timeout: Connection(),
+    )
+    output = tmp_path / "qdrant.snapshot"
+
+    with pytest.raises(DenseError, match="dense_snapshot_invalid") as captured:
+        export_dense_snapshot(
+            Client(),
+            qdrant_url="http://qdrant:6333",
+            collection_name=f"{RELEASE_ID}-bge-m3",
+            output=output,
+        )
+
+    assert not output.exists()
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+def test_dense_snapshot_rejects_unapproved_endpoint_before_client_io(
+    tmp_path: Path,
+) -> None:
+    called = False
+
+    class Client:
+        def create_snapshot(self, collection_name: str, *, wait: bool) -> object:
+            nonlocal called
+            called = True
+            raise AssertionError("network must not be reached")
+
+    with pytest.raises(DenseError, match="dense_snapshot_invalid"):
+        export_dense_snapshot(
+            Client(),
+            qdrant_url="http://unapproved.invalid:6333",
+            collection_name=f"{RELEASE_ID}-bge-m3",
+            output=tmp_path / "qdrant.snapshot",
+        )
+
+    assert called is False
 
 
 def test_qdrant_compose_is_digest_pinned_local_only_and_memory_bounded() -> None:

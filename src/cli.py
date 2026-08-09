@@ -94,6 +94,7 @@ from src.retrieval.dense import (
     DenseError,
     build_dense_candidate,
     create_qdrant_client,
+    export_dense_snapshot,
 )
 from src.retrieval.lexical import LexicalError, LexicalIndex, build_lexical_index
 from src.retrieval.query import QueryError
@@ -399,6 +400,9 @@ def assemble_release_evidence_command(
     lexical_index: Path = typer.Option(  # noqa: B008
         ..., "--lexical-index", exists=True, dir_okay=False, readable=True
     ),
+    qdrant_snapshot: Path = typer.Option(  # noqa: B008
+        ..., "--qdrant-snapshot", exists=True, dir_okay=False, readable=True
+    ),
     index_evidence: Path = typer.Option(  # noqa: B008
         ..., "--index-evidence", exists=True, dir_okay=False, readable=True
     ),
@@ -414,6 +418,7 @@ def assemble_release_evidence_command(
             canonical_manifest=canonical_manifest,
             canonical_database=canonical_database,
             lexical_index=lexical_index,
+            qdrant_snapshot=qdrant_snapshot,
             index_evidence_path=index_evidence,
             evaluation_report=evaluation_report,
             output=output,
@@ -432,6 +437,9 @@ def evaluate_release_evidence_command(
     release_id: str = typer.Option(..., "--release-id"),
     canonical_database: Path = typer.Option(  # noqa: B008
         ..., "--canonical-db", exists=True, dir_okay=False, readable=True
+    ),
+    retrieval_index: Path = typer.Option(  # noqa: B008
+        ..., "--retrieval-index", exists=True, dir_okay=False, readable=True
     ),
     dev_gold: Path = typer.Option(  # noqa: B008
         ..., "--dev-gold", exists=True, dir_okay=False, readable=True
@@ -465,6 +473,7 @@ def evaluate_release_evidence_command(
         report = create_release_evaluation_report(
             release_id=release_id,
             canonical_database=canonical_database,
+            retrieval_index=retrieval_index,
             dev_gold=dev_gold,
             blind_gold=blind_gold,
             blind_labels=blind_labels,
@@ -646,6 +655,9 @@ def build_dense_index_command(
         ..., "--lexical-index", exists=True, dir_okay=False, readable=True
     ),
     output: Path = typer.Option(..., "--output", dir_okay=False),  # noqa: B008
+    snapshot_output: Path = typer.Option(  # noqa: B008
+        ..., "--snapshot-output", dir_okay=False
+    ),
     release_id: str = typer.Option(..., "--release-id"),
     lock_path: Path = typer.Option(  # noqa: B008
         Path("config/models.lock.json"), "--lock", exists=True, dir_okay=False
@@ -672,11 +684,19 @@ def build_dense_index_command(
             encoder=encoder,
             release_id=release_id,
         )
+        snapshot_result = export_dense_snapshot(
+            client,
+            qdrant_url=qdrant_url,
+            collection_name=dense_result.collection_name,
+            output=snapshot_output,
+        )
         client.close()
         client = None
         evidence = create_index_release_evidence(
             canonical_database=canonical_database,
             lexical_index=lexical_index,
+            qdrant_snapshot=snapshot_output,
+            expected_qdrant_snapshot_sha256=snapshot_result.sha256,
             dense_result=dense_result,
             output=output,
             expected_release_id=release_id,

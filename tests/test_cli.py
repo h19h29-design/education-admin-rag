@@ -24,7 +24,7 @@ from src.ingestion.review import (
     VerifiedCanonicalReviewRegistry,
 )
 from src.release import IndexReleaseEvidence, ReleaseVerificationEvidence
-from src.retrieval.dense import DenseBuildResult
+from src.retrieval.dense import DenseBuildResult, DenseSnapshotResult
 from src.retrieval.lexical import build_lexical_index
 from tests.ingestion.test_parse_metadata import (
     _native_quarantine_records,
@@ -79,6 +79,7 @@ def test_evaluate_release_cli_passes_exact_evidence_paths_and_reports_gates(
         tmp_path / name
         for name in (
             "canonical.sqlite3",
+            "qdrant.snapshot",
             "dev.jsonl",
             "blind.jsonl",
             "labels.jsonl",
@@ -110,6 +111,7 @@ def test_evaluate_release_cli_passes_exact_evidence_paths_and_reports_gates(
     )
     option_names = (
         "canonical-db",
+        "retrieval-index",
         "dev-gold",
         "blind-gold",
         "blind-labels",
@@ -138,9 +140,10 @@ def test_evaluate_release_cli_passes_exact_evidence_paths_and_reports_gates(
     assert captured["retrieval_paths"] == {
         system: path
         for system, path in zip(
-            ("substring", "lexical", "dense", "hybrid"), inputs[5:], strict=True
+            ("substring", "lexical", "dense", "hybrid"), inputs[6:], strict=True
         )
     }
+    assert captured["retrieval_index"] == inputs[1]
 
 
 def test_create_restore_attestation_cli_binds_exact_restore_evidence(
@@ -212,6 +215,7 @@ def test_assemble_release_evidence_cli_uses_measured_artifacts(
             "manifest.json",
             "canonical.sqlite3",
             "lexical.sqlite3",
+            "qdrant.snapshot",
             "index-attestation.json",
             "evaluation-report.json",
         )
@@ -244,10 +248,12 @@ def test_assemble_release_evidence_cli_uses_measured_artifacts(
             str(inputs[1]),
             "--lexical-index",
             str(inputs[2]),
-            "--index-evidence",
+            "--qdrant-snapshot",
             str(inputs[3]),
-            "--evaluation-report",
+            "--index-evidence",
             str(inputs[4]),
+            "--evaluation-report",
+            str(inputs[5]),
             "--output",
             str(output),
         ],
@@ -256,6 +262,7 @@ def test_assemble_release_evidence_cli_uses_measured_artifacts(
     assert result.exit_code == 0
     assert result.stdout.strip() == f"bundle_sha256={'a' * 64} failed=0"
     assert captured["canonical_manifest"] == inputs[0]
+    assert captured["qdrant_snapshot"] == inputs[3]
     assert captured["output"] == output
 
 
@@ -267,6 +274,7 @@ def test_build_dense_index_cli_builds_candidate_and_writes_index_evidence(
     lock = tmp_path / "models.lock.json"
     model_root = tmp_path / "model"
     output = tmp_path / "index-attestation.json"
+    snapshot_output = tmp_path / "qdrant.snapshot"
     for path in (canonical, lexical, lock):
         path.write_bytes(b"input")
     model_root.mkdir()
@@ -281,6 +289,9 @@ def test_build_dense_index_cli_builds_candidate_and_writes_index_evidence(
             return object()
 
     class FakeClient:
+        def __init__(self) -> None:
+            captured["client"] = self
+
         def close(self) -> None:
             captured["closed"] = True
 
@@ -295,6 +306,16 @@ def test_build_dense_index_cli_builds_candidate_and_writes_index_evidence(
     monkeypatch.setattr(cli_module, "create_qdrant_client", lambda _url: FakeClient())
     monkeypatch.setattr(cli_module, "build_dense_candidate", lambda *a, **k: dense)
 
+    def fake_snapshot(*args: object, **kwargs: object) -> DenseSnapshotResult:
+        captured["snapshot_call"] = (args, kwargs)
+        return DenseSnapshotResult(
+            collection_name=dense.collection_name,
+            sha256="e" * 64,
+            size=123,
+        )
+
+    monkeypatch.setattr(cli_module, "export_dense_snapshot", fake_snapshot)
+
     def fake_evidence(**kwargs: object) -> IndexReleaseEvidence:
         captured.update(kwargs)
         return IndexReleaseEvidence(
@@ -302,6 +323,8 @@ def test_build_dense_index_cli_builds_candidate_and_writes_index_evidence(
             release_id=dense.release_id,
             canonical_database_sha256="c" * 64,
             lexical_index_sha256="d" * 64,
+            qdrant_snapshot_sha256="e" * 64,
+            qdrant_snapshot_size=123,
             dense_sample_sha256=dense.sampled_vector_sha256,
             eligible_chunks=3,
             lexical_chunks=3,
@@ -320,6 +343,8 @@ def test_build_dense_index_cli_builds_candidate_and_writes_index_evidence(
             str(lexical),
             "--output",
             str(output),
+            "--snapshot-output",
+            str(snapshot_output),
             "--release-id",
             dense.release_id,
             "--lock",
@@ -333,6 +358,16 @@ def test_build_dense_index_cli_builds_candidate_and_writes_index_evidence(
     assert result.stdout.strip() == "dense_points=3 failed=0"
     assert captured["dense_result"] == dense
     assert captured["output"] == output
+    assert captured["qdrant_snapshot"] == snapshot_output
+    assert captured["expected_qdrant_snapshot_sha256"] == "e" * 64
+    assert captured["snapshot_call"] == (
+        (captured["client"],),
+        {
+            "qdrant_url": "http://qdrant:6333",
+            "collection_name": dense.collection_name,
+            "output": snapshot_output,
+        },
+    )
     assert captured["closed"] is True
 
 

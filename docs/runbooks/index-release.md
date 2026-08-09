@@ -83,9 +83,10 @@ Likewise, `build-indexes.sh` first requires the canonical DB and an independent
 real atomic builder, starts the digest-pinned isolated Qdrant service, verifies
 the complete offline BGE-M3 cache, and builds a release-named dense candidate.
 The job checks the exact point count and a deterministic vector sample against
-what it just encoded, then binds those results to the physical canonical and
-lexical database hashes in `index-attestation.json`. It never changes the
-production alias.
+what it just encoded, creates and downloads a snapshot of that exact candidate
+collection, then binds the snapshot SHA-256 and size together with the physical
+canonical and lexical database hashes in `index-attestation.json`. It never
+changes the production alias.
 
 Human review and the separately persisted ready attestation remain mandatory
 pre-deployment checkpoints, not operator override points.
@@ -144,8 +145,10 @@ at `evaluation_observations_missing`. The evaluator rebinds every observation
 to the reviewed gold labels and canonical source-span evidence, writes only
 aggregate metrics, and fails when either release gate is red. Synthetic labels,
 partial question sets, symlinks, or group-readable private observations cannot
-satisfy this gate. `verify-release.sh` similarly requires canonical, index, and
-evaluation evidence and never promotes an alias.
+satisfy this gate. The aggregate report binds both the canonical SQLite SHA-256
+and `indexes/qdrant.snapshot` SHA-256; a report measured against a different
+snapshot cannot satisfy release verification. `verify-release.sh` similarly
+requires canonical, index, and evaluation evidence and never promotes an alias.
 
 Only after the evaluator writes a green aggregate report and the index job
 writes `index-attestation.json` may `verify-release.sh` proceed. It derives

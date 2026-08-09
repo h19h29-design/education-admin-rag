@@ -6,7 +6,7 @@ release_init
 release_require_pinned_image SEN_QA_BACKUP_IMAGE
 
 RELEASE_ROOT="$SEN_QA_ARTIFACT_ROOT/releases/$SEN_QA_RELEASE_ID"
-for relative in canonical/manifest.json canonical/canonical.sqlite3 indexes/lexical.sqlite3 indexes/index-attestation.json reports/evaluation-report.json; do
+for relative in canonical/manifest.json canonical/canonical.sqlite3 indexes/lexical.sqlite3 indexes/qdrant.snapshot indexes/index-attestation.json reports/evaluation-report.json; do
   release_require_regular "$RELEASE_ROOT/$relative" release_evidence_missing
 done
 EVIDENCE="$RELEASE_ROOT/reports/release-evidence.json"
@@ -27,6 +27,7 @@ install -d -m 0700 "$ATTESTATION_DIR"
   --canonical-manifest "$RELEASE_ROOT/canonical/manifest.json" \
   --canonical-db "$RELEASE_ROOT/canonical/canonical.sqlite3" \
   --lexical-index "$RELEASE_ROOT/indexes/lexical.sqlite3" \
+  --qdrant-snapshot "$RELEASE_ROOT/indexes/qdrant.snapshot" \
   --index-evidence "$RELEASE_ROOT/indexes/index-attestation.json" \
   --evaluation-report "$RELEASE_ROOT/reports/evaluation-report.json" \
   --output "$EVIDENCE")

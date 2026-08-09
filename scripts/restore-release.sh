@@ -90,6 +90,7 @@ ATTESTATION="$ATTESTATION_ROOT/restore.json"
 (cd -- "$SCRIPT_DIR/.." && uv run python -m src.cli evaluate-release-evidence \
   --release-id "$SEN_QA_RELEASE_ID" \
   --canonical-db "$ARTIFACT_RESTORE/canonical.sqlite3" \
+  --retrieval-index "$ARTIFACT_RESTORE/qdrant.snapshot" \
   --dev-gold "$SEN_QA_RESTORE_DEV_GOLD_FILE" \
   --blind-gold "$SEN_QA_RESTORE_BLIND_GOLD_FILE" \
   --blind-labels "$PRIVATE_RESTORE/retrieval-blind-labels.jsonl" \
