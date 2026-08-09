@@ -113,6 +113,13 @@ def test_bootstrap_report_matches_verified_public_state() -> None:
         "force_push_allowed=0",
         "github_push_mirror_enabled=1",
         "pipeline_status=pending_runner",
+        "project_runner_count=0",
+        "group_runner_count=0",
+        "instance_runner_count=0",
+        "required_runner_tag=public-safe",
+        "github_main_matches_gitlab=1",
+        "mirror_credentials_committed=0",
+        "gitlab_project_id=428",
         "milestone_created=1",
         "work_items_created=4",
     ):

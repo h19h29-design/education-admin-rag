@@ -753,6 +753,8 @@ Expected: GitLab and GitHub mirror converge to the commit.
 
 ### Task 7: Final pre-deployment verification
 
+> 2026-08-09 execution note: the GitLab instance exposed no project, group, or instance Runner. To move public test load off the NAS without weakening the source-of-truth boundary, the implementation adds a read-only GitHub-hosted `public-safe` workflow on the automatic mirror. Docker/SBOM and NAS pull-only verification remain blocked until a separately reviewed Runner exists.
+
 **Files:**
 - Verify all modified files and external settings
 - Modify Notion changelog only if every completed claim has fresh evidence

@@ -50,9 +50,7 @@ _MAX_LOCATION_FIELD_LENGTH = 32
 
 _OCR_INLINE_GAP = r"[ \t]{0,8}"
 _OCR_VALUE_GAP = r"[ \t]{0,12}(?:\r?\n[ \t]{0,12})?"
-_OCR_REQUIRED_SEPARATOR = (
-    r"(?:[ \t,;/]{1,16}|[ \t,;/]{0,8}\r?\n[ \t]{0,8})"
-)
+_OCR_REQUIRED_SEPARATOR = r"(?:[ \t,;/]{1,16}|[ \t,;/]{0,8}\r?\n[ \t]{0,8})"
 _OCR_FIELD_SEPARATOR = r"[ \t,;/]{0,16}(?:\r?\n[ \t]{0,8})?"
 _OCR_DASH = r"[-\u2010-\u2015\u2212\uFE63\uFF0D]"
 _OCR_MARKED_PHONE_SEPARATOR = (
@@ -71,9 +69,7 @@ _OCR_RRN_SEPARATOR = (
     rf"(?:[ \t]{{0,4}}{_OCR_DASH}[ \t]{{0,4}}(?:\r?\n[ \t]{{0,4}})?|"
     r"[ \t]{1,4})"
 )
-_OCR_LABELED_RRN_SEPARATOR = (
-    rf"(?:{_OCR_RRN_SEPARATOR}|[ \t]{{0,4}}\r?\n[ \t]{{0,4}})"
-)
+_OCR_LABELED_RRN_SEPARATOR = rf"(?:{_OCR_RRN_SEPARATOR}|[ \t]{{0,4}}\r?\n[ \t]{{0,4}})"
 _ACCOUNT_LABEL = (
     rf"(?:계좌(?:{_OCR_INLINE_GAP}번호)?|"
     rf"입금(?:{_OCR_INLINE_GAP}계좌(?:{_OCR_INLINE_GAP}번호)?)?|"
@@ -189,9 +185,7 @@ _PATTERNS: dict[FindingKind, tuple[re.Pattern[str], ...]] = {
         re.compile(r"(?<![A-Za-z0-9-])xox[baprs]-[A-Za-z0-9-]{16,255}"),
         re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"),
         re.compile(r"(?<![A-Za-z0-9_-])AIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
-        re.compile(
-            r"(?<![A-Za-z0-9_])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,255}"
-        ),
+        re.compile(r"(?<![A-Za-z0-9_])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,255}"),
         re.compile(r"(?<![A-Za-z0-9_])(?:whsec|hf)_[A-Za-z0-9]{16,255}"),
         re.compile(
             r"(?<![A-Za-z0-9_.])SG\.[A-Za-z0-9_-]{16,128}\."

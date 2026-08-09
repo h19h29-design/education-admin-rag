@@ -80,6 +80,16 @@ full-history secret 검사를 위해 `GIT_DEPTH`는 `0`이다. 공개 로그에 
 
 Runner가 첫 pipeline을 성공하기 전에는 NAS 연산이 이전됐다고 기록하지 않는다.
 
+### GitHub-hosted public-safe fallback
+
+GitLab Runner가 준비될 때까지 공개 GitHub 미러의 `.github/workflows/public-safe.yml`이 동일한 `ci-public-gates.sh` 계약을 실행한다. GitLab은 계속 원본 저장소이고 GitHub Actions는 공개 코드·합성 fixture의 테스트 계산만 대신한다.
+
+- 권한은 `contents: read`만 허용한다.
+- checkout은 full history이며 공식 action도 immutable commit SHA로 고정한다.
+- secret, artifact, cache, deploy, Docker push와 NAS 환경변수를 사용하지 않는다.
+- 원본 PDF, OCR output, canonical/review DB, Qdrant snapshot은 업로드하지 않는다.
+- hosted workflow 성공은 공개 테스트 부하가 NAS에서 분리됐다는 증거일 뿐, 민감 운영 계산이나 Docker/SBOM 배포가 이전됐다는 뜻은 아니다.
+
 ## NAS pull-only
 
 NAS는 검토된 tag를 pull하고 commit과 release checksum을 검증한다. GitLab에는 NAS write credential을 제공하지 않는다. GitLab webhook도 NAS 쓰기 권한을 갖지 않는다.

@@ -1,16 +1,23 @@
 # Public GitLab bootstrap evidence
 
 project_path=h19h19/education-admin-rag
+gitlab_project_id=428
 project_created=1
 project_visibility=public
 auto_devops_enabled=0
 default_branch=main
 pipeline_definition=.gitlab-ci.yml
 runner_available=0
+project_runner_count=0
+group_runner_count=0
+instance_runner_count=0
+required_runner_tag=public-safe
 container_registry_enabled=0
 github_mirror_target=h19h29-design/education-admin-rag
 github_visibility=public
 github_push_mirror_enabled=1
+github_main_matches_gitlab=1
+mirror_credentials_committed=0
 mirror_mode=gitlab-push
 github_bootstrap_push_completed=1
 gitlab_main_pushed=1

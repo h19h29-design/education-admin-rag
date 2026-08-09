@@ -25,7 +25,9 @@ MAX_SUPPORTED_PDF_PAGE_COUNT: Final = 10_000
 """Corpus safety ceiling; reviewed originals are under 400 pages."""
 
 APPROVED_EDITION_YEARS = (2020, 2021, 2022, 2023, 2024, 2025)
-EDITION_SEQUENCE_ERROR = "manifest must contain exactly editions 2020 through 2025 in order"
+EDITION_SEQUENCE_ERROR = (
+    "manifest must contain exactly editions 2020 through 2025 in order"
+)
 PDF_LIBRARY_ERRORS = (OSError, RuntimeError, ValueError)
 
 
@@ -36,9 +38,7 @@ class ManifestError(Exception):
 class PageSizeProfile(BaseModel):
     """A contiguous PDF-page range that shares an expected media-box size."""
 
-    model_config = ConfigDict(
-        extra="forbid", strict=True, hide_input_in_errors=True
-    )
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
 
     start_pdf_page: int = Field(ge=1)
     end_pdf_page: int = Field(ge=1)
@@ -55,9 +55,7 @@ class PageSizeProfile(BaseModel):
 class PageNumberingPolicy(BaseModel):
     """Maps a PDF page to a safe body-page label."""
 
-    model_config = ConfigDict(
-        extra="forbid", strict=True, hide_input_in_errors=True
-    )
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
 
     mode: Literal["offset"]
     body_start_pdf_page: int = Field(ge=1)
@@ -101,13 +99,19 @@ class SourceDocument(BaseModel):
 
     @model_validator(mode="after")
     def validates_page_ranges_and_dates(self) -> SourceDocument:
-        if self.source_period_start and self.source_period_end and self.source_period_end < self.source_period_start:
+        if (
+            self.source_period_start
+            and self.source_period_end
+            and self.source_period_end < self.source_period_start
+        ):
             raise ValueError("source period end must not precede source period start")
 
         expected_start = 1
         for profile in self.page_size_profiles:
             if profile.start_pdf_page != expected_start:
-                raise ValueError("page-size profiles must be contiguous from PDF page 1")
+                raise ValueError(
+                    "page-size profiles must be contiguous from PDF page 1"
+                )
             expected_start = profile.end_pdf_page + 1
         if expected_start - 1 != self.pdf_page_count:
             raise ValueError("page-size profiles must end at the PDF page count")
@@ -127,9 +131,7 @@ class SourceDocument(BaseModel):
 class SourceManifest(BaseModel):
     """Strict manifest envelope with unique, chronological editions."""
 
-    model_config = ConfigDict(
-        extra="forbid", strict=True, hide_input_in_errors=True
-    )
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
 
     documents: tuple[SourceDocument, ...] = Field(min_length=1)
 
@@ -213,12 +215,15 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _matches_profile(page_number: int, rect: pymupdf.Rect, profiles: tuple[PageSizeProfile, ...]) -> bool:
+def _matches_profile(
+    page_number: int, rect: pymupdf.Rect, profiles: tuple[PageSizeProfile, ...]
+) -> bool:
     for profile in profiles:
         if profile.start_pdf_page <= page_number <= profile.end_pdf_page:
             return (
                 abs(float(rect.width) - profile.width_pt) <= PAGE_SIZE_TOLERANCE_PT
-                and abs(float(rect.height) - profile.height_pt) <= PAGE_SIZE_TOLERANCE_PT
+                and abs(float(rect.height) - profile.height_pt)
+                <= PAGE_SIZE_TOLERANCE_PT
             )
     return False
 

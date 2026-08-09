@@ -393,9 +393,9 @@ def _queue_bytes(assessments: Iterable[QualityAssessment]) -> bytes:
                 }
             )
     return b"".join(
-        json.dumps(record, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
-            "utf-8"
-        )
+        json.dumps(
+            record, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
         + b"\n"
         for record in records
     )

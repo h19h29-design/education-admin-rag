@@ -54,7 +54,9 @@ class RepeatedLineEvidence(NormalizationModel):
     @property
     def supports_removal(self) -> bool:
         """Require a majority occurrence and a conservative top/bottom margin."""
-        has_document_frequency = self.page_occurrence_count * 2 > self.document_page_count
+        has_document_frequency = (
+            self.page_occurrence_count * 2 > self.document_page_count
+        )
         has_margin_coordinate = self.y1_fraction <= 0.10 or self.y0_fraction >= 0.90
         return has_document_frequency and has_margin_coordinate
 
@@ -91,8 +93,9 @@ class Correction(NormalizationModel):
             raise ValueError("reviewer ID must use canonical bounded syntax")
         if not _REASON_CODE_RE.fullmatch(self.reason_code):
             raise ValueError("reason code must use canonical bounded syntax")
-        if self.corrected_at.tzinfo is None or self.corrected_at.utcoffset() != UTC.utcoffset(
-            self.corrected_at
+        if (
+            self.corrected_at.tzinfo is None
+            or self.corrected_at.utcoffset() != UTC.utcoffset(self.corrected_at)
         ):
             raise ValueError("correction timestamp must be an explicit UTC value")
         if hmac.compare_digest(self.before_sha256, self.after_sha256):
@@ -143,8 +146,12 @@ class TextLayers(NormalizationModel):
             expected_before = correction.after_sha256
             previous_timestamp = correction.corrected_at
         if self.corrections:
-            if not hmac.compare_digest(expected_before, _sha256_text(self.corrected_text)):
-                raise ValueError("corrected text does not match the final SHA-256 boundary")
+            if not hmac.compare_digest(
+                expected_before, _sha256_text(self.corrected_text)
+            ):
+                raise ValueError(
+                    "corrected text does not match the final SHA-256 boundary"
+                )
         elif self.corrected_text != self.normalized_text:
             raise ValueError("corrected text requires a correction record")
         return self
@@ -199,7 +206,9 @@ def normalize_text(
 ) -> str:
     """Normalize a derived view without altering protected semantic entities."""
     raw_text_sha256 = _sha256_text(text)
-    normalized = unicodedata.normalize("NFC", text).translate(_SAFE_SEPARATOR_TRANSLATION)
+    normalized = unicodedata.normalize("NFC", text).translate(
+        _SAFE_SEPARATOR_TRANSLATION
+    )
     normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
     normalized = "\n".join(
         _HORIZONTAL_WHITESPACE_RE.sub(" ", line).strip()
@@ -242,7 +251,9 @@ def normalize_text(
 
 
 def _normalize_evidence_text(text: str) -> str:
-    normalized = unicodedata.normalize("NFC", text).translate(_SAFE_SEPARATOR_TRANSLATION)
+    normalized = unicodedata.normalize("NFC", text).translate(
+        _SAFE_SEPARATOR_TRANSLATION
+    )
     normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
     return _HORIZONTAL_WHITESPACE_RE.sub(" ", normalized).strip()
 

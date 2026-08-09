@@ -12,12 +12,8 @@ _WHITESPACE = re.compile(r"\s+")
 _SAFE_CASE_NO = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
 _RESERVED_DUPLICATE_SUFFIX = re.compile(r"^.+-p[1-9][0-9]*-[0-9a-f]{8}$")
 _RESERVED_OPAQUE_CASE_NO = re.compile(r"^opaque-[0-9a-f]{12}$")
-_DUPLICATE_CASE_COMPONENT = re.compile(
-    r"^(?P<base>.+)-p[1-9][0-9]*-[0-9a-f]{8}$"
-)
-_DUPLICATE_LIKE_CASE_COMPONENT = re.compile(
-    r"^(?:.+-)?p[0-9]+-[0-9a-f]{8}$"
-)
+_DUPLICATE_CASE_COMPONENT = re.compile(r"^(?P<base>.+)-p[1-9][0-9]*-[0-9a-f]{8}$")
+_DUPLICATE_LIKE_CASE_COMPONENT = re.compile(r"^(?:.+-)?p[0-9]+-[0-9a-f]{8}$")
 _HASHED_BUSINESS_SLUG = re.compile(r"^[0-9a-f]{10}$")
 _HEX_SHA = re.compile(r"^[0-9a-fA-F]+$")
 _CANONICAL_CASE_ID = re.compile(
@@ -95,14 +91,17 @@ def title_hash(title: str) -> str:
 def _business_slug(value: str) -> str:
     normalized_value = _normalized_text(value, label="business label")
     return _BUSINESS_SLUGS.get(
-        normalized_value, hashlib.sha256(normalized_value.encode("utf-8")).hexdigest()[:10]
+        normalized_value,
+        hashlib.sha256(normalized_value.encode("utf-8")).hexdigest()[:10],
     )
 
 
 def _normalize_case_number(case_no: str) -> str:
     normalized = _normalized_text(case_no, label="case number").replace(" ", "-")
     if not _SAFE_CASE_NO.fullmatch(normalized):
-        raise ValueError("case number must contain only letters, numbers, and single hyphens")
+        raise ValueError(
+            "case number must contain only letters, numbers, and single hyphens"
+        )
     canonical = normalized.lower()
     if _RESERVED_DUPLICATE_SUFFIX.fullmatch(canonical):
         raise ValueError("case number uses a reserved duplicate suffix")
@@ -215,18 +214,26 @@ def make_case_id(
         part_slug,
         canonical_case_number,
     ):
-        raise ValueError("business labels and case number form an ambiguous canonical case ID")
+        raise ValueError(
+            "business labels and case number form an ambiguous canonical case ID"
+        )
     case_id = f"senqa-{edition_year}-{body}"
     if not duplicate:
         return validate_case_id(case_id)
-    if isinstance(start_page, bool) or not isinstance(start_page, int) or start_page < 1:
+    if (
+        isinstance(start_page, bool)
+        or not isinstance(start_page, int)
+        or start_page < 1
+    ):
         raise ValueError("duplicate start page must be a positive integer")
     if title is None:
         raise ValueError("duplicate case IDs require a valid start page and title")
     try:
         suffix = title_hash(title)
     except ValueError as error:
-        raise ValueError("duplicate case IDs require a valid start page and title") from error
+        raise ValueError(
+            "duplicate case IDs require a valid start page and title"
+        ) from error
     return validate_case_id(f"{case_id}-p{start_page}-{suffix}")
 
 
@@ -267,7 +274,9 @@ def _validate_issued_id(case_id: str) -> None:
 
 def make_release_id(released_at: datetime, git_sha: str) -> str:
     """Build a release ID from an explicit UTC instant and a valid Git SHA."""
-    if released_at.tzinfo is None or released_at.utcoffset() != UTC.utcoffset(released_at):
+    if released_at.tzinfo is None or released_at.utcoffset() != UTC.utcoffset(
+        released_at
+    ):
         raise ValueError("release timestamp must be explicit UTC")
     if len(git_sha) < 8:
         raise ValueError("git SHA must contain at least 8 hexadecimal characters")

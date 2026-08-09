@@ -40,9 +40,7 @@ def _add_case_schema_invariants(schema: dict[str, Any]) -> None:
         },
         {
             "if": {
-                "properties": {
-                    "pii_class": {"enum": ["public_credit", "restricted"]}
-                },
+                "properties": {"pii_class": {"enum": ["public_credit", "restricted"]}},
                 "required": ["pii_class"],
             },
             "then": _FALSE_ELIGIBILITY,
@@ -93,9 +91,7 @@ def _add_chunk_schema_invariants(schema: dict[str, Any]) -> None:
     schema["allOf"] = [
         {
             "if": {
-                "properties": {
-                    "pii_class": {"enum": ["public_credit", "restricted"]}
-                },
+                "properties": {"pii_class": {"enum": ["public_credit", "restricted"]}},
                 "required": ["pii_class"],
             },
             "then": _FALSE_ELIGIBILITY,
@@ -361,12 +357,16 @@ class IngestionRun(CanonicalModel):
 
     @model_validator(mode="after")
     def has_consistent_utc_timeline_and_hashes(self) -> IngestionRun:
-        if not _is_utc(self.started_at) or (self.ended_at is not None and not _is_utc(self.ended_at)):
+        if not _is_utc(self.started_at) or (
+            self.ended_at is not None and not _is_utc(self.ended_at)
+        ):
             raise ValueError("ingestion timestamps must be explicit UTC values")
         if self.ended_at is not None and self.ended_at < self.started_at:
             raise ValueError("ingestion end time must not precede start time")
         for source_sha256 in self.source_sha256s:
-            if len(source_sha256) != 64 or any(char not in "0123456789abcdef" for char in source_sha256):
+            if len(source_sha256) != 64 or any(
+                char not in "0123456789abcdef" for char in source_sha256
+            ):
                 raise ValueError("source SHA-256 values must be lowercase hexadecimal")
         return self
 

@@ -45,6 +45,8 @@ flowchart LR
 
 미러 우선순위는 GitLab의 push mirror 기능이다. 계정 또는 요금제 제약으로 사용할 수 없으면 보호된 CI 변수에 최소 권한 GitHub 토큰을 저장한 미러 전용 작업을 사용한다. 토큰은 코드, Git 이력, 로그에 기록하지 않는다.
 
+GitLab Runner가 없는 동안 GitHub 미러는 GitHub-hosted Actions에서 공개 안전 테스트만 실행할 수 있다. 이 fallback은 저장소 원본 권한을 GitHub로 옮기지 않으며, secret·artifact·cache·deploy 없이 GitLab과 동일한 공개 게이트를 실행한다. Docker/SBOM과 NAS 관련 검증은 별도의 검증된 Runner가 생길 때까지 계속 차단한다.
+
 ## 4. 공개·비공개 경계
 
 ### 4.1 공공 GitLab에 허용
