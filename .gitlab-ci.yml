@@ -1,0 +1,39 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: "$CI_COMMIT_BRANCH"
+    - if: "$CI_COMMIT_TAG"
+
+stages:
+  - verify
+
+default:
+  tags:
+    - public-safe
+  interruptible: true
+
+variables:
+  GIT_DEPTH: "0"
+  AUTO_DEVOPS_DISABLED: "1"
+  UV_FROZEN: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+public-policy:
+  stage: verify
+  script:
+    - ./scripts/ci-public-gates.sh policy
+
+quality:
+  stage: verify
+  script:
+    - ./scripts/ci-public-gates.sh quality
+
+security:
+  stage: verify
+  script:
+    - ./scripts/ci-public-gates.sh security
+
+docs:
+  stage: verify
+  script:
+    - ./scripts/ci-public-gates.sh docs
