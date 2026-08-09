@@ -107,7 +107,12 @@ def test_bootstrap_report_matches_verified_public_state() -> None:
         "container_registry_enabled=0",
         "github_mirror_target=h19h29-design/education-admin-rag",
         "github_visibility=public",
-        "gitlab_main_pushed=0",
+        "default_branch=main",
+        "gitlab_main_pushed=1",
+        "main_protected=1",
+        "force_push_allowed=0",
+        "github_push_mirror_enabled=1",
+        "pipeline_status=pending_runner",
         "milestone_created=1",
         "work_items_created=4",
     ):
