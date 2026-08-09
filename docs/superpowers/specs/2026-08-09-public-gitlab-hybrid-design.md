@@ -1,7 +1,7 @@
 # 공공 GitLab·AI정부실험실 하이브리드 운영 설계
 
 **작성일:** 2026-08-09  
-**상태:** 사용자 승인 후 구현 대기  
+**상태:** 사용자 승인 완료·구현 계획 수립
 **대상 저장소:** 교육행정 질문답변 말뭉치·RAG 기반  
 **공개 GitLab 경로:** `gitlab.aigov.go.kr/h19h19/education-admin-rag`  
 **GitHub 미러:** `github.com/weplebong/education-admin-launcher`
@@ -70,13 +70,14 @@ flowchart LR
 
 ## 5. CI/CD 설계
 
-Auto DevOps는 비활성화하고 다음 명시적 파이프라인만 둔다.
+Auto DevOps는 비활성화하고 Runner 종류에 따라 다음 명시적 파이프라인만 둔다.
 
-1. **quality**: `pytest`, Ruff, Ruff format check, strict mypy, `uv lock --check --offline`
-2. **security**: current-tree 및 full-history secret 검사, 의존성·Dockerfile·공개 경계 검사
-3. **build-check**: 최소 Docker context로 linux/amd64 이미지 빌드 검증과 SBOM·digest 생성
-4. **docs**: 설계·runbook 링크와 셸 블록 검증
-5. **release-evidence**: 수동 승인된 태그에서 비식별 검증 보고서와 체크섬 생성
+1. **public-policy**: tracked path가 공개 허용 경계를 넘지 않는지 검사
+2. **quality**: `pytest`, Ruff, Ruff format check, strict mypy, `uv lock --check --offline`
+3. **security**: current-tree 및 full-history secret 검사
+4. **docs**: 설계·runbook과 셸 블록 검증
+
+Docker executor가 검증된 `public-safe-docker` Runner가 생긴 뒤에만 최소 Docker context의 linux/amd64 이미지 빌드와 SBOM·digest 생성을 추가한다. Container Registry에는 push하지 않는다. Release evidence는 민감한 NAS 입력을 public CI가 읽어 생성하지 않는다. NAS에서 서명한 본문 없는 체크섬·검증 메타데이터만 수동으로 GitLab Release에 첨부한다.
 
 공통 정책은 다음과 같다.
 
