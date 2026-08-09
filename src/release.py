@@ -15,11 +15,18 @@ import tempfile
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, NoReturn, Protocol
+from typing import Literal, NoReturn, Protocol, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from src.corpus.ids import make_release_id
+from src.corpus.models import Case, IngestionRun
+from src.corpus.storage import StorageError, connect_canonical_storage
+from src.evaluation.release_report import (
+    ReleaseEvaluationReport,
+    canonical_release_evaluation_bytes,
+)
+from src.ingestion.privacy import classify_privacy, scan_text
 
 _RELEASE_RE = re.compile(r"^corpus-\d{14}-[0-9a-f]{8}$")
 _COLLECTION_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,190}[a-z0-9]$")
@@ -36,6 +43,27 @@ BACKUP_PAYLOAD_PATHS = (
     "models.lock.json",
     "evaluation-report.json",
     "blind-labels.age",
+)
+_CANONICAL_EXPORTS = frozenset(
+    f"{name}.jsonl"
+    for name in (
+        "build_meta",
+        "documents",
+        "issued_case_ids",
+        "cases",
+        "source_spans",
+        "chunks",
+        "chunk_source_spans",
+        "law_refs",
+        "case_relations",
+        "corrections",
+        "review_events",
+        "ingestion_runs",
+        "tokenizer_contract",
+        "review_registry",
+        "review_registry_locations",
+        "case_authorities",
+    )
 )
 
 
@@ -110,6 +138,49 @@ class ReleaseVerificationEvidence(_ReleaseModel):
             )
         ):
             raise ValueError("release evidence gate failed")
+        return self
+
+
+class IndexReleaseEvidence(_ReleaseModel):
+    schema_version: Literal["sen-qa-index-evidence/v1"]
+    release_id: str = Field(pattern=r"^corpus-\d{14}-[0-9a-f]{8}$")
+    canonical_database_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    lexical_index_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    dense_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    eligible_chunks: int = Field(gt=0, le=1_000_000)
+    lexical_chunks: int = Field(gt=0, le=1_000_000)
+    dense_points: int = Field(gt=0, le=1_000_000)
+    collection_name: str = Field(pattern=r"^corpus-\d{14}-[0-9a-f]{8}-bge-m3$")
+
+    @model_validator(mode="after")
+    def counts_and_collection_match_release(self) -> IndexReleaseEvidence:
+        if (
+            self.eligible_chunks != self.lexical_chunks
+            or self.eligible_chunks != self.dense_points
+            or self.collection_name != f"{self.release_id}-bge-m3"
+        ):
+            raise ValueError("index release evidence mismatch")
+        return self
+
+
+class _CanonicalBundleEvidence(_ReleaseModel):
+    schema_version: Literal["sen-qa-canonical-bundle/v1"]
+    release_id: str = Field(pattern=r"^corpus-\d{14}-[0-9a-f]{8}$")
+    database_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    canonical_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    projection_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    predecessor_bundle_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    exports: dict[str, str]
+
+    @model_validator(mode="after")
+    def exports_are_exact_and_hashed(self) -> _CanonicalBundleEvidence:
+        if set(self.exports) != _CANONICAL_EXPORTS or any(
+            re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for digest in self.exports.values()
+        ):
+            raise ValueError("canonical bundle exports mismatch")
         return self
 
 
@@ -740,6 +811,318 @@ def _open_regular_path(path: Path) -> tuple[int, os.stat_result] | None:
                 os.close(descriptor)
             except OSError:
                 pass
+
+
+def _stable_file_sha256(path: Path) -> str | None:
+    opened = _open_regular_path(path)
+    if opened is None:
+        return None
+    descriptor, before = opened
+    digest = hashlib.sha256()
+    total = 0
+    failed = False
+    try:
+        while total <= _MAX_BACKUP_FILE_BYTES:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            total != before.st_size
+            or total > _MAX_BACKUP_FILE_BYTES
+            or os.read(descriptor, 1)
+            or (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+        ):
+            failed = True
+    except OSError:
+        failed = True
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            failed = True
+    return None if failed else digest.hexdigest()
+
+
+_EvidenceModelT = TypeVar("_EvidenceModelT", bound=_ReleaseModel)
+
+
+def _load_exact_evidence_model(
+    path: Path, model_type: type[_EvidenceModelT]
+) -> tuple[_EvidenceModelT, bytes] | None:
+    payload = _read_bounded(path, limit=_MAX_ATTESTATION_BYTES)
+    if payload is None:
+        return None
+    try:
+        decoded = json.loads(payload, object_pairs_hook=_unique_object)
+        if type(decoded) is not dict:
+            return None
+        checked = model_type.model_validate_json(payload)
+        if _canonical_json(checked) != payload:
+            return None
+        return checked, payload
+    except (
+        json.JSONDecodeError,
+        _DuplicateKey,
+        ValidationError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _load_exact_evaluation(path: Path) -> ReleaseEvaluationReport | None:
+    payload = _read_bounded(path, limit=_MAX_ATTESTATION_BYTES)
+    if payload is None:
+        return None
+    try:
+        decoded = json.loads(payload, object_pairs_hook=_unique_object)
+        if type(decoded) is not dict:
+            return None
+        checked = ReleaseEvaluationReport.model_validate_json(payload)
+        if canonical_release_evaluation_bytes(checked) != payload:
+            return None
+        return checked
+    except (
+        json.JSONDecodeError,
+        _DuplicateKey,
+        ValidationError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _case_privacy_matches(case: Case) -> bool:
+    if not case.search_eligible:
+        return True
+    text = "\n".join(
+        value
+        for value in (
+            case.title_raw,
+            case.title_normalized,
+            case.question,
+            case.answer,
+            case.facts,
+            case.basis_text,
+        )
+        if value is not None
+    )
+    try:
+        findings = scan_text(
+            text,
+            location_id=f"case-{case.case_id}:canonical",
+            case_type=case.case_type,
+        )
+        decision = classify_privacy(
+            findings,
+            case_type=case.case_type,
+            audit_masked=case.pii_class == "anonymized_case",
+            proposed_search_eligible=case.search_eligible,
+            proposed_answer_eligible=case.answer_eligible,
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        decision.pii_class == case.pii_class
+        and decision.search_eligible == case.search_eligible
+        and decision.answer_eligible == case.answer_eligible
+    )
+
+
+def assemble_release_verification_evidence(
+    *,
+    canonical_manifest: Path,
+    canonical_database: Path,
+    lexical_index: Path,
+    index_evidence_path: Path,
+    evaluation_report: Path,
+    output: Path,
+    expected_release_id: str,
+) -> ReleaseVerificationEvidence:
+    """Derive release gates from exact canonical, index, and evaluation artifacts."""
+    if (
+        type(expected_release_id) is not str
+        or _RELEASE_RE.fullmatch(expected_release_id) is None
+        or not all(
+            isinstance(path, Path)
+            for path in (
+                canonical_manifest,
+                canonical_database,
+                lexical_index,
+                index_evidence_path,
+                evaluation_report,
+                output,
+            )
+        )
+    ):
+        _raise("release_evidence_invalid")
+    loaded_manifest = _load_exact_evidence_model(
+        canonical_manifest, _CanonicalBundleEvidence
+    )
+    loaded_index = _load_exact_evidence_model(index_evidence_path, IndexReleaseEvidence)
+    evaluation = _load_exact_evaluation(evaluation_report)
+    database_sha256 = _stable_file_sha256(canonical_database)
+    lexical_sha256 = _stable_file_sha256(lexical_index)
+    if loaded_manifest is None or loaded_index is None or evaluation is None:
+        _raise("release_evidence_invalid")
+    manifest, manifest_bytes = loaded_manifest
+    index_evidence, _ = loaded_index
+    bundle_sha256 = hashlib.sha256(
+        b"sen-qa-canonical-bundle-v1\0" + manifest_bytes
+    ).hexdigest()
+    failed = False
+    cases: tuple[Case, ...] = ()
+    runs: tuple[IngestionRun, ...] = ()
+    chunk_count = -1
+    review_location_cases = -1
+    case_authorities = -1
+    registry_count = -1
+    build_release: object = None
+    try:
+        with connect_canonical_storage(canonical_database) as connection:
+            connection.execute("BEGIN")
+            build_row = connection.execute(
+                "SELECT release_id FROM build_meta WHERE singleton=1"
+            ).fetchone()
+            build_release = (
+                build_row[0]
+                if type(build_row) is tuple and len(build_row) == 1
+                else None
+            )
+            raw_cases = connection.execute(
+                "SELECT payload_json FROM cases ORDER BY case_id"
+            ).fetchall()
+            raw_runs = connection.execute(
+                "SELECT payload_json FROM ingestion_runs ORDER BY run_id"
+            ).fetchall()
+            cases = tuple(Case.model_validate_json(row[0]) for row in raw_cases)
+            runs = tuple(IngestionRun.model_validate_json(row[0]) for row in raw_runs)
+            chunk_count = cast(
+                int, connection.execute("SELECT count(*) FROM chunks").fetchone()[0]
+            )
+            review_location_cases = cast(
+                int,
+                connection.execute(
+                    "SELECT count(DISTINCT case_id) FROM review_registry_locations"
+                ).fetchone()[0],
+            )
+            case_authorities = cast(
+                int,
+                connection.execute("SELECT count(*) FROM case_authorities").fetchone()[
+                    0
+                ],
+            )
+            registry_count = cast(
+                int,
+                connection.execute("SELECT count(*) FROM review_registry").fetchone()[
+                    0
+                ],
+            )
+            connection.execute("ROLLBACK")
+    except (
+        StorageError,
+        sqlite3.Error,
+        ValidationError,
+        TypeError,
+        ValueError,
+    ):
+        failed = True
+    quarantined_pages = sum(
+        counts.quarantined
+        for run in runs
+        for counts in run.document_page_counts.values()
+    )
+    failed_pages = sum(
+        counts.failed for run in runs for counts in run.document_page_counts.values()
+    )
+    hybrid = next(
+        (item for item in evaluation.retrieval if item.system == "hybrid"), None
+    )
+    if (
+        failed
+        or database_sha256 is None
+        or lexical_sha256 is None
+        or manifest.release_id != expected_release_id
+        or index_evidence.release_id != expected_release_id
+        or evaluation.release_id != expected_release_id
+        or build_release != expected_release_id
+        or manifest.database_sha256 != database_sha256
+        or index_evidence.canonical_database_sha256 != database_sha256
+        or index_evidence.lexical_index_sha256 != lexical_sha256
+        or chunk_count != index_evidence.eligible_chunks
+        or not cases
+        or len(runs) != 1
+        or runs[0].release_id != expected_release_id
+        or runs[0].ended_at is None
+        or not isinstance(runs[0].approved_by, str)
+        or re.fullmatch(r"review-snapshot:[0-9a-f]{64}", runs[0].approved_by) is None
+        or any(
+            case.review_status not in {"search_approved", "approved", "rejected"}
+            for case in cases
+        )
+        or any(
+            case.search_eligible
+            and case.pii_class
+            not in {
+                "none",
+                "anonymized_case",
+                "quasi_identifier",
+            }
+            for case in cases
+        )
+        or any(not _case_privacy_matches(case) for case in cases)
+        or review_location_cases != len(cases)
+        or case_authorities != len(cases)
+        or registry_count != 1
+        or hybrid is None
+        or len(evaluation.retrieval) != 4
+        or {item.system for item in evaluation.retrieval}
+        != {"substring", "lexical", "dense", "hybrid"}
+    ):
+        _raise("release_evidence_invalid")
+    try:
+        evidence = ReleaseVerificationEvidence(
+            schema_version="sen-qa-release-verification-evidence/v1",
+            release_id=expected_release_id,
+            canonical_bundle_sha256=bundle_sha256,
+            canonical_content_sha256=manifest.canonical_content_sha256,
+            lexical_index_sha256=index_evidence.lexical_index_sha256,
+            dense_sample_sha256=index_evidence.dense_sample_sha256,
+            eligible_chunks=index_evidence.eligible_chunks,
+            lexical_chunks=index_evidence.lexical_chunks,
+            dense_points=index_evidence.dense_points,
+            gold_items=evaluation.gold_items,
+            blind_items=evaluation.blind_items,
+            quarantined_pages=quarantined_pages,
+            failed_pages=failed_pages,
+            provenance_missing=evaluation.ingestion.provenance_missing_count,
+            privacy_findings_unresolved=0,
+            warm_latency_p95_ms=hybrid.warm_latency_p95_ms.total_ms,
+            review_gate=True,
+            ingestion_gate=evaluation.ingestion_gate,
+            retrieval_gate=evaluation.retrieval_gate,
+            privacy_gate=True,
+        )
+    except (ValidationError, TypeError, ValueError):
+        _raise("release_evidence_invalid")
+    _write_new_file(output, _canonical_json(evidence))
+    return evidence
 
 
 def _copy_open_file(descriptor: int, before: os.stat_result, target: Path) -> bool:

@@ -195,3 +195,14 @@ def test_evaluation_script_runs_gold_bound_aggregate_evaluator() -> None:
     assert "evaluate-release-evidence" in script
     assert "evaluation_observations_missing" in script
     assert "retrieval_evaluation_driver_required" not in script
+
+
+def test_verification_script_derives_evidence_before_signing() -> None:
+    """Catches signing a caller-authored all-green evidence file."""
+    script = Path("scripts/verify-release.sh").read_text(encoding="utf-8")
+
+    assert "assemble-release-evidence" in script
+    assert script.index("assemble-release-evidence") < script.index(
+        "create-verification-attestation"
+    )
+    assert "release_evidence_exists" in script

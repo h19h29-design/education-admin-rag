@@ -22,6 +22,7 @@ from src.ingestion.review import (
     SegmentManifest,
     VerifiedCanonicalReviewRegistry,
 )
+from src.release import ReleaseVerificationEvidence
 from src.retrieval.lexical import build_lexical_index
 from tests.ingestion.test_parse_metadata import (
     _native_quarantine_records,
@@ -138,6 +139,62 @@ def test_evaluate_release_cli_passes_exact_evidence_paths_and_reports_gates(
             ("substring", "lexical", "dense", "hybrid"), inputs[5:], strict=True
         )
     }
+
+
+def test_assemble_release_evidence_cli_uses_measured_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = tuple(
+        tmp_path / name
+        for name in (
+            "manifest.json",
+            "canonical.sqlite3",
+            "lexical.sqlite3",
+            "index-attestation.json",
+            "evaluation-report.json",
+        )
+    )
+    for path in inputs:
+        path.write_bytes(b"evidence")
+    output = tmp_path / "release-evidence.json"
+    captured: dict[str, object] = {}
+
+    def fake_assemble(**kwargs: object) -> ReleaseVerificationEvidence:
+        captured.update(kwargs)
+        return ReleaseVerificationEvidence.model_construct(
+            canonical_bundle_sha256="a" * 64
+        )
+
+    monkeypatch.setattr(
+        cli_module,
+        "assemble_release_verification_evidence",
+        fake_assemble,
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "assemble-release-evidence",
+            "--release-id",
+            "corpus-20250808123456-deadbeef",
+            "--canonical-manifest",
+            str(inputs[0]),
+            "--canonical-db",
+            str(inputs[1]),
+            "--lexical-index",
+            str(inputs[2]),
+            "--index-evidence",
+            str(inputs[3]),
+            "--evaluation-report",
+            str(inputs[4]),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == f"bundle_sha256={'a' * 64} failed=0"
+    assert captured["canonical_manifest"] == inputs[0]
+    assert captured["output"] == output
 
 
 def test_module_entrypoint_reports_version() -> None:

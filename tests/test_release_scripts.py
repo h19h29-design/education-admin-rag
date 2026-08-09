@@ -11,9 +11,16 @@ from pathlib import Path
 import pytest
 
 import src.release as release_module
+from src.evaluation.release_report import (
+    build_release_evaluation_report,
+    canonical_release_evaluation_bytes,
+)
+from src.ingestion.privacy import PrivacyFinding
 from src.release import (
     BACKUP_PAYLOAD_PATHS,
+    IndexReleaseEvidence,
     ReleaseAttestation,
+    assemble_release_verification_evidence,
     create_backup_manifest,
     create_verification_attestation,
     load_backup_tool_lock,
@@ -25,6 +32,9 @@ from src.release import (
     verify_backup_manifest,
     write_release_attestation,
 )
+from src.retrieval.lexical import build_lexical_index
+from tests.corpus.test_storage import _batch, _build
+from tests.evaluation.test_release_report import _gold, _ingestion, _retrieval
 
 RELEASE_ID = "corpus-20250808123456-deadbeef"
 BACKUP_TOOL_LOCK = Path("config/backup-tools.lock.json")
@@ -290,6 +300,100 @@ def test_verification_attestation_requires_every_measured_release_gate(
             output=tmp_path / "must-not-exist.json",
             expected_release_id=RELEASE_ID,
         )
+
+
+def test_release_evidence_is_derived_from_canonical_index_and_evaluation_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = _batch(release_id=RELEASE_ID)
+    canonical = _build(
+        tmp_path,
+        batch,
+        registry_name="issuance.sqlite3",
+        output_name="canonical-output",
+    )
+    lexical_path = tmp_path / "lexical.sqlite3"
+    lexical = build_lexical_index(
+        canonical.bundle_path / "canonical.sqlite3", lexical_path
+    )
+    gold = _gold()
+    retrieval = _retrieval(gold)
+    evaluation = build_release_evaluation_report(
+        release_id=RELEASE_ID,
+        gold_items=gold,
+        ingestion_observations=_ingestion(gold),
+        retrieval_observations={
+            system: retrieval for system in ("substring", "lexical", "dense", "hybrid")
+        },
+    )
+    evaluation_path = tmp_path / "evaluation-report.json"
+    evaluation_path.write_bytes(canonical_release_evaluation_bytes(evaluation))
+    index_path = tmp_path / "index-attestation.json"
+    index_evidence = IndexReleaseEvidence(
+        schema_version="sen-qa-index-evidence/v1",
+        release_id=RELEASE_ID,
+        canonical_database_sha256=canonical.database_sha256,
+        lexical_index_sha256=hashlib.sha256(lexical_path.read_bytes()).hexdigest(),
+        dense_sample_sha256="4" * 64,
+        eligible_chunks=lexical.indexed_chunks,
+        lexical_chunks=lexical.indexed_chunks,
+        dense_points=lexical.indexed_chunks,
+        collection_name=f"{RELEASE_ID}-bge-m3",
+    )
+    index_path.write_text(
+        json.dumps(
+            index_evidence.model_dump(mode="json"),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    output = tmp_path / "release-evidence.json"
+
+    evidence = assemble_release_verification_evidence(
+        canonical_manifest=canonical.bundle_path / "manifest.json",
+        canonical_database=canonical.bundle_path / "canonical.sqlite3",
+        lexical_index=lexical_path,
+        index_evidence_path=index_path,
+        evaluation_report=evaluation_path,
+        output=output,
+        expected_release_id=RELEASE_ID,
+    )
+
+    assert evidence.canonical_bundle_sha256 == canonical.bundle_sha256
+    assert evidence.eligible_chunks == lexical.indexed_chunks
+    assert evidence.quarantined_pages == 0
+    assert evidence.failed_pages == 0
+    assert evidence.review_gate is True
+    assert evidence.privacy_gate is True
+    assert json.loads(output.read_bytes())["retrieval_gate"] is True
+
+    unresolved_output = tmp_path / "unresolved-release-evidence.json"
+    monkeypatch.setattr(
+        release_module,
+        "scan_text",
+        lambda *_args, **_kwargs: (
+            PrivacyFinding(
+                kind="phone",
+                location_id="case-synthetic:canonical",
+                count=1,
+            ),
+        ),
+    )
+    with pytest.raises(release_module.ReleaseError, match="release_evidence_invalid"):
+        assemble_release_verification_evidence(
+            canonical_manifest=canonical.bundle_path / "manifest.json",
+            canonical_database=canonical.bundle_path / "canonical.sqlite3",
+            lexical_index=lexical_path,
+            index_evidence_path=index_path,
+            evaluation_report=evaluation_path,
+            output=unresolved_output,
+            expected_release_id=RELEASE_ID,
+        )
+    assert not unresolved_output.exists()
 
 
 def test_backup_tool_lock_pins_exact_linux_amd64_archives() -> None:

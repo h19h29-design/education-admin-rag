@@ -67,6 +67,7 @@ from src.ingestion.review import (
 )
 from src.release import (
     ReleaseError,
+    assemble_release_verification_evidence,
     create_backup_manifest,
     create_verification_attestation,
     load_storage_policy,
@@ -334,6 +335,46 @@ def create_verification_attestation_command(
         typer.echo("failed=1 error_code=release_evidence_invalid")
         raise SystemExit(1) from None
     typer.echo(f"bundle_sha256={attestation.bundle_sha256} failed=0")
+
+
+@app.command("assemble-release-evidence")
+def assemble_release_evidence_command(
+    release_id: str = typer.Option(..., "--release-id"),
+    canonical_manifest: Path = typer.Option(  # noqa: B008
+        ..., "--canonical-manifest", exists=True, dir_okay=False, readable=True
+    ),
+    canonical_database: Path = typer.Option(  # noqa: B008
+        ..., "--canonical-db", exists=True, dir_okay=False, readable=True
+    ),
+    lexical_index: Path = typer.Option(  # noqa: B008
+        ..., "--lexical-index", exists=True, dir_okay=False, readable=True
+    ),
+    index_evidence: Path = typer.Option(  # noqa: B008
+        ..., "--index-evidence", exists=True, dir_okay=False, readable=True
+    ),
+    evaluation_report: Path = typer.Option(  # noqa: B008
+        ..., "--evaluation-report", exists=True, dir_okay=False, readable=True
+    ),
+    output: Path = typer.Option(..., "--output", dir_okay=False),  # noqa: B008
+) -> None:
+    """Derive canonical release evidence from exact measured artifacts."""
+    evidence = None
+    try:
+        evidence = assemble_release_verification_evidence(
+            canonical_manifest=canonical_manifest,
+            canonical_database=canonical_database,
+            lexical_index=lexical_index,
+            index_evidence_path=index_evidence,
+            evaluation_report=evaluation_report,
+            output=output,
+            expected_release_id=release_id,
+        )
+    except (ReleaseError, OSError, sqlite3.Error, TypeError, ValueError):
+        pass
+    if evidence is None:
+        typer.echo("failed=1 error_code=release_evidence_invalid")
+        raise SystemExit(1) from None
+    typer.echo(f"bundle_sha256={evidence.canonical_bundle_sha256} failed=0")
 
 
 @app.command("evaluate-release-evidence")

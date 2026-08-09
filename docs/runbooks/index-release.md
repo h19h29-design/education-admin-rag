@@ -95,10 +95,14 @@ partial question sets, symlinks, or group-readable private observations cannot
 satisfy this gate. `verify-release.sh` similarly requires canonical, index, and
 evaluation evidence and never promotes an alias.
 
-Only after a real evaluator driver produces canonical `release-evidence.json`
-with all ingestion/retrieval/privacy and latency gates may
-`verify-release.sh` create and minisign the verification attestation. The attestation
-release ID and bundle SHA must exactly match the isolated restore attestation.
+Only after the evaluator writes a green aggregate report and the index job
+writes `index-attestation.json` may `verify-release.sh` proceed. It derives
+`release-evidence.json` itself by rehashing the canonical manifest/database and
+lexical index, checking dense counts/sample hash, rereading canonical
+review/ingestion/privacy state, and validating the evaluation gates. A
+caller-authored all-green evidence file is rejected. The script then creates and
+minisign-signs the verification attestation. Its release ID and bundle SHA must
+exactly match the isolated restore attestation.
 
 ## Promotion and reconciliation
 
