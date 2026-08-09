@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import traceback
 from itertools import pairwise
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,11 +19,13 @@ from src.corpus.chunking import (
     ChunkingError,
     EmbeddingModelLock,
     LockedEmbeddingFile,
+    LockedTokenizer,
     RoleSource,
     TokenizerContract,
     VerifiedChunkSet,
     build_chunks,
     load_embedding_model_lock,
+    load_locked_tokenizer,
     revalidate_verified_chunk_set,
     role_source_manifest_bytes,
     validate_embedding_model_lock,
@@ -228,6 +232,58 @@ def test_tokenizer_cache_gate_uses_exact_subset_without_model_binary(
             scope="full",
             expected_lock_sha256=lock.fingerprint_sha256,
         )
+
+
+def test_locked_tokenizer_loads_verified_json_bytes_without_path_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = validate_embedding_model_lock(_composite_lock_payload())
+    _write_cache(tmp_path, TOKENIZER_REQUIRED_PATHS)
+
+    class Encoding:
+        tokens = ("fixture-token",)
+        offsets = ((0, 7),)
+
+    class Backend:
+        def encode(self, text: str, *, add_special_tokens: bool) -> Encoding:
+            assert text == "fixture"
+            assert not add_special_tokens
+            return Encoding()
+
+        def token_to_id(self, token: str) -> int | None:
+            return 1 if token == "fixture-token" else None
+
+        def decode(self, ids: list[int], *, skip_special_tokens: bool) -> str:
+            assert ids == [1]
+            assert not skip_special_tokens
+            return "fixture"
+
+    class TokenizerFactory:
+        @staticmethod
+        def from_str(raw: str) -> Backend:
+            assert raw == _cache_bytes("tokenizer.json").decode()
+            return Backend()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenizers",
+        SimpleNamespace(Tokenizer=TokenizerFactory),
+    )
+
+    tokenizer = load_locked_tokenizer(
+        lock,
+        tmp_path,
+        expected_lock_sha256=lock.fingerprint_sha256,
+        runtime_fingerprint_sha256="d" * 64,
+    )
+
+    assert type(tokenizer) is LockedTokenizer
+    assert tokenizer.tokenize("fixture") == ("fixture-token",)
+    assert tokenizer.token_offsets("fixture") == ((0, 7),)
+    assert tokenizer.detokenize(("fixture-token",)) == "fixture"
+    assert tokenizer.model_name == "BAAI/bge-m3"
+    assert tokenizer.revision == _REVISION
 
 
 def test_embedding_cache_rejects_missing_extra_symlink_size_and_hash(

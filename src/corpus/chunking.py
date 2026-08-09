@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib
 import json
 import os
 import re
@@ -498,6 +499,46 @@ def verify_embedding_cache(
         os.close(root_fd)
 
 
+def _read_locked_cache_file(
+    root_fd: int,
+    locked: LockedEmbeddingFile,
+    *,
+    max_bytes: int,
+) -> bytes | None:
+    if locked.size > max_bytes:
+        return None
+    descriptor = _open_relative_file(root_fd, locked.path)
+    if descriptor is None:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != locked.size:
+            return None
+        chunks: list[bytes] = []
+        remaining = locked.size
+        digest = hashlib.sha256()
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1_048_576))
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            return None
+        after = os.fstat(descriptor)
+        if (
+            _stat_identity(before) != _stat_identity(after)
+            or digest.hexdigest() != locked.sha256
+        ):
+            return None
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
 ChunkRole = Literal["question", "answer", "basis", "facts", "table"]
 
 
@@ -568,6 +609,98 @@ class Tokenizer(Protocol):
     def detokenize(self, tokens: tuple[str, ...]) -> str: ...
 
     def token_offsets(self, text: str) -> tuple[tuple[int, int], ...]: ...
+
+
+class LockedTokenizer:
+    """In-memory tokenizer created only from exact locked tokenizer JSON bytes."""
+
+    def __init__(
+        self,
+        backend: Any,
+        *,
+        lock: EmbeddingModelLock,
+        runtime_fingerprint_sha256: str,
+    ) -> None:
+        self._backend = backend
+        self.model_name = lock.repo_id
+        self.revision = lock.revision
+        self.model_lock_sha256 = lock.fingerprint_sha256
+        self.runtime_fingerprint_sha256 = runtime_fingerprint_sha256
+
+    def tokenize(self, text: str) -> tuple[str, ...]:
+        encoding = self._backend.encode(text, add_special_tokens=False)
+        return tuple(encoding.tokens)
+
+    def detokenize(self, tokens: tuple[str, ...]) -> str:
+        identifiers = [self._backend.token_to_id(token) for token in tokens]
+        if any(identifier is None for identifier in identifiers):
+            _raise("locked tokenizer returned an unknown token")
+        return cast(
+            str,
+            self._backend.decode(
+                cast(list[int], identifiers),
+                skip_special_tokens=False,
+            ),
+        )
+
+    def token_offsets(self, text: str) -> tuple[tuple[int, int], ...]:
+        encoding = self._backend.encode(text, add_special_tokens=False)
+        return tuple(tuple(offset) for offset in encoding.offsets)
+
+
+def load_locked_tokenizer(
+    lock: object,
+    model_root: Path,
+    *,
+    expected_lock_sha256: str,
+    runtime_fingerprint_sha256: str,
+) -> LockedTokenizer:
+    """Load exact tokenizer bytes without reopening a verified pathname."""
+    approved = _revalidate_embedding_lock(lock)
+    if (
+        approved is None
+        or not isinstance(expected_lock_sha256, str)
+        or _SHA256_RE.fullmatch(expected_lock_sha256) is None
+        or not hmac.compare_digest(approved.fingerprint_sha256, expected_lock_sha256)
+        or not isinstance(runtime_fingerprint_sha256, str)
+        or _SHA256_RE.fullmatch(runtime_fingerprint_sha256) is None
+    ):
+        _raise("locked tokenizer authority is invalid")
+    verify_embedding_cache(
+        approved,
+        model_root,
+        scope="tokenizer",
+        expected_lock_sha256=expected_lock_sha256,
+    )
+    tokenizer_file = next(
+        item for item in approved.files if item.path == "tokenizer.json"
+    )
+    root_fd = _open_cache_root(model_root)
+    if root_fd is None:
+        _raise("locked tokenizer cache is invalid")
+    try:
+        raw = _read_locked_cache_file(
+            root_fd,
+            tokenizer_file,
+            max_bytes=32 * 1024 * 1024,
+        )
+    finally:
+        os.close(root_fd)
+    backend: object | None = None
+    if raw is not None:
+        try:
+            module = importlib.import_module("tokenizers")
+            tokenizer_type = cast(Any, module).Tokenizer
+            backend = tokenizer_type.from_str(raw.decode("utf-8"))
+        except (ImportError, UnicodeError, RuntimeError, TypeError, ValueError):
+            backend = None
+    if backend is None:
+        _raise("locked tokenizer cache is invalid")
+    return LockedTokenizer(
+        backend,
+        lock=approved,
+        runtime_fingerprint_sha256=runtime_fingerprint_sha256,
+    )
 
 
 _ROLE_ORDER: dict[ChunkRole, int] = {
