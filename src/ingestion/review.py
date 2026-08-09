@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Literal, Self, cast, get_args
 
 from src.corpus.ids import validate_case_id
-from src.ingestion.quality import QualityReason
+from src.ingestion.quality import QualityReason, ReviewProvenanceReason
 
 ReviewStatus = Literal[
     "machine_extracted", "needs_review", "search_approved", "approved", "rejected"
@@ -34,11 +34,21 @@ _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.:@/-]{1,160}$")
 _MANIFEST_SCHEMA = "sen-qa-review-segment/v1"
 _REGISTRY_SCHEMA = "sen-qa-canonical-review-registry/v1"
+_DECISION_SNAPSHOT_SCHEMA = "review-decision-snapshot-v1"
+_MAX_DECISION_SNAPSHOT_CASES = 10_000
+_MAX_DECISION_SNAPSHOT_EVENTS = 50_000
+_MAX_DECISION_SNAPSHOT_BYTES = 16 * 1024 * 1024
+_SNAPSHOT_BOUNDED_ERROR = "review decision snapshot exceeds bounded export limits"
+_SNAPSHOT_COMPLETE_ERROR = (
+    "review registry requires a complete terminal decision snapshot"
+)
+_SNAPSHOT_INVALID_ERROR = "review decision snapshot is invalid"
 _TERMINAL_STATES = {"approved", "rejected"}
 _OS_ACTOR_PATTERN = re.compile(r"^uid:([0-9]+):")
 _INVALID_DUPLICATE_PAGE = re.compile(r"(?:^|-)p0(?:-|$)")
 _QUALITY_REASON_CODES = frozenset(cast(tuple[str, ...], get_args(QualityReason)))
-_REVIEW_REASON_CODES = _QUALITY_REASON_CODES | {
+_PROVENANCE_REASON_CODES = _QUALITY_REASON_CODES | {"human-review-required"}
+_REVIEW_REASON_CODES = _PROVENANCE_REASON_CODES | {
     "answer_batch",
     "answer_checked",
     "bad_layout",
@@ -359,7 +369,7 @@ class ReviewSourceLocation:
 
     page_id: int
     bbox: tuple[float, float, float, float]
-    reason_code: QualityReason
+    reason_code: ReviewProvenanceReason
     count: int = 1
 
     def __post_init__(self) -> None:
@@ -386,7 +396,7 @@ class ReviewSourceLocation:
         x0, y0, x1, y1 = self.bbox
         if not all(math.isfinite(value) for value in self.bbox) or x0 >= x1 or y0 >= y1:
             raise ReviewValidationError("source bbox must be finite and ordered")
-        _validate_quality_reason(self.reason_code)
+        _validate_provenance_reason(self.reason_code)
         if (
             isinstance(self.count, bool)
             or not isinstance(self.count, int)
@@ -560,7 +570,10 @@ class CanonicalReviewRegistry:
                             tuple[float, float, float, float],
                             tuple(float(value) for value in bbox),
                         ),
-                        reason_code=cast(QualityReason, raw_location["reason_code"]),
+                        reason_code=cast(
+                            ReviewProvenanceReason,
+                            raw_location["reason_code"],
+                        ),
                         count=raw_location["count"],
                     )
                 )
@@ -847,10 +860,10 @@ def _source_location_key(
     return (location.page_id, location.bbox, location.reason_code, location.count)
 
 
-def _validate_quality_reason(value: str) -> None:
-    if value not in _QUALITY_REASON_CODES:
+def _validate_provenance_reason(value: str) -> None:
+    if value not in _PROVENANCE_REASON_CODES:
         raise ReviewValidationError(
-            "provenance reason must be an allowlisted quality code"
+            "provenance reason must be an allowlisted review code"
         )
 
 
@@ -1225,7 +1238,10 @@ class ReviewStore:
                     float(row["x1"]),
                     float(row["y1"]),
                 ),
-                reason_code=cast(QualityReason, str(row["reason_code"])),
+                reason_code=cast(
+                    ReviewProvenanceReason,
+                    str(row["reason_code"]),
+                ),
                 count=int(row["finding_count"]),
             )
             for row in rows
@@ -1252,6 +1268,165 @@ class ReviewStore:
             (case_id,),
         ).fetchall()
         return tuple(_event_from_row(row) for row in rows)
+
+    def export_decision_snapshot(self) -> bytes:
+        """Export one canonical terminal decision view from a single DB snapshot."""
+        if self._connection.in_transaction:
+            raise ReviewConflictError("review snapshot cannot nest a transaction")
+        failure: str | None = None
+        rendered: bytes | None = None
+        try:
+            self._connection.execute("BEGIN")
+            registry_row = self._connection.execute(
+                """
+                SELECT fingerprint_sha256
+                FROM review_registry_meta
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            rows = self._connection.execute(
+                """
+                SELECT
+                    binding.case_id AS binding_case_id,
+                    binding.content_sha256 AS binding_content_sha256,
+                    decision.*
+                FROM canonical_review_bindings AS binding
+                LEFT JOIN review_cases AS decision
+                    ON decision.case_id = binding.case_id
+                    AND decision.content_sha256 = binding.content_sha256
+                ORDER BY binding.case_id
+                LIMIT ?
+                """,
+                (_MAX_DECISION_SNAPSHOT_CASES + 1,),
+            ).fetchall()
+            if len(rows) > _MAX_DECISION_SNAPSHOT_CASES:
+                raise ReviewValidationError(_SNAPSHOT_BOUNDED_ERROR)
+            event_rows = self._connection.execute(
+                """
+                SELECT *
+                FROM review_events
+                ORDER BY case_id, event_sequence
+                LIMIT ?
+                """,
+                (_MAX_DECISION_SNAPSHOT_EVENTS + 1,),
+            ).fetchall()
+            if len(event_rows) > _MAX_DECISION_SNAPSHOT_EVENTS:
+                raise ReviewValidationError(_SNAPSHOT_BOUNDED_ERROR)
+
+            case_ids = tuple(str(row["binding_case_id"]) for row in rows)
+            if (
+                registry_row is None
+                or not rows
+                or any(
+                    row["case_id"] is None
+                    or row["review_status"]
+                    not in {"search_approved", "approved", "rejected"}
+                    for row in rows
+                )
+            ):
+                raise ReviewValidationError(_SNAPSHOT_COMPLETE_ERROR)
+
+            events_by_case: dict[str, list[dict[str, object]]] = {
+                case_id: [] for case_id in case_ids
+            }
+            for event_row in event_rows:
+                case_id = str(event_row["case_id"])
+                if case_id not in events_by_case:
+                    raise ReviewValidationError(_SNAPSHOT_COMPLETE_ERROR)
+                events = events_by_case[case_id]
+                events.append(
+                    {
+                        "action": str(event_row["action"]),
+                        "actor_id": str(event_row["actor_id"]),
+                        "after_state": str(event_row["after_state"]),
+                        "batch_manifest_sha256": cast(
+                            str | None,
+                            event_row["batch_manifest_sha256"],
+                        ),
+                        "before_state": str(event_row["before_state"]),
+                        "event_id": str(event_row["event_id"]),
+                        "event_sequence": len(events) + 1,
+                        "occurred_at": str(event_row["occurred_at"]),
+                        "reason": str(event_row["reason"]),
+                        "reviewed_content_sha256": str(
+                            event_row["reviewed_content_sha256"]
+                        ),
+                    }
+                )
+
+            cases: list[dict[str, object]] = []
+            for row in rows:
+                case_id = str(row["binding_case_id"])
+                events = events_by_case[case_id]
+                if int(row["version"]) != len(events) or not events:
+                    raise ReviewValidationError(_SNAPSHOT_COMPLETE_ERROR)
+                cases.append(
+                    {
+                        "case_id": case_id,
+                        "corrections": [],
+                        "events": events,
+                        "promotion_envelope_sha256": str(row["binding_content_sha256"]),
+                        "review_record": {
+                            "answer_eligible": bool(row["answer_eligible"]),
+                            "answer_reviewer_id": cast(
+                                str | None,
+                                row["answer_reviewer_id"],
+                            ),
+                            "basis_verified": bool(row["basis_verified"]),
+                            "content_sha256": str(row["content_sha256"]),
+                            "content_verified": bool(row["content_verified"]),
+                            "critical_field_review": str(row["critical_field_review"]),
+                            "critical_reviewer_id": cast(
+                                str | None,
+                                row["critical_reviewer_id"],
+                            ),
+                            "privacy_verified": bool(row["privacy_verified"]),
+                            "review_status": str(row["review_status"]),
+                            "search_eligible": bool(row["search_eligible"]),
+                            "search_reviewer_id": cast(
+                                str | None,
+                                row["search_reviewer_id"],
+                            ),
+                            "version": int(row["version"]),
+                        },
+                    }
+                )
+            payload = {
+                "cases": cases,
+                "registry_fingerprint_sha256": str(registry_row["fingerprint_sha256"]),
+                "schema_version": _DECISION_SNAPSHOT_SCHEMA,
+            }
+            rendered = (
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+            if len(rendered) > _MAX_DECISION_SNAPSHOT_BYTES:
+                raise ReviewValidationError(_SNAPSHOT_BOUNDED_ERROR)
+        except ReviewValidationError as error:
+            candidate = str(error)
+            failure = (
+                candidate
+                if candidate in {_SNAPSHOT_BOUNDED_ERROR, _SNAPSHOT_COMPLETE_ERROR}
+                else _SNAPSHOT_INVALID_ERROR
+            )
+        except (sqlite3.Error, KeyError, TypeError, ValueError, OverflowError):
+            failure = _SNAPSHOT_INVALID_ERROR
+        finally:
+            if self._connection.in_transaction:
+                try:
+                    self._connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    failure = _SNAPSHOT_INVALID_ERROR
+        if failure is not None:
+            raise ReviewValidationError(failure) from None
+        if rendered is None:
+            raise ReviewValidationError(_SNAPSHOT_INVALID_ERROR) from None
+        return rendered
 
     def verify_critical_fields(
         self,

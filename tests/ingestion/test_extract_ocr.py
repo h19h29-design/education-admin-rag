@@ -357,6 +357,39 @@ def test_checked_in_model_lock_matches_frozen_runtime_packages() -> None:
     }
 
 
+def test_ocr_lock_accepts_only_the_reviewed_embedding_slice_extension() -> None:
+    """Catches the composite lock either breaking OCR or admitting arbitrary keys."""
+    payload = _valid_model_lock_payload()
+    checked_in = json.loads(Path("config/models.lock.json").read_text(encoding="utf-8"))
+    embedding_models = checked_in["embedding_models"]
+    assert isinstance(embedding_models, list)
+    assert len(embedding_models) == 1
+    assert isinstance(embedding_models[0], dict)
+    payload["embedding_models"] = embedding_models
+
+    lock = validate_model_lock(payload)
+
+    assert lock.language == "korean"
+    assert {model.name for model in lock.models} == {"detector", "recognizer"}
+
+    embedding_models[0]["repo_id"] = "attacker/unreviewed-model"
+    with pytest.raises(ModelLockError, match="embedding") as captured:
+        validate_model_lock(payload)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+    payload["embedding_models"] = None
+    with pytest.raises(ModelLockError, match="structure"):
+        validate_model_lock(payload)
+
+    payload["embedding_models"] = embedding_models
+    payload["unreviewed_top_level"] = []
+    with pytest.raises(ModelLockError, match="structure") as captured:
+        validate_model_lock(payload)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -1353,9 +1386,7 @@ def test_ocr_document_wrapper_revalidates_source_contract_before_open(
 ) -> None:
     """Catches a forged page-count contract reaching PDF I/O or range expansion."""
     document = _ocr_document(year=2023)
-    forged = document.model_construct(
-        **{**document.__dict__, "pdf_page_count": 10_001}
-    )
+    forged = document.model_construct(**{**document.__dict__, "pdf_page_count": 10_001})
 
     def forbidden_open(*args: object, **kwargs: object) -> object:
         del args, kwargs

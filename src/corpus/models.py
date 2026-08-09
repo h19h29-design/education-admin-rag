@@ -113,7 +113,12 @@ def _add_chunk_schema_invariants(schema: dict[str, Any]) -> None:
 class CanonicalModel(BaseModel):
     """Base class that rejects data not explicitly covered by a reviewed contract."""
 
-    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        allow_inf_nan=False,
+        hide_input_in_errors=True,
+    )
 
 
 class SourceSpan(CanonicalModel):

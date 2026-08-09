@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -271,6 +272,243 @@ def test_reason_codes_reject_value_bearing_data_before_storage(
     assert unsafe_reason not in str(event_error.value)
     with pytest.raises(ReviewNotFoundError):
         review_store.get(CASE_1)
+
+
+def test_clean_case_human_review_provenance_can_seed_the_review_store(
+    tmp_path: Path,
+) -> None:
+    """Catches clean quality results being impossible to bind for human review."""
+    location = ReviewSourceLocation(
+        page_id=13,
+        bbox=(10.0, 20.0, 100.0, 200.0),
+        reason_code="human-review-required",
+    )
+    registry = CanonicalReviewRegistry.create(
+        cases=[
+            ReviewReference(
+                case_id=CASE_1,
+                content_sha256=CONTENT_A,
+                source_locations=(location,),
+            )
+        ]
+    )
+    verified = _verified_registry(registry)
+
+    with ReviewStore(
+        tmp_path / "clean-review.sqlite3",
+        canonical_registry=verified,
+    ) as store:
+        store.register_candidate(CASE_1, content_sha256=CONTENT_A)
+        reference = store.canonical_reference(CASE_1)
+
+    assert reference.source_locations == (location,)
+
+
+def test_review_store_exports_one_canonical_terminal_decision_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Catches storage accepting caller-authored approval labels or incomplete events."""
+    registry = CanonicalReviewRegistry.create(
+        cases=[
+            ReviewReference(
+                case_id=CASE_1,
+                content_sha256=CONTENT_A,
+                source_locations=(
+                    ReviewSourceLocation(
+                        page_id=13,
+                        bbox=(10.0, 20.0, 100.0, 200.0),
+                        reason_code="human-review-required",
+                    ),
+                ),
+            )
+        ]
+    )
+    verified = _verified_registry(registry)
+    with ReviewStore(
+        tmp_path / "decision-review.sqlite3",
+        canonical_registry=verified,
+        clock=lambda: datetime(2026, 8, 8, 1, 2, 3, tzinfo=UTC),
+    ) as store:
+        _enqueue(store)
+        _search_approve(store)
+        store.approve_answer(
+            CASE_1,
+            reviewer_id="reviewer-b",
+            reviewed_content_sha256=CONTENT_A,
+            reason="answer_checked",
+            content_verified=True,
+            basis_verified=True,
+            privacy_verified=True,
+        )
+
+        first = store.export_decision_snapshot()
+        second = store.export_decision_snapshot()
+
+    assert first == second
+    payload = json.loads(first)
+    assert payload["schema_version"] == "review-decision-snapshot-v1"
+    assert payload["registry_fingerprint_sha256"] == verified.fingerprint_sha256
+    assert len(payload["cases"]) == 1
+    decision = payload["cases"][0]
+    assert decision["case_id"] == CASE_1
+    assert decision["promotion_envelope_sha256"] == CONTENT_A
+    assert "canonical_case_sha256" not in decision
+    assert decision["corrections"] == []
+    assert decision["review_record"]["review_status"] == "approved"
+    assert decision["review_record"]["version"] == len(decision["events"]) == 4
+    assert [event["action"] for event in decision["events"]] == [
+        "enqueue",
+        "verify_fields",
+        "approve_search",
+        "approve_answer",
+    ]
+
+
+def test_review_decision_snapshot_rejects_nonterminal_or_partial_registry(
+    tmp_path: Path,
+) -> None:
+    """Catches omitting unreviewed registry cases from a release snapshot."""
+    registry = CanonicalReviewRegistry.create(
+        cases=[
+            ReviewReference(
+                case_id=CASE_1,
+                content_sha256=CONTENT_A,
+                source_locations=(
+                    ReviewSourceLocation(
+                        page_id=13,
+                        bbox=(10.0, 20.0, 100.0, 200.0),
+                        reason_code="human-review-required",
+                    ),
+                ),
+            )
+        ]
+    )
+    with ReviewStore(
+        tmp_path / "partial-review.sqlite3",
+        canonical_registry=_verified_registry(registry),
+    ) as store:
+        with pytest.raises(ReviewValidationError, match="complete terminal"):
+            store.export_decision_snapshot()
+        store.register_candidate(CASE_1, content_sha256=CONTENT_A)
+        with pytest.raises(ReviewValidationError, match="complete terminal"):
+            store.export_decision_snapshot()
+
+
+def test_review_decision_snapshot_bounds_cases_events_and_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches an unbounded DB snapshot exhausting memory before validation."""
+    registry = CanonicalReviewRegistry.create(
+        cases=[
+            ReviewReference(
+                case_id=case_id,
+                content_sha256=content_hash,
+                source_locations=(
+                    ReviewSourceLocation(
+                        page_id=13,
+                        bbox=(10.0, 20.0, 100.0, 200.0),
+                        reason_code="human-review-required",
+                    ),
+                ),
+            )
+            for case_id, content_hash in (
+                (CASE_1, CONTENT_A),
+                (CASE_2, CONTENT_B),
+            )
+        ]
+    )
+    with ReviewStore(
+        tmp_path / "bounded-decision-review.sqlite3",
+        canonical_registry=_verified_registry(registry),
+    ) as store:
+        for case_id, content_hash in ((CASE_1, CONTENT_A), (CASE_2, CONTENT_B)):
+            store.register_candidate(case_id, content_sha256=content_hash)
+            store.reject(
+                case_id,
+                reviewer_id="reviewer-a",
+                reason="bad_layout",
+                reviewed_content_sha256=content_hash,
+                expected_state="machine_extracted",
+            )
+
+        monkeypatch.setattr(review_module, "_MAX_DECISION_SNAPSHOT_CASES", 1)
+        with pytest.raises(ReviewValidationError, match="bounded") as case_error:
+            store.export_decision_snapshot()
+        assert case_error.value.__cause__ is None
+        assert case_error.value.__context__ is None
+
+        monkeypatch.setattr(review_module, "_MAX_DECISION_SNAPSHOT_CASES", 2)
+        monkeypatch.setattr(review_module, "_MAX_DECISION_SNAPSHOT_EVENTS", 1)
+        with pytest.raises(ReviewValidationError, match="bounded") as event_error:
+            store.export_decision_snapshot()
+        assert event_error.value.__cause__ is None
+        assert event_error.value.__context__ is None
+
+        monkeypatch.setattr(review_module, "_MAX_DECISION_SNAPSHOT_EVENTS", 2)
+        monkeypatch.setattr(review_module, "_MAX_DECISION_SNAPSHOT_BYTES", 1)
+        with pytest.raises(ReviewValidationError, match="bounded") as byte_error:
+            store.export_decision_snapshot()
+        assert byte_error.value.__cause__ is None
+        assert byte_error.value.__context__ is None
+
+
+def test_review_decision_snapshot_sanitizes_malformed_database_rows(
+    tmp_path: Path,
+) -> None:
+    """Catches corrupt SQLite values escaping through conversion diagnostics."""
+    sentinel = "PRIVATE_DB_ROW_SENTINEL"
+    registry = CanonicalReviewRegistry.create(
+        cases=[
+            ReviewReference(
+                case_id=CASE_1,
+                content_sha256=CONTENT_A,
+                source_locations=(
+                    ReviewSourceLocation(
+                        page_id=13,
+                        bbox=(10.0, 20.0, 100.0, 200.0),
+                        reason_code="human-review-required",
+                    ),
+                ),
+            )
+        ]
+    )
+    with ReviewStore(
+        tmp_path / "malformed-decision-review.sqlite3",
+        canonical_registry=_verified_registry(registry),
+    ) as store:
+        store.register_candidate(CASE_1, content_sha256=CONTENT_A)
+        store.reject(
+            CASE_1,
+            reviewer_id="reviewer-a",
+            reason="bad_layout",
+            reviewed_content_sha256=CONTENT_A,
+            expected_state="machine_extracted",
+        )
+        store._write_authorized = True
+        try:
+            store._connection.execute("PRAGMA ignore_check_constraints = ON")
+            store._connection.execute(
+                "UPDATE review_cases SET version = ? WHERE case_id = ?",
+                (sentinel, CASE_1),
+            )
+        finally:
+            store._write_authorized = False
+
+        with pytest.raises(ReviewValidationError, match="invalid") as captured:
+            store.export_decision_snapshot()
+
+    rendered = "\n".join(
+        (
+            str(captured.value),
+            repr(captured.value),
+            repr(captured.value.__cause__),
+            repr(captured.value.__context__),
+        )
+    )
+    assert sentinel not in rendered
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
 
 
 def test_registry_fingerprint_binds_sorted_quality_provenance() -> None:

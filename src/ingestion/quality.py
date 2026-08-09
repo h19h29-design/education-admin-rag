@@ -42,6 +42,7 @@ QualityReason: TypeAlias = Literal[
     "unsupported-edition-year",
     "year-extraction-policy-mismatch",
 ]
+ReviewProvenanceReason: TypeAlias = QualityReason | Literal["human-review-required"]
 
 _RELEASE_ID_RE = re.compile(
     r"^corpus-(?P<timestamp>[0-9]{14})-(?P<git_sha>[0-9a-f]{8})$"

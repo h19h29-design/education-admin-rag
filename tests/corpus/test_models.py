@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import traceback
 from datetime import UTC, date, datetime, timedelta, timezone
 from itertools import product
 from pathlib import Path
@@ -32,6 +33,24 @@ def _span() -> dict[str, object]:
         "bbox": (126.0, 341.0, 1064.0, 1498.0),
         "text_sha256": "a" * 64,
     }
+
+
+def test_canonical_validation_errors_hide_rejected_source_values(
+    case_payload: dict[str, object],
+) -> None:
+    """Catches canonical model diagnostics retaining rejected corpus content."""
+    sentinel = "PRIVATE-CANONICAL-SOURCE-SENTINEL"
+    payload = {**case_payload, "extraction_confidence": sentinel}
+
+    with pytest.raises(ValidationError) as captured:
+        Case.model_validate(payload)
+
+    disclosed = (
+        str(captured.value)
+        + repr(captured.value)
+        + "".join(traceback.format_exception(captured.value))
+    )
+    assert sentinel not in disclosed
 
 
 def _law_ref_payload(**updates: object) -> dict[str, object]:

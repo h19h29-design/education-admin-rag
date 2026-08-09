@@ -743,6 +743,28 @@ def validate_model_lock(payload: object) -> ModelLock:
     """Validate the complete lock before any model or network operation."""
     if not isinstance(payload, dict):
         raise ModelLockError("invalid model lock structure")
+    required_keys = {"schema_version", "language", "packages", "models"}
+    if set(payload) not in (required_keys, required_keys | {"embedding_models"}):
+        raise ModelLockError("invalid model lock structure")
+    if "embedding_models" in payload and (
+        not isinstance(payload["embedding_models"], list)
+        or len(payload["embedding_models"]) != 1
+        or not isinstance(payload["embedding_models"][0], dict)
+    ):
+        raise ModelLockError("invalid model lock structure")
+    if "embedding_models" in payload:
+        from src.corpus.chunking import (
+            ChunkingError,
+            validate_embedding_model_lock,
+        )
+
+        embedding_lock_valid = True
+        try:
+            validate_embedding_model_lock(payload)
+        except ChunkingError:
+            embedding_lock_valid = False
+        if not embedding_lock_valid:
+            raise ModelLockError("invalid embedding model lock structure") from None
     if payload.get("schema_version") != 1:
         raise ModelLockError("model lock schema version must be 1")
     if payload.get("language") != "korean":
@@ -805,15 +827,15 @@ def validate_model_lock(payload: object) -> ModelLock:
             paths.add(path)
             _checked_sha256(file_payload.get("sha256"))
 
-    normalized_payload = dict(payload)
+    normalized_payload = {key: payload[key] for key in required_keys}
     normalized_payload["models"] = tuple(
         {**model_payload, "files": tuple(model_payload["files"])}
         for model_payload in models_payload
     )
     try:
         return ModelLock.model_validate(normalized_payload)
-    except ValidationError as error:
-        raise ModelLockError("invalid model lock structure") from error
+    except ValidationError:
+        raise ModelLockError("invalid model lock structure") from None
 
 
 def load_model_lock(path: Path) -> ModelLock:
