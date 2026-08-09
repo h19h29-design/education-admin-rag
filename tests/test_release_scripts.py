@@ -23,6 +23,7 @@ from src.release import (
     assemble_release_verification_evidence,
     create_backup_manifest,
     create_index_release_evidence,
+    create_restore_attestation,
     create_verification_attestation,
     load_backup_tool_lock,
     materialize_backup_restore,
@@ -143,6 +144,41 @@ def test_materialize_restore_rehashes_stable_canonical_and_snapshot_bytes(
         hashlib.sha256((output / "qdrant.snapshot").read_bytes()).hexdigest()
         == (expected["qdrant/qdrant.snapshot"])
     )
+
+
+def test_restore_attestation_binds_backup_restored_bytes_and_green_evaluation(
+    tmp_path: Path,
+) -> None:
+    bundle = tmp_path / "bundle"
+    _backup_payload(bundle)
+    manifest = create_backup_manifest(bundle, release_id=RELEASE_ID)
+    restored = materialize_backup_restore(bundle, tmp_path / "restore")
+    gold = _gold()
+    retrieval = _retrieval(gold)
+    report = build_release_evaluation_report(
+        release_id=RELEASE_ID,
+        canonical_database_sha256=hashlib.sha256(
+            (restored / "canonical.sqlite3").read_bytes()
+        ).hexdigest(),
+        gold_items=gold,
+        ingestion_observations=_ingestion(gold),
+        retrieval_observations={
+            system: retrieval for system in ("substring", "lexical", "dense", "hybrid")
+        },
+    )
+    report_path = tmp_path / "restore-evaluation.json"
+    report_path.write_bytes(canonical_release_evaluation_bytes(report))
+
+    attestation = create_restore_attestation(
+        bundle,
+        restored,
+        report_path,
+        output=tmp_path / "restore-attestation.json",
+        expected_release_id=RELEASE_ID,
+    )
+
+    assert attestation.kind == "restore"
+    assert attestation.bundle_sha256 == manifest.bundle_sha256
 
 
 def test_start_release_writes_only_minimal_mode_0600_environment(
@@ -323,6 +359,7 @@ def test_release_evidence_is_derived_from_canonical_index_and_evaluation_bytes(
     retrieval = _retrieval(gold)
     evaluation = build_release_evaluation_report(
         release_id=RELEASE_ID,
+        canonical_database_sha256=canonical.database_sha256,
         gold_items=gold,
         ingestion_observations=_ingestion(gold),
         retrieval_observations={

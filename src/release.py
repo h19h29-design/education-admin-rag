@@ -432,6 +432,67 @@ def create_verification_attestation(
     return attestation
 
 
+def create_restore_attestation(
+    bundle_root: Path,
+    restored_root: Path,
+    evaluation_report: Path,
+    *,
+    output: Path,
+    expected_release_id: str,
+) -> ReleaseAttestation:
+    """Attest only a green evaluation of exact, isolated restored bytes."""
+    if (
+        not all(
+            isinstance(path, Path)
+            for path in (bundle_root, restored_root, evaluation_report, output)
+        )
+        or type(expected_release_id) is not str
+        or _RELEASE_RE.fullmatch(expected_release_id) is None
+    ):
+        _raise("restore_evidence_invalid")
+    manifest = verify_backup_manifest(bundle_root)
+    evaluation = _load_exact_evaluation(evaluation_report)
+    try:
+        nodes = {path.name for path in restored_root.iterdir()}
+    except OSError:
+        nodes = set()
+    canonical = _backup_file_digest(restored_root, "canonical.sqlite3")
+    qdrant = _backup_file_digest(restored_root, "qdrant.snapshot")
+    expected = {entry.path: entry for entry in manifest.files}
+    if (
+        manifest.release_id != expected_release_id
+        or evaluation is None
+        or evaluation.release_id != expected_release_id
+        or not evaluation.ingestion_gate
+        or not evaluation.retrieval_gate
+        or nodes != {"canonical.sqlite3", "qdrant.snapshot"}
+        or canonical is None
+        or qdrant is None
+        or canonical.size != expected["canonical/canonical.sqlite3"].size
+        or qdrant.size != expected["qdrant/qdrant.snapshot"].size
+        or not hmac.compare_digest(
+            canonical.sha256,
+            expected["canonical/canonical.sqlite3"].sha256,
+        )
+        or not hmac.compare_digest(
+            qdrant.sha256,
+            expected["qdrant/qdrant.snapshot"].sha256,
+        )
+        or not hmac.compare_digest(
+            evaluation.canonical_database_sha256,
+            canonical.sha256,
+        )
+    ):
+        _raise("restore_evidence_invalid")
+    attestation = ReleaseAttestation(
+        kind="restore",
+        release_id=expected_release_id,
+        bundle_sha256=manifest.bundle_sha256,
+    )
+    write_release_attestation(output, attestation)
+    return attestation
+
+
 def _checked_existing_roots(roots: tuple[Path, Path, Path]) -> tuple[Path, ...] | None:
     checked: list[Path] = []
     try:
@@ -1136,6 +1197,7 @@ def assemble_release_verification_evidence(
         or manifest.release_id != expected_release_id
         or index_evidence.release_id != expected_release_id
         or evaluation.release_id != expected_release_id
+        or evaluation.canonical_database_sha256 != database_sha256
         or build_release != expected_release_id
         or manifest.database_sha256 != database_sha256
         or index_evidence.canonical_database_sha256 != database_sha256

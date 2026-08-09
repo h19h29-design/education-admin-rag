@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -39,6 +40,7 @@ _SYSTEMS = ("substring", "lexical", "dense", "hybrid")
 _MAX_OBSERVATION_BYTES = 16 * 1024 * 1024
 _MAX_OBSERVATION_LINE_BYTES = 64 * 1024
 _MAX_CANONICAL_CASES = 1_000_000
+_MAX_CANONICAL_DATABASE_BYTES = 2 * 1024 * 1024 * 1024
 _ObservationT = TypeVar("_ObservationT", IngestionObservation, RetrievalObservation)
 
 
@@ -112,6 +114,7 @@ class ReleaseEvaluationReport(_ReportModel):
         "sen-qa-release-evaluation/v1"
     )
     release_id: str = Field(pattern=r"^corpus-[0-9]{14}-[0-9a-f]{8}$")
+    canonical_database_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     gold_items: Literal[200]
     blind_items: Literal[60]
     ingestion_gate: bool
@@ -412,6 +415,7 @@ def _expected_ocr_group(item: ReleaseGoldItem) -> str:
 def build_release_evaluation_report(
     *,
     release_id: str,
+    canonical_database_sha256: str,
     gold_items: object,
     ingestion_observations: object,
     retrieval_observations: object,
@@ -420,6 +424,8 @@ def build_release_evaluation_report(
     if (
         type(release_id) is not str
         or _RELEASE_RE.fullmatch(release_id) is None
+        or type(canonical_database_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", canonical_database_sha256) is None
         or type(gold_items) is not tuple
         or len(gold_items) != 200
         or type(ingestion_observations) is not tuple
@@ -492,6 +498,7 @@ def build_release_evaluation_report(
         )
         return ReleaseEvaluationReport(
             release_id=release_id,
+            canonical_database_sha256=canonical_database_sha256,
             gold_items=200,
             blind_items=60,
             ingestion_gate=ingestion_release_ready(ingestion_metrics),
@@ -631,6 +638,56 @@ def _write_new_report(path: object, payload: bytes) -> None:
         _raise("evaluation_report_write_failed")
 
 
+def _stable_file_sha256(path: Path, *, max_bytes: int) -> str | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    failed = False
+    digest = hashlib.sha256()
+    try:
+        descriptor = os.open(path, flags)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > max_bytes
+        ):
+            return None
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1_048_576))
+            if not chunk:
+                failed = True
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        if os.read(descriptor, 1) or (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            failed = True
+    except OSError:
+        failed = True
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                failed = True
+    return None if failed else digest.hexdigest()
+
+
 def create_release_evaluation_report(
     *,
     release_id: str,
@@ -643,7 +700,16 @@ def create_release_evaluation_report(
     output: Path,
 ) -> ReleaseEvaluationReport:
     """Evaluate exact on-disk release evidence and publish aggregates only."""
+    database_sha256 = _stable_file_sha256(
+        canonical_database,
+        max_bytes=_MAX_CANONICAL_DATABASE_BYTES,
+    )
     canonical_evidence = load_canonical_evidence(canonical_database)
+    if database_sha256 is None or database_sha256 != _stable_file_sha256(
+        canonical_database,
+        max_bytes=_MAX_CANONICAL_DATABASE_BYTES,
+    ):
+        _raise("evaluation_canonical_invalid")
     gold = load_release_goldsets(
         dev_gold,
         blind_gold,
@@ -652,6 +718,7 @@ def create_release_evaluation_report(
     )
     report = build_release_evaluation_report(
         release_id=release_id,
+        canonical_database_sha256=database_sha256,
         gold_items=gold,
         ingestion_observations=load_ingestion_observations(ingestion_path),
         retrieval_observations=load_retrieval_observations(retrieval_paths),

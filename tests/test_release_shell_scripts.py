@@ -184,7 +184,9 @@ def test_runbooks_preserve_predeployment_blockers_and_no_fake_keys() -> None:
     assert "stage=review_pending" in index_runbook
     assert "index-attestation.json" in index_runbook
     assert "qdrant_alias_broker_required" in index_runbook
-    assert "restore_evaluation_driver_required" in backup_runbook
+    assert "stage=restore_pending" in backup_runbook
+    assert "create-restore-attestation" in backup_runbook
+    assert "restore_evaluation_driver_required" not in backup_runbook
     assert "age1" not in recipients
     assert "AGE-SECRET-KEY" not in recipients
 
@@ -196,6 +198,17 @@ def test_evaluation_script_runs_gold_bound_aggregate_evaluator() -> None:
     assert "evaluate-release-evidence" in script
     assert "evaluation_observations_missing" in script
     assert "retrieval_evaluation_driver_required" not in script
+
+
+def test_restore_script_separates_materialization_from_measured_attestation() -> None:
+    script = Path("scripts/restore-release.sh").read_text(encoding="utf-8")
+
+    assert "stage=restore_pending" in script
+    assert "evaluate-release-evidence" in script
+    assert "create-restore-attestation" in script
+    assert "stage=restore_attested" in script
+    assert "restore_evaluation_driver_required" not in script
+    assert "qdrant_alias" not in script
 
 
 def test_verification_script_derives_evidence_before_signing() -> None:

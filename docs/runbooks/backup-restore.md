@@ -54,17 +54,35 @@ beside, not inside, the bundle to avoid a self-referential hash.
 ```bash
 export SEN_QA_ATTESTATION_PUBLIC_KEY_FILE=/operator/minisign-release.pub
 export SEN_QA_BACKUP_IDENTITY_FILE=/offline/education-admin-backup.agekey
-bash scripts/restore-release.sh /EXTERNAL/BACKUP-ROOT
+bash scripts/restore-release.sh /EXTERNAL/BACKUP-ROOT materialize
 ```
 
 Restore verifies the minisign signature and rehashes every bundle byte before
 decrypting. Blind labels go only to a new mode-0700
 `private-eval/restore/$SEN_QA_RELEASE_ID` directory. Canonical SQLite and the
 Qdrant snapshot go to a new artifact restore namespace. No current alias is
-touched.
+touched. Success prints `stage=restore_pending`; this is not a deployable or
+promotable state.
 
-The script deliberately exits with `restore_evaluation_driver_required` after
-materialization. A complete release requires the same 200-question evaluation
-in that isolated namespace and a signed restore attestation with the exact
-backup bundle SHA. Until that driver and the real SME gold set exist, promotion
-is blocked.
+Restore the Qdrant snapshot into a new, isolated collection namespace and run
+the same 200-question ingestion/retrieval drivers against the restored SQLite
+and collection. Write only the five owner-only observation JSONL files
+(`ingestion`, `substring`, `lexical`, `dense`, and `hybrid`) to a new private
+observation directory. Use the reviewed SME gold files; never synthesize gold
+or observations to satisfy the gate. Then bind those measurements to the exact
+restored database and backup manifest and sign the resulting attestation:
+
+```bash
+export SEN_QA_RESTORE_DEV_GOLD_FILE=/approved/retrieval-dev.jsonl
+export SEN_QA_RESTORE_BLIND_GOLD_FILE=/approved/retrieval-blind.jsonl
+export SEN_QA_RESTORE_OBSERVATION_ROOT=/private/restore-observations/$SEN_QA_RELEASE_ID
+export SEN_QA_ATTESTATION_SECRET_KEY_FILE=/offline/minisign-release.key
+bash scripts/restore-release.sh /EXTERNAL/BACKUP-ROOT attest
+```
+
+The attestation phase recomputes both restored payload hashes, requires both
+evaluation gates to be green, binds the evaluation report to the restored
+canonical database SHA-256 through the `create-restore-attestation` command,
+and signs `restore.json`. Success prints
+`stage=restore_attested`. The script never changes the current Qdrant alias;
+promotion remains a separate operator action.

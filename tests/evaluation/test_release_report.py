@@ -101,6 +101,7 @@ def test_release_report_binds_all_200_gold_items_and_emits_aggregates_only() -> 
 
     report = build_release_evaluation_report(
         release_id=RELEASE_ID,
+        canonical_database_sha256="a" * 64,
         gold_items=gold,
         ingestion_observations=_ingestion(gold),
         retrieval_observations={
@@ -116,6 +117,7 @@ def test_release_report_binds_all_200_gold_items_and_emits_aggregates_only() -> 
     assert report.ingestion_gate is True
     assert report.retrieval_gate is True
     assert payload["schema_version"] == "sen-qa-release-evaluation/v1"
+    assert payload["canonical_database_sha256"] == "a" * 64
     assert '"item_id":' not in rendered.decode("ascii")
     assert '"question":' not in rendered.decode("ascii")
 
@@ -129,6 +131,7 @@ def test_release_report_rejects_observations_with_self_asserted_gold_labels() ->
     with pytest.raises(ReleaseReportError, match="evaluation_observations_invalid"):
         build_release_evaluation_report(
             release_id=RELEASE_ID,
+            canonical_database_sha256="a" * 64,
             gold_items=gold,
             ingestion_observations=_ingestion(gold),
             retrieval_observations={

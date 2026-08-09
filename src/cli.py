@@ -81,6 +81,7 @@ from src.release import (
     assemble_release_verification_evidence,
     create_backup_manifest,
     create_index_release_evidence,
+    create_restore_attestation,
     create_verification_attestation,
     load_storage_policy,
     materialize_backup_restore,
@@ -350,6 +351,38 @@ def create_verification_attestation_command(
         pass
     if attestation is None:
         typer.echo("failed=1 error_code=release_evidence_invalid")
+        raise SystemExit(1) from None
+    typer.echo(f"bundle_sha256={attestation.bundle_sha256} failed=0")
+
+
+@app.command("create-restore-attestation")
+def create_restore_attestation_command(
+    bundle_root: Path = typer.Option(  # noqa: B008
+        ..., "--bundle-root", exists=True, file_okay=False, readable=True
+    ),
+    restored_root: Path = typer.Option(  # noqa: B008
+        ..., "--restored-root", exists=True, file_okay=False, readable=True
+    ),
+    evaluation_report: Path = typer.Option(  # noqa: B008
+        ..., "--evaluation-report", exists=True, dir_okay=False, readable=True
+    ),
+    output: Path = typer.Option(..., "--output", dir_okay=False),  # noqa: B008
+    release_id: str = typer.Option(..., "--release-id"),
+) -> None:
+    """Attest exact restored bytes only after isolated evaluation is green."""
+    attestation = None
+    try:
+        attestation = create_restore_attestation(
+            bundle_root,
+            restored_root,
+            evaluation_report,
+            output=output,
+            expected_release_id=release_id,
+        )
+    except (ReleaseError, OSError, TypeError, ValueError):
+        pass
+    if attestation is None:
+        typer.echo("failed=1 error_code=restore_evidence_invalid")
         raise SystemExit(1) from None
     typer.echo(f"bundle_sha256={attestation.bundle_sha256} failed=0")
 

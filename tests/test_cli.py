@@ -143,6 +143,66 @@ def test_evaluate_release_cli_passes_exact_evidence_paths_and_reports_gates(
     }
 
 
+def test_create_restore_attestation_cli_binds_exact_restore_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    restored = tmp_path / "restored"
+    bundle.mkdir()
+    restored.mkdir()
+    report = tmp_path / "evaluation-report.json"
+    report.write_bytes(b"evaluation")
+    output = tmp_path / "restore-attestation.json"
+    captured: dict[str, object] = {}
+
+    def fake_create(
+        bundle_root: Path,
+        restored_root: Path,
+        evaluation_report: Path,
+        *,
+        output: Path,
+        expected_release_id: str,
+    ) -> SimpleNamespace:
+        captured.update(
+            {
+                "bundle_root": bundle_root,
+                "restored_root": restored_root,
+                "evaluation_report": evaluation_report,
+                "output": output,
+                "expected_release_id": expected_release_id,
+            }
+        )
+        return SimpleNamespace(bundle_sha256="a" * 64)
+
+    monkeypatch.setattr(cli_module, "create_restore_attestation", fake_create)
+    result = CliRunner().invoke(
+        app,
+        [
+            "create-restore-attestation",
+            "--bundle-root",
+            str(bundle),
+            "--restored-root",
+            str(restored),
+            "--evaluation-report",
+            str(report),
+            "--output",
+            str(output),
+            "--release-id",
+            "corpus-20250808123456-deadbeef",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == f"bundle_sha256={'a' * 64} failed=0"
+    assert captured == {
+        "bundle_root": bundle,
+        "restored_root": restored,
+        "evaluation_report": report,
+        "output": output,
+        "expected_release_id": "corpus-20250808123456-deadbeef",
+    }
+
+
 def test_assemble_release_evidence_cli_uses_measured_artifacts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
