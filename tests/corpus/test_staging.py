@@ -10,6 +10,7 @@ from src.corpus import staging as staging_module
 from src.corpus.models import SourceSpan
 from src.corpus.staging import (
     StagingError,
+    export_review_ready,
     prepare_review_batch,
     prepare_review_corpus_from_artifacts,
     write_review_package,
@@ -362,3 +363,65 @@ def test_target_fragment_is_bound_into_question_authority() -> None:
         "question",
         "question",
     ]
+
+
+def test_review_ready_export_requires_terminal_store_and_binds_snapshot(
+    tmp_path: Path,
+) -> None:
+    result, pages = _parsed()
+    batch = prepare_review_batch(
+        document=_document(),
+        result=result,
+        pages=pages,
+        parser_authority_sha256=hashlib.sha256(b"parser").hexdigest(),
+        raw_authority_sha256=hashlib.sha256(b"raw").hexdigest(),
+        ingestion_version="ingestion-v1",
+    )
+    package = write_review_package(tmp_path, release_id=RELEASE_ID, batch=batch)
+
+    with pytest.raises(StagingError, match="review_not_ready"):
+        export_review_ready(
+            package,
+            release_id=RELEASE_ID,
+            expected_registry_sha256=batch.registry.fingerprint_sha256,
+        )
+    case = batch.cases[0]
+    content_sha256 = batch.envelopes[0].fingerprint_sha256
+    with ReviewStore(package / "review.sqlite3") as store:
+        store.verify_critical_fields(
+            case.case_id,
+            reviewer_id="reviewer-critical",
+            reviewed_content_sha256=content_sha256,
+            reason="fields_checked",
+        )
+        store.approve_search(
+            case.case_id,
+            reviewer_id="reviewer-critical",
+            reviewed_content_sha256=content_sha256,
+            reason="search_checked",
+        )
+        store.approve_answer(
+            case.case_id,
+            reviewer_id="reviewer-answer",
+            reviewed_content_sha256=content_sha256,
+            reason="answer_checked",
+            content_verified=True,
+            basis_verified=True,
+            privacy_verified=True,
+        )
+
+    attestation = export_review_ready(
+        package,
+        release_id=RELEASE_ID,
+        expected_registry_sha256=batch.registry.fingerprint_sha256,
+    )
+
+    assert attestation == package / "review-ready.attestation.json"
+    assert (package / "review-decision-snapshot.json").is_file()
+    assert (attestation.stat().st_mode & 0o777) == 0o600
+    with pytest.raises(StagingError, match="review_attestation_exists"):
+        export_review_ready(
+            package,
+            release_id=RELEASE_ID,
+            expected_registry_sha256=batch.registry.fingerprint_sha256,
+        )

@@ -24,6 +24,7 @@ from src.corpus.chunking import (
 from src.corpus.models import Case, CaseRelation, Chunk, Document, LawRef
 from src.corpus.staging import (
     StagingError,
+    export_review_ready,
     prepare_review_corpus_from_artifacts,
     write_review_package,
 )
@@ -905,6 +906,27 @@ def review_assert_ready(
     )
     if not report.ready:
         raise typer.Exit(code=1)
+
+
+@review_app.command("export-ready")
+def review_export_ready(
+    package: Path = typer.Option(  # noqa: B008
+        ..., "--package", exists=True, file_okay=False, readable=True, writable=True
+    ),
+    release_id: str = typer.Option(..., "--release-id"),
+    registry_sha256: str = typer.Option(..., "--registry-sha256"),
+) -> None:
+    """Export a terminal decision snapshot and value-free ready attestation."""
+    try:
+        export_review_ready(
+            package,
+            release_id=release_id,
+            expected_registry_sha256=registry_sha256,
+        )
+    except (OSError, StagingError, TypeError, ValueError):
+        typer.echo("ready=0 failed=1 error_code=review_export_failed")
+        raise SystemExit(1) from None
+    typer.echo("ready=1 failed=0")
 
 
 @app.command("verify-sources")

@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 from collections import Counter
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
@@ -17,7 +18,11 @@ from typing import NoReturn, cast
 from src.corpus.chunking import ChunkRole, RoleSource, role_source_manifest_bytes
 from src.corpus.ids import make_case_id
 from src.corpus.models import Case, Document, SourceSpan
-from src.corpus.storage import VerifiedPromotionEnvelope, load_promotion_envelope
+from src.corpus.storage import (
+    VerifiedPromotionEnvelope,
+    load_promotion_envelope,
+    load_review_decision_snapshot,
+)
 from src.ingestion.extract_common import revalidate_source_document
 from src.ingestion.manifest import SourceDocument, load_manifest
 from src.ingestion.parse_common import (
@@ -33,6 +38,7 @@ from src.ingestion.privacy import classify_privacy, scan_text
 from src.ingestion.quality import QualityAssessment, QualityFinding, assess_case
 from src.ingestion.review import (
     CanonicalReviewRegistry,
+    ReviewError,
     ReviewReference,
     ReviewSourceLocation,
     ReviewStore,
@@ -44,6 +50,7 @@ _RELEASE_ID_RE = re.compile(r"^corpus-[0-9]{14}-[0-9a-f]{8}$")
 _INGESTION_VERSION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 _MAX_CASES = 10_000
 _MAX_LINES = 250_000
+_MAX_REVIEW_FILE_BYTES = 16 * 1024 * 1024
 
 
 class StagingError(ValueError):
@@ -860,6 +867,43 @@ def _write_private(path: Path, data: bytes) -> None:
         os.close(descriptor)
 
 
+def _read_private(
+    path: Path, *, max_bytes: int = _MAX_REVIEW_FILE_BYTES
+) -> bytes | None:
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+            return None
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if len(raw) > max_bytes or (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            return None
+        return raw
+    except OSError:
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _revalidate_batch(value: object) -> PreparedReviewBatch | None:
     if type(value) is not PreparedReviewBatch:
         return None
@@ -1151,3 +1195,153 @@ def write_review_package(root: Path, *, release_id: str, batch: object) -> Path:
     except (KeyError, OSError, sqlite3.Error, TypeError, ValueError):
         code = "staging_write_failed"
     _raise(code or "staging_write_failed")
+
+
+def _export_review_ready(
+    package: Path,
+    *,
+    release_id: str,
+    expected_registry_sha256: str,
+) -> Path:
+    if (
+        not isinstance(package, Path)
+        or not package.is_dir()
+        or package.is_symlink()
+        or not _RELEASE_ID_RE.fullmatch(release_id)
+        or not _SHA256_RE.fullmatch(expected_registry_sha256)
+    ):
+        _raise("review_export_invalid")
+    attestation_path = package / "review-ready.attestation.json"
+    snapshot_path = package / "review-decision-snapshot.json"
+    if attestation_path.exists() or attestation_path.is_symlink():
+        _raise("review_attestation_exists")
+    registry_raw = _read_private(package / "registry.json")
+    if registry_raw is None:
+        _raise("review_export_invalid")
+    try:
+        registry = CanonicalReviewRegistry.from_bytes(
+            registry_raw,
+            expected_sha256=expected_registry_sha256,
+        )
+    except (TypeError, ValueError):
+        _raise("review_export_invalid")
+    candidate_directory = package / "candidates"
+    if not candidate_directory.is_dir() or candidate_directory.is_symlink():
+        _raise("review_export_invalid")
+    expected_names = {f"{reference.case_id}.json" for reference in registry.cases}
+    try:
+        actual_names = {path.name for path in candidate_directory.iterdir()}
+    except OSError:
+        _raise("review_export_invalid")
+    if actual_names != expected_names:
+        _raise("review_export_invalid")
+    envelope_hashes: dict[str, str] = {}
+    for reference in registry.cases:
+        raw = _read_private(candidate_directory / f"{reference.case_id}.json")
+        if raw is None:
+            _raise("review_export_invalid")
+        try:
+            envelope = load_promotion_envelope(
+                raw,
+                expected_sha256=reference.content_sha256,
+            )
+        except (TypeError, ValueError):
+            _raise("review_export_invalid")
+        if envelope.candidate_case.case_id != reference.case_id:
+            _raise("review_export_invalid")
+        envelope_hashes[reference.case_id] = envelope.fingerprint_sha256
+    try:
+        with ReviewStore(package / "review.sqlite3") as store:
+            snapshot_raw = store.export_decision_snapshot()
+    except (OSError, ReviewError, sqlite3.Error):
+        _raise("review_not_ready")
+    snapshot_sha256 = hashlib.sha256(snapshot_raw).hexdigest()
+    try:
+        snapshot = load_review_decision_snapshot(
+            snapshot_raw,
+            expected_sha256=snapshot_sha256,
+        )
+    except (TypeError, ValueError):
+        _raise("review_export_invalid")
+    snapshot_bindings = {
+        case.case_id: case.promotion_envelope_sha256 for case in snapshot.cases
+    }
+    if (
+        snapshot.registry_fingerprint_sha256 != expected_registry_sha256
+        or snapshot_bindings != envelope_hashes
+    ):
+        _raise("review_export_invalid")
+    existing_snapshot = _read_private(snapshot_path)
+    if existing_snapshot is None:
+        _write_private(snapshot_path, snapshot_raw)
+    elif existing_snapshot != snapshot_raw:
+        _raise("review_export_invalid")
+    candidate_binding_bytes = json.dumps(
+        envelope_hashes,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    statuses = tuple(
+        cast(str, case.review_record["review_status"]) for case in snapshot.cases
+    )
+    attestation = {
+        "approved_count": statuses.count("approved"),
+        "candidate_binding_sha256": hashlib.sha256(candidate_binding_bytes).hexdigest(),
+        "case_count": len(snapshot.cases),
+        "registry_sha256": expected_registry_sha256,
+        "rejected_count": statuses.count("rejected"),
+        "release_id": release_id,
+        "schema_version": "sen-qa-review-ready-attestation/v1",
+        "snapshot_sha256": snapshot_sha256,
+    }
+    _write_private(
+        attestation_path,
+        (
+            json.dumps(
+                attestation,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("ascii"),
+    )
+    os.chmod(snapshot_path, 0o600)
+    os.chmod(attestation_path, 0o600)
+    directory_fd = os.open(package, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return attestation_path
+
+
+def export_review_ready(
+    package: Path,
+    *,
+    release_id: str,
+    expected_registry_sha256: str,
+) -> Path:
+    """Export the terminal review snapshot and its final commit marker."""
+    code: str | None = None
+    try:
+        return _export_review_ready(
+            package,
+            release_id=release_id,
+            expected_registry_sha256=expected_registry_sha256,
+        )
+    except StagingError as error:
+        code = (
+            str(error)
+            if str(error)
+            in {
+                "review_attestation_exists",
+                "review_export_invalid",
+                "review_not_ready",
+            }
+            else "review_export_invalid"
+        )
+    except (KeyError, OSError, sqlite3.Error, TypeError, ValueError):
+        code = "review_export_invalid"
+    _raise(code or "review_export_invalid")

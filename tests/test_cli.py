@@ -1149,6 +1149,37 @@ def test_stage_review_corpus_cli_reports_only_counts_and_registry_hash(
     )
 
 
+def test_review_export_ready_cli_is_value_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "review"
+    package.mkdir()
+    monkeypatch.setattr(
+        cli_module,
+        "export_review_ready",
+        lambda *_args, **_kwargs: package / "review-ready.attestation.json",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "review",
+            "export-ready",
+            "--package",
+            str(package),
+            "--release-id",
+            "corpus-20250808123456-deadbeef",
+            "--registry-sha256",
+            "f" * 64,
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert result.stdout.strip() == "ready=1 failed=0"
+
+
 def test_parse_metadata_cli_errors_are_fixed_and_source_value_free(
     tmp_path: Path,
 ) -> None:
