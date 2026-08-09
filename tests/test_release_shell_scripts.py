@@ -186,3 +186,12 @@ def test_runbooks_preserve_predeployment_blockers_and_no_fake_keys() -> None:
     assert "restore_evaluation_driver_required" in backup_runbook
     assert "age1" not in recipients
     assert "AGE-SECRET-KEY" not in recipients
+
+
+def test_evaluation_script_runs_gold_bound_aggregate_evaluator() -> None:
+    """Catches replacement of measured evaluation with a generic TODO blocker."""
+    script = Path("scripts/evaluate-release.sh").read_text(encoding="utf-8")
+
+    assert "evaluate-release-evidence" in script
+    assert "evaluation_observations_missing" in script
+    assert "retrieval_evaluation_driver_required" not in script

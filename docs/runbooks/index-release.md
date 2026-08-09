@@ -84,11 +84,16 @@ These code gaps are pre-deployment blockers, not operator override points.
 
 ## Evaluation and verification
 
-`evaluate-release.sh` fails unless both checked-in public gold files and the
-private blind label file exist. It currently stops at
-`retrieval_evaluation_driver_required`; no synthetic labels or partial question
-set may satisfy this gate. `verify-release.sh` similarly requires canonical,
-index, and evaluation evidence and never promotes an alias.
+`evaluate-release.sh` requires both checked-in public gold files, the private
+blind label file, the canonical database, and exactly 200 owner-only JSONL
+observations for ingestion, substring, lexical, dense, and hybrid retrieval at
+`$SEN_QA_PRIVATE_EVAL_ROOT/observations/$SEN_QA_RELEASE_ID/`. Missing files stop
+at `evaluation_observations_missing`. The evaluator rebinds every observation
+to the reviewed gold labels and canonical source-span evidence, writes only
+aggregate metrics, and fails when either release gate is red. Synthetic labels,
+partial question sets, symlinks, or group-readable private observations cannot
+satisfy this gate. `verify-release.sh` similarly requires canonical, index, and
+evaluation evidence and never promotes an alias.
 
 Only after a real evaluator driver produces canonical `release-evidence.json`
 with all ingestion/retrieval/privacy and latency gates may

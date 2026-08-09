@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 
 import src.cli as cli_module
 from src.cli import app
+from src.evaluation.release_report import ReleaseEvaluationReport
 from src.ingestion.review import (
     CanonicalReviewRegistry,
     ReviewReference,
@@ -66,6 +67,77 @@ def test_cli_reports_version() -> None:
     result = CliRunner().invoke(app, ["version"])
     assert result.exit_code == 0
     assert result.stdout.strip() == "education-admin-rag 0.1.0"
+
+
+def test_evaluate_release_cli_passes_exact_evidence_paths_and_reports_gates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = tuple(
+        tmp_path / name
+        for name in (
+            "canonical.sqlite3",
+            "dev.jsonl",
+            "blind.jsonl",
+            "labels.jsonl",
+            "ingestion.jsonl",
+            "substring.jsonl",
+            "lexical.jsonl",
+            "dense.jsonl",
+            "hybrid.jsonl",
+        )
+    )
+    for path in inputs:
+        path.write_bytes(b"evidence")
+    output = tmp_path / "evaluation-report.json"
+    captured: dict[str, object] = {}
+
+    def fake_create(**kwargs: object) -> ReleaseEvaluationReport:
+        captured.update(kwargs)
+        return ReleaseEvaluationReport.model_construct(
+            gold_items=200,
+            blind_items=60,
+            ingestion_gate=True,
+            retrieval_gate=True,
+        )
+
+    monkeypatch.setattr(
+        cli_module,
+        "create_release_evaluation_report",
+        fake_create,
+    )
+    option_names = (
+        "canonical-db",
+        "dev-gold",
+        "blind-gold",
+        "blind-labels",
+        "ingestion-observations",
+        "substring-observations",
+        "lexical-observations",
+        "dense-observations",
+        "hybrid-observations",
+    )
+    arguments = [
+        "evaluate-release-evidence",
+        "--release-id",
+        "corpus-20250808123456-deadbeef",
+    ]
+    for option, path in zip(option_names, inputs, strict=True):
+        arguments.extend((f"--{option}", str(path)))
+    arguments.extend(("--output", str(output)))
+
+    result = CliRunner().invoke(app, arguments)
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == (
+        "gold_items=200 blind_items=60 ingestion_gate=1 retrieval_gate=1 failed=0"
+    )
+    assert captured["canonical_database"] == inputs[0]
+    assert captured["retrieval_paths"] == {
+        system: path
+        for system, path in zip(
+            ("substring", "lexical", "dense", "hybrid"), inputs[5:], strict=True
+        )
+    }
 
 
 def test_module_entrypoint_reports_version() -> None:

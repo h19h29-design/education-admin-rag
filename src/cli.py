@@ -22,6 +22,11 @@ from src.corpus.chunking import (
     verify_embedding_cache,
 )
 from src.corpus.models import Case, CaseRelation, Chunk, Document, LawRef
+from src.evaluation.goldset import GoldsetError
+from src.evaluation.release_report import (
+    ReleaseReportError,
+    create_release_evaluation_report,
+)
 from src.ingestion.extract_native import (
     NativeExtractionError,
     extract_document,
@@ -329,6 +334,79 @@ def create_verification_attestation_command(
         typer.echo("failed=1 error_code=release_evidence_invalid")
         raise SystemExit(1) from None
     typer.echo(f"bundle_sha256={attestation.bundle_sha256} failed=0")
+
+
+@app.command("evaluate-release-evidence")
+def evaluate_release_evidence_command(
+    release_id: str = typer.Option(..., "--release-id"),
+    canonical_database: Path = typer.Option(  # noqa: B008
+        ..., "--canonical-db", exists=True, dir_okay=False, readable=True
+    ),
+    dev_gold: Path = typer.Option(  # noqa: B008
+        ..., "--dev-gold", exists=True, dir_okay=False, readable=True
+    ),
+    blind_gold: Path = typer.Option(  # noqa: B008
+        ..., "--blind-gold", exists=True, dir_okay=False, readable=True
+    ),
+    blind_labels: Path = typer.Option(  # noqa: B008
+        ..., "--blind-labels", exists=True, dir_okay=False, readable=True
+    ),
+    ingestion_observations: Path = typer.Option(  # noqa: B008
+        ..., "--ingestion-observations", exists=True, dir_okay=False, readable=True
+    ),
+    substring_observations: Path = typer.Option(  # noqa: B008
+        ..., "--substring-observations", exists=True, dir_okay=False, readable=True
+    ),
+    lexical_observations: Path = typer.Option(  # noqa: B008
+        ..., "--lexical-observations", exists=True, dir_okay=False, readable=True
+    ),
+    dense_observations: Path = typer.Option(  # noqa: B008
+        ..., "--dense-observations", exists=True, dir_okay=False, readable=True
+    ),
+    hybrid_observations: Path = typer.Option(  # noqa: B008
+        ..., "--hybrid-observations", exists=True, dir_okay=False, readable=True
+    ),
+    output: Path = typer.Option(..., "--output", dir_okay=False),  # noqa: B008
+) -> None:
+    """Bind exact gold and canonical evidence into an aggregate-only report."""
+    report = None
+    try:
+        report = create_release_evaluation_report(
+            release_id=release_id,
+            canonical_database=canonical_database,
+            dev_gold=dev_gold,
+            blind_gold=blind_gold,
+            blind_labels=blind_labels,
+            ingestion_path=ingestion_observations,
+            retrieval_paths={
+                "substring": substring_observations,
+                "lexical": lexical_observations,
+                "dense": dense_observations,
+                "hybrid": hybrid_observations,
+            },
+            output=output,
+        )
+    except (
+        GoldsetError,
+        ReleaseReportError,
+        OSError,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+    ):
+        pass
+    if report is None:
+        typer.echo("failed=1 error_code=evaluation_evidence_invalid")
+        raise SystemExit(1) from None
+    summary = (
+        f"gold_items={report.gold_items} blind_items={report.blind_items} "
+        f"ingestion_gate={int(report.ingestion_gate)} "
+        f"retrieval_gate={int(report.retrieval_gate)}"
+    )
+    if not report.ingestion_gate or not report.retrieval_gate:
+        typer.echo(f"{summary} failed=1 error_code=evaluation_gate_failed")
+        raise SystemExit(1) from None
+    typer.echo(f"{summary} failed=0")
 
 
 @app.command("inspect-lexical-plan")
