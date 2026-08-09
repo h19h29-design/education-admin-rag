@@ -28,6 +28,7 @@ from src.corpus.chunking import (
     load_locked_tokenizer,
     revalidate_verified_chunk_set,
     role_source_manifest_bytes,
+    tokenizer_runtime_fingerprint_sha256,
     validate_embedding_model_lock,
     verify_embedding_cache,
     verify_role_sources,
@@ -284,6 +285,21 @@ def test_locked_tokenizer_loads_verified_json_bytes_without_path_reopen(
     assert tokenizer.detokenize(("fixture-token",)) == "fixture"
     assert tokenizer.model_name == "BAAI/bge-m3"
     assert tokenizer.revision == _REVISION
+
+
+def test_tokenizer_runtime_fingerprint_binds_lock_bytes_and_image_digest() -> None:
+    first = tokenizer_runtime_fingerprint_sha256(
+        b"lock-v1\n", indexer_image_digest="sha256:" + "a" * 64
+    )
+    second = tokenizer_runtime_fingerprint_sha256(
+        b"lock-v2\n", indexer_image_digest="sha256:" + "a" * 64
+    )
+    third = tokenizer_runtime_fingerprint_sha256(
+        b"lock-v1\n", indexer_image_digest="sha256:" + "b" * 64
+    )
+
+    assert len(first) == 64
+    assert len({first, second, third}) == 3
 
 
 def test_embedding_cache_rejects_missing_extra_symlink_size_and_hash(

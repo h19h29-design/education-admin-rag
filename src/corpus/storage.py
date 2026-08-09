@@ -875,6 +875,14 @@ class IssuanceHead:
     authority_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class IssuanceSnapshot:
+    """One integrity-checked read snapshot of the cross-release authority."""
+
+    head: IssuanceHead
+    records: tuple[IssuedCaseRecord, ...]
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class StorageProjectionReceipt:
     """Capability binding one published canonical DB to an issuance projection."""
@@ -1330,6 +1338,30 @@ def read_issuance_head(path: Path) -> IssuanceHead:
         if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             _raise("issuance registry is invalid")
         return _read_head(connection)
+    except sqlite3.Error:
+        failed = True
+    finally:
+        if connection is not None:
+            connection.close()
+    if failed:
+        _raise("cannot read issuance registry")
+    _raise("cannot read issuance registry")
+
+
+def read_issuance_snapshot(path: Path) -> IssuanceSnapshot:
+    """Read the head and issued-case projection in one SQLite snapshot."""
+    stable_path = _require_regular_database(path, max_bytes=_MAX_DATABASE_BYTES)
+    connection: sqlite3.Connection | None = None
+    failed = False
+    try:
+        connection = sqlite3.connect(_sqlite_uri(stable_path, mode="ro"), uri=True)
+        if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            _raise("issuance registry is invalid")
+        connection.execute("BEGIN")
+        head = _read_head(connection)
+        records = _issuance_records(connection)
+        connection.execute("ROLLBACK")
+        return IssuanceSnapshot(head=head, records=records)
     except sqlite3.Error:
         failed = True
     finally:

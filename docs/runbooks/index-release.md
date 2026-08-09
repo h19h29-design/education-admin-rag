@@ -13,6 +13,9 @@ or copy example values into production:
 - the reviewer group GID and the current reviewer's real UID;
 - digest-qualified ingestion, indexer, backup, and permission-probe images;
 - the independently reviewed canonical registry and review decision snapshot;
+- the SHA-256 of the final `review-ready.attestation.json`, captured after review;
+- the exact offline BGE-M3 cache root, embedding lock fingerprint, and tokenizer
+  runtime fingerprint bound to `uv.lock` plus the digest-qualified indexer image;
 - the public 140-question development set, public 60 blind questions, and the
   private 60 blind labels approved by SMEs;
 - the offline attestation public key and an operator-only signing key path.
@@ -86,6 +89,50 @@ production alias.
 
 Human review and the separately persisted ready attestation remain mandatory
 pre-deployment checkpoints, not operator override points.
+
+After every case is terminal, export the checkpoint and capture its hashes
+without printing any candidate content:
+
+```bash
+python -m src.cli review export-ready \
+  --package "$SEN_QA_ARTIFACT_ROOT/releases/$SEN_QA_RELEASE_ID/review" \
+  --release-id "$SEN_QA_RELEASE_ID" \
+  --registry-sha256 "$SEN_QA_REVIEW_REGISTRY_SHA256"
+export SEN_QA_READY_ATTESTATION_SHA256="$(shasum -a 256 \
+  "$SEN_QA_ARTIFACT_ROOT/releases/$SEN_QA_RELEASE_ID/review/review-ready.attestation.json" \
+  | awk '{print $1}')"
+```
+
+An independent operator supplies `SEN_QA_REVIEW_REGISTRY_SHA256`,
+`SEN_QA_EMBEDDING_MODEL_LOCK_SHA256`, `SEN_QA_RUNTIME_FINGERPRINT_SHA256`, and
+the absolute, nonsymlink `SEN_QA_MODEL_CACHE_ROOT`. The runtime fingerprint is
+the reviewed domain-separated SHA-256 over the exact `uv.lock` digest and the
+digest portion of `SEN_QA_INDEXER_IMAGE`; do not substitute a hostname, tag, or
+wall-clock value. Derive it with the checked-in implementation and independently
+record the result:
+
+```bash
+export SEN_QA_RUNTIME_FINGERPRINT_SHA256="$(uv run python -c \
+  'import os; from pathlib import Path; from src.corpus.chunking import tokenizer_runtime_fingerprint_sha256 as f; print(f(Path("uv.lock").read_bytes(), indexer_image_digest=os.environ["SEN_QA_INDEXER_IMAGE"].rsplit("@", 1)[1]))')"
+```
+
+The finalizer recomputes this value from `/work/uv.lock` inside the pinned
+indexer image before reading the review package. For the first release only, explicitly set
+`SEN_QA_INITIALIZE_ISSUANCE_GENESIS=1`; subsequent releases must reuse the
+existing owner-only issuance registry and leave that variable unset. Then run:
+
+```bash
+bash scripts/finalize-corpus.sh
+unset SEN_QA_INITIALIZE_ISSUANCE_GENESIS
+```
+
+`finalize-corpus.sh` revalidates the attested documents, manifest/page counts,
+registry, terminal snapshot, every promotion envelope, role-source authority,
+locked tokenizer bytes, and persistent issuance predecessor. It derives final
+review-controlled Case fields and chunks internally, writes SQLite plus JSONL
+through the atomic canonical builder, and stops at `stage=canonical_ready`.
+It does not start Qdrant, build an index, upload anything, or mutate a
+production alias. `build-indexes.sh` is the next explicit pre-deployment step.
 
 ## Evaluation and verification
 

@@ -193,6 +193,7 @@ def build_canonical_bundle(
     expected_runtime_fingerprint_sha256: str,
     embedding_model_lock: object,
     embedding_model_root: Path,
+    bundle_directory_name: str | None = None,
 ) -> CanonicalBuildResult:
     """Build, publish, and issue one complete canonical bundle."""
     totals = _quarantine_totals(batch)
@@ -205,6 +206,16 @@ def build_canonical_bundle(
         or not isinstance(diagnostics_root, Path)
         or not isinstance(issuance_registry_path, Path)
         or not isinstance(embedding_model_root, Path)
+        or (
+            bundle_directory_name is not None
+            and (
+                not isinstance(bundle_directory_name, str)
+                or re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", bundle_directory_name
+                )
+                is None
+            )
+        )
     ):
         _raise("canonical build input is invalid")
     tokenizer_cache_invalid = False
@@ -237,7 +248,7 @@ def build_canonical_bundle(
             failed_pages=failed_pages,
         )
         _raise("canonical build requires complete nonquarantined coverage")
-    target = output_root / batch.release_id
+    target = output_root / (bundle_directory_name or batch.release_id)
     if target.exists() or target.is_symlink():
         _raise("canonical bundle target already exists")
     temporary = Path(

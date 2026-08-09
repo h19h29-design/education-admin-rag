@@ -46,6 +46,7 @@ from src.corpus.storage import (
     load_promotion_envelope,
     load_review_decision_snapshot,
     read_issuance_head,
+    read_issuance_snapshot,
     write_canonical_storage,
 )
 from src.corpus.storage import (
@@ -437,6 +438,18 @@ def _registry(path: Path) -> object:
         expected_genesis_sha256=GENESIS_ISSUANCE_AUTHORITY_SHA256,
     )
     return read_issuance_head(path)
+
+
+def test_issuance_snapshot_exposes_one_authoritative_head_and_records(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "issuance.sqlite3"
+    head = _registry(path)
+
+    snapshot = read_issuance_snapshot(path)
+
+    assert snapshot.head == head
+    assert snapshot.records == ()
 
 
 def _write(

@@ -725,6 +725,28 @@ _MAX_CHUNKS_PER_CASE = 50_000
 _OVERLAP_RATIO = 0.12
 
 
+def tokenizer_runtime_fingerprint_sha256(
+    runtime_lock_bytes: bytes,
+    *,
+    indexer_image_digest: str,
+) -> str:
+    """Bind tokenizer implementation bytes to the immutable runtime image."""
+    if (
+        type(runtime_lock_bytes) is not bytes
+        or not runtime_lock_bytes
+        or len(runtime_lock_bytes) > 16 * 1024 * 1024
+        or not isinstance(indexer_image_digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", indexer_image_digest) is None
+    ):
+        _raise("tokenizer runtime authority is invalid")
+    return hashlib.sha256(
+        b"sen-qa-tokenizer-runtime-v1\0"
+        + hashlib.sha256(runtime_lock_bytes).digest()
+        + b"\0"
+        + indexer_image_digest.encode("ascii")
+    ).hexdigest()
+
+
 def tokenizer_contract(
     lock: object,
     *,

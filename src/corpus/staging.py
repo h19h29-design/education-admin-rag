@@ -1181,6 +1181,7 @@ def _write_review_package(root: Path, *, release_id: str, batch: object) -> Path
                 for doc_id, count in sorted(approved_batch.document_page_counts.items())
             },
             "manifest_sha256": approved_batch.manifest_sha256,
+            "parser_quarantine_count": approved_batch.quarantine_count,
             "parser_authority_sha256": approved_batch.parser_authority_sha256,
             "raw_authority_sha256": approved_batch.raw_authority_sha256,
             "schema_version": "sen-qa-ingestion-evidence/v1",
@@ -1330,7 +1331,9 @@ def _export_review_ready(
     if attestation_path.exists() or attestation_path.is_symlink():
         _raise("review_attestation_exists")
     registry_raw = _read_private(package / "registry.json")
-    if registry_raw is None:
+    documents_raw = _read_private(package / "documents.json")
+    evidence_raw = _read_private(package / "ingestion-evidence.json")
+    if registry_raw is None or documents_raw is None or evidence_raw is None:
         _raise("review_export_invalid")
     try:
         registry = CanonicalReviewRegistry.from_bytes(
@@ -1403,6 +1406,8 @@ def _export_review_ready(
         "approved_count": statuses.count("approved"),
         "candidate_binding_sha256": hashlib.sha256(candidate_binding_bytes).hexdigest(),
         "case_count": len(snapshot.cases),
+        "documents_sha256": hashlib.sha256(documents_raw).hexdigest(),
+        "ingestion_evidence_sha256": hashlib.sha256(evidence_raw).hexdigest(),
         "registry_sha256": expected_registry_sha256,
         "rejected_count": statuses.count("rejected"),
         "release_id": release_id,

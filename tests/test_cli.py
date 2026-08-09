@@ -5,6 +5,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import typer
@@ -1178,6 +1179,75 @@ def test_review_export_ready_cli_is_value_free(
     assert result.exit_code == 0
     assert result.stderr == ""
     assert result.stdout.strip() == "ready=1 failed=0"
+
+
+def test_build_canonical_corpus_cli_emits_only_release_hashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "review"
+    package.mkdir()
+    model_root = tmp_path / "models"
+    model_root.mkdir()
+    lock_path = tmp_path / "models.lock.json"
+    lock_path.write_bytes(b"{}\n")
+    runtime_lock = tmp_path / "uv.lock"
+    runtime_lock.write_bytes(b"runtime\n")
+    lock = object()
+    monkeypatch.setattr(cli_module, "load_embedding_model_lock", lambda _path: lock)
+    monkeypatch.setattr(
+        cli_module,
+        "finalize_review_ready_bundle",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            release_id="corpus-20250808123456-deadbeef",
+            canonical_content_sha256="a" * 64,
+            bundle_sha256="b" * 64,
+            issuance_generation=1,
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "build-canonical-corpus",
+            "--package",
+            str(package),
+            "--release-root",
+            str(tmp_path / "release"),
+            "--diagnostics-root",
+            str(tmp_path / "diagnostics"),
+            "--issuance-registry",
+            str(tmp_path / "issuance.sqlite3"),
+            "--release-id",
+            "corpus-20250808123456-deadbeef",
+            "--ready-attestation-sha256",
+            "c" * 64,
+            "--registry-sha256",
+            "d" * 64,
+            "--model-lock",
+            str(lock_path),
+            "--model-root",
+            str(model_root),
+            "--model-lock-sha256",
+            "e" * 64,
+            "--runtime-fingerprint-sha256",
+            "f" * 64,
+            "--runtime-lock",
+            str(runtime_lock),
+            "--indexer-image-digest",
+            "sha256:" + "2" * 64,
+            "--container-image",
+            "sha256:" + "1" * 64,
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "release_id=corpus-20250808123456-deadbeef "
+        f"canonical_content_sha256={'a' * 64} bundle_sha256={'b' * 64} "
+        "issuance_generation=1 failed=0"
+    )
 
 
 def test_parse_metadata_cli_errors_are_fixed_and_source_value_free(

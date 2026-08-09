@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
 
 from src.corpus import staging as staging_module
+from src.corpus.chunking import (
+    BGE_M3_REQUIRED_PATHS,
+    TOKENIZER_REQUIRED_PATHS,
+    tokenizer_runtime_fingerprint_sha256,
+    validate_embedding_model_lock,
+)
+from src.corpus.finalize import FinalizationError, finalize_review_ready_bundle
 from src.corpus.models import SourceSpan
 from src.corpus.staging import (
     StagingError,
@@ -15,6 +24,10 @@ from src.corpus.staging import (
     prepare_review_batch,
     prepare_review_corpus_from_artifacts,
     write_review_package,
+)
+from src.corpus.storage import (
+    GENESIS_ISSUANCE_AUTHORITY_SHA256,
+    initialize_issuance_registry,
 )
 from src.ingestion.extract_common import LayoutEvidence
 from src.ingestion.manifest import PageNumberingPolicy, PageSizeProfile, SourceDocument
@@ -29,6 +42,7 @@ from src.ingestion.parse_metadata import VerifiedParseRun
 from src.ingestion.review import ReviewStore
 
 RELEASE_ID = "corpus-20250808123456-deadbeef"
+_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 
 
 def _span(text: str, *, y: float) -> SourceSpan:
@@ -217,6 +231,7 @@ def test_review_package_is_owner_only_no_clobber_and_enqueues_every_case(
         "fixture-2023": {"failed": 0, "quarantined": 0, "succeeded": 1}
     }
     assert evidence["manifest_sha256"] == batch.manifest_sha256
+    assert evidence["parser_quarantine_count"] == 0
     assert evidence["schema_version"] == "sen-qa-ingestion-evidence/v1"
     assert ((package / "documents.json").stat().st_mode & 0o777) == 0o600
     assert ((package / "ingestion-evidence.json").stat().st_mode & 0o777) == 0o600
@@ -436,6 +451,17 @@ def test_review_ready_export_requires_terminal_store_and_binds_snapshot(
 
     assert attestation == package / "review-ready.attestation.json"
     assert (package / "review-decision-snapshot.json").is_file()
+    attestation_payload = json.loads(attestation.read_text())
+    assert (
+        attestation_payload["documents_sha256"]
+        == hashlib.sha256((package / "documents.json").read_bytes()).hexdigest()
+    )
+    assert (
+        attestation_payload["ingestion_evidence_sha256"]
+        == hashlib.sha256(
+            (package / "ingestion-evidence.json").read_bytes()
+        ).hexdigest()
+    )
     assert (attestation.stat().st_mode & 0o777) == 0o600
     with pytest.raises(StagingError, match="review_attestation_exists"):
         export_review_ready(
@@ -443,3 +469,169 @@ def test_review_ready_export_requires_terminal_store_and_binds_snapshot(
             release_id=RELEASE_ID,
             expected_registry_sha256=batch.registry.fingerprint_sha256,
         )
+
+
+def test_review_ready_package_builds_one_atomic_canonical_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, pages = _parsed()
+    batch = prepare_review_batch(
+        document=_document(),
+        result=result,
+        pages=pages,
+        parser_authority_sha256=hashlib.sha256(b"parser").hexdigest(),
+        raw_authority_sha256=hashlib.sha256(b"raw").hexdigest(),
+        ingestion_version="image-" + "e" * 64,
+    )
+    package = write_review_package(tmp_path, release_id=RELEASE_ID, batch=batch)
+    case = batch.cases[0]
+    envelope_sha256 = batch.envelopes[0].fingerprint_sha256
+    with ReviewStore(package / "review.sqlite3") as store:
+        store.verify_critical_fields(
+            case.case_id,
+            reviewer_id="reviewer-critical",
+            reviewed_content_sha256=envelope_sha256,
+            reason="fields_checked",
+        )
+        store.approve_search(
+            case.case_id,
+            reviewer_id="reviewer-critical",
+            reviewed_content_sha256=envelope_sha256,
+            reason="search_checked",
+        )
+        store.approve_answer(
+            case.case_id,
+            reviewer_id="reviewer-answer",
+            reviewed_content_sha256=envelope_sha256,
+            reason="answer_checked",
+            content_verified=True,
+            basis_verified=True,
+            privacy_verified=True,
+        )
+    attestation = export_review_ready(
+        package,
+        release_id=RELEASE_ID,
+        expected_registry_sha256=batch.registry.fingerprint_sha256,
+    )
+
+    def cache_bytes(path: str) -> bytes:
+        return f"fixture:{path}".encode()
+
+    lock = validate_embedding_model_lock(
+        {
+            "schema_version": 1,
+            "language": "korean",
+            "packages": {},
+            "models": [],
+            "embedding_models": [
+                {
+                    "repo_id": "BAAI/bge-m3",
+                    "revision": _REVISION,
+                    "files": [
+                        {
+                            "path": path,
+                            "sha256": hashlib.sha256(cache_bytes(path)).hexdigest(),
+                            "size": len(cache_bytes(path)),
+                            "source_url": (
+                                "https://huggingface.co/BAAI/bge-m3/resolve/"
+                                f"{_REVISION}/{path}"
+                            ),
+                        }
+                        for path in BGE_M3_REQUIRED_PATHS
+                    ],
+                }
+            ],
+        }
+    )
+    cache = tmp_path / "tokenizer-cache"
+    for path in TOKENIZER_REQUIRED_PATHS:
+        target = cache / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(cache_bytes(path))
+
+    class Backend:
+        def encode(self, text: str, *, add_special_tokens: bool) -> object:
+            assert not add_special_tokens
+            return SimpleNamespace(
+                tokens=tuple(text),
+                offsets=tuple((index, index + 1) for index in range(len(text))),
+            )
+
+        def token_to_id(self, token: str) -> int:
+            return ord(token)
+
+        def decode(self, ids: list[int], *, skip_special_tokens: bool) -> str:
+            assert not skip_special_tokens
+            return "".join(chr(item) for item in ids)
+
+    class TokenizerFactory:
+        @staticmethod
+        def from_str(_raw: str) -> Backend:
+            return Backend()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenizers",
+        SimpleNamespace(Tokenizer=TokenizerFactory),
+    )
+    issuance = tmp_path / "issuance" / "registry.sqlite3"
+    issuance.parent.mkdir(mode=0o700)
+    initialize_issuance_registry(
+        issuance,
+        expected_genesis_sha256=GENESIS_ISSUANCE_AUTHORITY_SHA256,
+    )
+    runtime_lock = tmp_path / "uv.lock"
+    runtime_lock.write_bytes(b"runtime-lock\n")
+    indexer_image_digest = "sha256:" + "2" * 64
+    runtime_sha256 = tokenizer_runtime_fingerprint_sha256(
+        runtime_lock.read_bytes(),
+        indexer_image_digest=indexer_image_digest,
+    )
+
+    with pytest.raises(
+        FinalizationError, match="review_ready_attestation_invalid"
+    ) as rejected:
+        finalize_review_ready_bundle(
+            package,
+            tmp_path / "release",
+            tmp_path / "diagnostics",
+            issuance,
+            release_id=RELEASE_ID,
+            expected_ready_attestation_sha256="0" * 64,
+            expected_registry_sha256=batch.registry.fingerprint_sha256,
+            expected_model_lock_sha256=lock.fingerprint_sha256,
+            expected_runtime_fingerprint_sha256=runtime_sha256,
+            container_image="sha256:" + "e" * 64,
+            runtime_lock_path=runtime_lock,
+            indexer_image_digest=indexer_image_digest,
+            embedding_model_lock=lock,
+            embedding_model_root=cache,
+        )
+    assert rejected.value.__cause__ is None
+    assert rejected.value.__context__ is None
+    assert not (tmp_path / "release" / "canonical").exists()
+
+    built = finalize_review_ready_bundle(
+        package,
+        tmp_path / "release",
+        tmp_path / "diagnostics",
+        issuance,
+        release_id=RELEASE_ID,
+        expected_ready_attestation_sha256=hashlib.sha256(
+            attestation.read_bytes()
+        ).hexdigest(),
+        expected_registry_sha256=batch.registry.fingerprint_sha256,
+        expected_model_lock_sha256=lock.fingerprint_sha256,
+        expected_runtime_fingerprint_sha256=runtime_sha256,
+        container_image="sha256:" + "e" * 64,
+        runtime_lock_path=runtime_lock,
+        indexer_image_digest=indexer_image_digest,
+        embedding_model_lock=lock,
+        embedding_model_root=cache,
+    )
+
+    assert built.bundle_path == tmp_path / "release" / "canonical"
+    assert (built.bundle_path / "canonical.sqlite3").is_file()
+    assert (built.bundle_path / "manifest.json").is_file()
+    assert built.issuance_generation == 1

@@ -21,12 +21,17 @@ from src.corpus.chunking import (
     load_embedding_model_lock,
     verify_embedding_cache,
 )
+from src.corpus.finalize import FinalizationError, finalize_review_ready_bundle
 from src.corpus.models import Case, CaseRelation, Chunk, Document, LawRef
 from src.corpus.staging import (
     StagingError,
     export_review_ready,
     prepare_review_corpus_from_artifacts,
     write_review_package,
+)
+from src.corpus.storage import (
+    GENESIS_ISSUANCE_AUTHORITY_SHA256,
+    initialize_issuance_registry,
 )
 from src.evaluation.goldset import GoldsetError
 from src.evaluation.release_report import (
@@ -1355,6 +1360,70 @@ def stage_review_corpus(
     typer.echo(
         f"cases={len(batch.cases)} quarantines={batch.quarantine_count} "
         f"registry_sha256={batch.registry.fingerprint_sha256} failed=0"
+    )
+
+
+@app.command("build-canonical-corpus")
+def build_canonical_corpus(
+    package: Path = typer.Option(  # noqa: B008
+        ..., "--package", exists=True, file_okay=False, readable=True
+    ),
+    release_root: Path = typer.Option(..., "--release-root"),  # noqa: B008
+    diagnostics_root: Path = typer.Option(..., "--diagnostics-root"),  # noqa: B008
+    issuance_registry: Path = typer.Option(..., "--issuance-registry"),  # noqa: B008
+    release_id: str = typer.Option(..., "--release-id"),
+    ready_attestation_sha256: str = typer.Option(..., "--ready-attestation-sha256"),
+    registry_sha256: str = typer.Option(..., "--registry-sha256"),
+    model_lock: Path = typer.Option(  # noqa: B008
+        ..., "--model-lock", exists=True, dir_okay=False, readable=True
+    ),
+    model_root: Path = typer.Option(  # noqa: B008
+        ..., "--model-root", exists=True, file_okay=False, readable=True
+    ),
+    model_lock_sha256: str = typer.Option(..., "--model-lock-sha256"),
+    runtime_fingerprint_sha256: str = typer.Option(..., "--runtime-fingerprint-sha256"),
+    runtime_lock: Path = typer.Option(  # noqa: B008
+        ..., "--runtime-lock", exists=True, dir_okay=False, readable=True
+    ),
+    indexer_image_digest: str = typer.Option(..., "--indexer-image-digest"),
+    container_image: str = typer.Option(..., "--container-image"),
+    initialize_genesis: bool = typer.Option(False, "--initialize-genesis"),
+) -> None:
+    """Build and issue one reviewed canonical bundle; never deploy or promote it."""
+    result = None
+    try:
+        if initialize_genesis:
+            initialize_issuance_registry(
+                issuance_registry,
+                expected_genesis_sha256=GENESIS_ISSUANCE_AUTHORITY_SHA256,
+            )
+        lock = load_embedding_model_lock(model_lock)
+        result = finalize_review_ready_bundle(
+            package,
+            release_root,
+            diagnostics_root,
+            issuance_registry,
+            release_id=release_id,
+            expected_ready_attestation_sha256=ready_attestation_sha256,
+            expected_registry_sha256=registry_sha256,
+            expected_model_lock_sha256=model_lock_sha256,
+            expected_runtime_fingerprint_sha256=runtime_fingerprint_sha256,
+            container_image=container_image,
+            runtime_lock_path=runtime_lock,
+            indexer_image_digest=indexer_image_digest,
+            embedding_model_lock=lock,
+            embedding_model_root=model_root,
+        )
+    except (ChunkingError, FinalizationError, OSError, TypeError, ValueError):
+        result = None
+    if result is None:
+        typer.echo("failed=1 error_code=canonical_build_failed")
+        raise SystemExit(1) from None
+    typer.echo(
+        f"release_id={result.release_id} "
+        f"canonical_content_sha256={result.canonical_content_sha256} "
+        f"bundle_sha256={result.bundle_sha256} "
+        f"issuance_generation={result.issuance_generation} failed=0"
     )
 
 

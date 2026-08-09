@@ -8,6 +8,7 @@ import pytest
 
 SCRIPTS = (
     "build-corpus.sh",
+    "finalize-corpus.sh",
     "build-indexes.sh",
     "evaluate-release.sh",
     "verify-release.sh",
@@ -223,3 +224,14 @@ def test_corpus_script_stages_review_registry_before_stopping() -> None:
     assert "--input-root /sen-qa/artifacts/raw-pages" in script
     assert "stage=review_pending failed=0" in script
     assert "candidate_review_bridge_required" not in script
+
+
+def test_finalize_script_requires_external_review_and_runtime_pins() -> None:
+    script = Path("scripts/finalize-corpus.sh").read_text(encoding="utf-8")
+
+    assert "build-canonical-corpus" in script
+    assert "SEN_QA_READY_ATTESTATION_SHA256" in script
+    assert "SEN_QA_REVIEW_REGISTRY_SHA256" in script
+    assert "SEN_QA_RUNTIME_FINGERPRINT_SHA256" in script
+    assert "--network none" in script
+    assert "stage=canonical_ready failed=0" in script
