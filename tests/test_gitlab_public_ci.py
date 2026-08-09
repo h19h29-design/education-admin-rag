@@ -6,6 +6,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".gitlab-ci.yml"
 ENTRYPOINT = ROOT / "scripts" / "ci-public-gates.sh"
+RUNBOOK = ROOT / "docs" / "runbooks" / "public-gitlab.md"
+REPORT = ROOT / "docs" / "reports" / "public-gitlab-bootstrap.md"
 
 
 def test_gitlab_pipeline_is_full_history_public_safe() -> None:
@@ -61,3 +63,34 @@ def test_public_gate_rejects_unknown_mode_without_input_echo() -> None:
     assert result.returncode == 2
     assert combined == "public_ci_gate=invalid\n"
     assert marker not in combined
+
+
+def test_public_gitlab_runbook_preserves_private_boundary() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+
+    for phrase in (
+        "Auto DevOps",
+        "public-safe",
+        "GIT_DEPTH",
+        "push mirror",
+        "NAS pull-only",
+        "원본 PDF",
+        "Runner 없음",
+        "Rollback",
+    ):
+        assert phrase in text
+
+
+def test_bootstrap_report_is_metadata_only() -> None:
+    text = REPORT.read_text(encoding="utf-8")
+
+    for key in (
+        "project_created=",
+        "project_visibility=",
+        "runner_available=",
+        "container_registry_enabled=",
+        "private_data_uploaded=",
+    ):
+        assert key in text
+    assert "/volume" not in text
+    assert "PRIVATE" not in text
