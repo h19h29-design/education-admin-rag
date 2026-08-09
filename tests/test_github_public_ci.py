@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 
 import yaml
@@ -54,3 +55,10 @@ def test_github_workflow_has_no_private_or_publishing_surface() -> None:
         "deploy",
     ):
         assert forbidden not in serialized
+
+
+def test_public_ci_declares_its_test_runtime_dependencies() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    dev_dependencies = set(project["dependency-groups"]["dev"])
+
+    assert {"pyyaml", "qdrant-client"} <= dev_dependencies

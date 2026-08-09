@@ -23,6 +23,8 @@ index = [
 dev = [
     "jsonschema",
     "mypy",
+    "pyyaml",
+    "qdrant-client",
     "pytest",
     "pytest-cov",
     "ruff",

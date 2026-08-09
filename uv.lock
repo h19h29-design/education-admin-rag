@@ -361,6 +361,8 @@ dev = [
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "pyyaml" },
+    { name = "qdrant-client" },
     { name = "ruff" },
 ]
 
@@ -382,6 +384,8 @@ dev = [
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "pyyaml" },
+    { name = "qdrant-client" },
     { name = "ruff" },
 ]
 
