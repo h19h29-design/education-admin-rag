@@ -512,6 +512,7 @@ def test_exported_schemas_are_deterministic_and_validate_payloads(
         "chunk.schema.json",
         "law-ref.schema.json",
         "case-relation.schema.json",
+        "search-result.schema.json",
     }
     assert set(first) == expected
     for name, contents in first.items():

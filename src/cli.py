@@ -60,6 +60,7 @@ from src.ingestion.review import (
 from src.retrieval.dense import DenseEncoder, DenseError
 from src.retrieval.lexical import LexicalError, LexicalIndex
 from src.retrieval.query import QueryError
+from src.retrieval.service import SearchResponse
 
 app = typer.Typer(no_args_is_help=True)
 review_app = typer.Typer(no_args_is_help=True)
@@ -875,6 +876,7 @@ _SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "chunk.schema.json": Chunk,
     "law-ref.schema.json": LawRef,
     "case-relation.schema.json": CaseRelation,
+    "search-result.schema.json": SearchResponse,
 }
 
 
