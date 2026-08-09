@@ -30,12 +30,10 @@ _RELEASE_RE = re.compile(r"^corpus-[0-9]{14}-[0-9a-f]{8}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$")
 _APPROVED_STATUSES = frozenset(("search_approved", "approved"))
-_CURRENT_ALIAS = "education-admin-current"
 _MAX_BATCH_SIZE = 256
 _MAX_TEXT_CHARACTERS = 16_384
 _MAX_POINTS_PER_CALL = 10_000
 _MAX_SOURCE_REFERENCES = 4_096
-_MAX_ALIASES = 1_024
 _POINT_NAMESPACE = uuid.UUID("4d8b3e8e-1f41-51c2-88ea-54ddf572304d")
 
 
@@ -85,12 +83,6 @@ class _DenseStore(Protocol):
         query_filter: object,
         **kwargs: object,
     ) -> object: ...
-
-    def get_aliases(self, **kwargs: object) -> object: ...
-
-    def update_collection_aliases(
-        self, operations: list[object], **kwargs: object
-    ) -> bool: ...
 
 
 def _load_sentence_transformer(model_root: Path) -> _EncoderBackend:
@@ -791,7 +783,6 @@ class DenseIndex:
             or not hmac.compare_digest(sampled_vector_sha256, expected_sample_sha256)
         ):
             _raise("sample_verification_failed")
-        self._promote_alias()
         return DenseBuildResult(
             collection_name=self.collection_name,
             release_id=self._release_id,
@@ -799,56 +790,6 @@ class DenseIndex:
             point_count=count,
             sampled_vector_sha256=sampled_vector_sha256,
         )
-
-    def _promote_alias(self) -> None:
-        failed = False
-        try:
-            response = self._client.get_aliases()
-            raw_aliases = getattr(response, "aliases", None)
-            if (
-                not isinstance(raw_aliases, (list, tuple))
-                or len(raw_aliases) > _MAX_ALIASES
-            ):
-                failed = True
-            else:
-                current_targets: list[str] = []
-                for alias in raw_aliases:
-                    alias_name = getattr(alias, "alias_name", None)
-                    collection_name = getattr(alias, "collection_name", None)
-                    if type(alias_name) is not str or type(collection_name) is not str:
-                        failed = True
-                        break
-                    if alias_name == _CURRENT_ALIAS:
-                        current_targets.append(collection_name)
-                if len(current_targets) > 1:
-                    failed = True
-                elif current_targets == [self.collection_name]:
-                    return
-                else:
-                    models = _qdrant_models()
-                    operations: list[object] = []
-                    if current_targets:
-                        operations.append(
-                            models.DeleteAliasOperation(
-                                delete_alias=models.DeleteAlias(
-                                    alias_name=_CURRENT_ALIAS
-                                )
-                            )
-                        )
-                    operations.append(
-                        models.CreateAliasOperation(
-                            create_alias=models.CreateAlias(
-                                collection_name=self.collection_name,
-                                alias_name=_CURRENT_ALIAS,
-                            )
-                        )
-                    )
-                    if self._client.update_collection_aliases(operations) is not True:
-                        failed = True
-        except (ImportError, OSError, RuntimeError, TypeError, ValueError):
-            failed = True
-        if failed:
-            _raise("alias_update_failed")
 
     def _validate_search_payload(
         self,

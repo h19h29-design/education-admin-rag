@@ -360,10 +360,10 @@ def test_dense_index_uses_versioned_collection_and_count_hash_gate() -> None:
     assert result.point_count == 1
     assert len(result.sampled_vector_sha256) == 64
     assert result.collection_name == index.collection_name
-    assert len(client.alias_operations) == 1
+    assert client.alias_operations == []
 
 
-def test_verified_collection_atomically_replaces_the_current_alias() -> None:
+def test_candidate_verification_never_replaces_the_current_alias() -> None:
     client = FakeQdrant()
     client.alias_targets["education-admin-current"] = "corpus-old-bge-m3"
     index = DenseIndex(
@@ -376,16 +376,8 @@ def test_verified_collection_atomically_replaces_the_current_alias() -> None:
 
     index.verify(expected_eligible_count=1)
 
-    assert len(client.alias_operations) == 2
-    rendered = [
-        cast(Any, operation).model_dump(mode="json")
-        for operation in client.alias_operations
-    ]
-    assert rendered[0]["delete_alias"]["alias_name"] == "education-admin-current"
-    assert rendered[1]["create_alias"] == {
-        "alias_name": "education-admin-current",
-        "collection_name": index.collection_name,
-    }
+    assert client.alias_operations == []
+    assert client.alias_targets == {"education-admin-current": "corpus-old-bge-m3"}
 
 
 @pytest.mark.parametrize(
