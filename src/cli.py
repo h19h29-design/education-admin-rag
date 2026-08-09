@@ -13,6 +13,11 @@ from typing import NoReturn, cast
 import typer
 from pydantic import BaseModel
 
+from src.corpus.chunking import (
+    ChunkingError,
+    load_embedding_model_lock,
+    verify_embedding_cache,
+)
 from src.corpus.models import Case, CaseRelation, Chunk, Document, LawRef
 from src.ingestion.extract_native import (
     NativeExtractionError,
@@ -52,6 +57,7 @@ from src.ingestion.review import (
     SegmentManifest,
     validate_review_reason,
 )
+from src.retrieval.dense import DenseEncoder, DenseError
 from src.retrieval.lexical import LexicalError, LexicalIndex
 from src.retrieval.query import QueryError
 
@@ -139,6 +145,82 @@ def inspect_lexical_plan(
         f"full_table_scan={int(plan.full_table_scan)} "
         f"restricted_candidates={plan.restricted_candidates} "
         f"plan_steps={plan.plan_steps} failed=0"
+    )
+
+
+@app.command("verify-embedding-models")
+def verify_embedding_models(
+    lock_path: Path = typer.Option(  # noqa: B008 - Typer declares CLI parameters this way.
+        Path("config/models.lock.json"), "--lock", exists=True, dir_okay=False
+    ),
+    model_root: Path = typer.Option(..., "--model-root", file_okay=False),  # noqa: B008
+    expected_lock_sha256: str = typer.Option(..., "--expected-lock-sha256"),
+) -> None:
+    """Verify the exact offline BGE-M3 runtime closure without loading the model."""
+    error_code: str | None = None
+    lock = None
+    try:
+        lock = load_embedding_model_lock(lock_path)
+        verify_embedding_cache(
+            lock,
+            model_root,
+            scope="full",
+            expected_lock_sha256=expected_lock_sha256,
+        )
+    except ChunkingError:
+        error_code = "embedding_cache_invalid"
+    except (OSError, TypeError, ValueError):
+        error_code = "embedding_verification_failed"
+    if error_code is not None or lock is None:
+        typer.echo(
+            f"failed=1 error_code={error_code or 'embedding_verification_failed'}"
+        )
+        raise SystemExit(1) from None
+    typer.echo(
+        f"models=1 files={len(lock.files)} revision={lock.revision[:8]} failed=0"
+    )
+
+
+@app.command("dense-smoke")
+def dense_smoke(
+    text: str = typer.Option(..., "--text"),
+    lock_path: Path = typer.Option(  # noqa: B008 - Typer declares CLI parameters this way.
+        Path("config/models.lock.json"), "--lock", exists=True, dir_okay=False
+    ),
+) -> None:
+    """Encode one value while emitting only normalized-vector metadata."""
+    model_root_value = os.environ.get("SEN_QA_EMBEDDING_MODEL_ROOT")
+    expected_lock_sha256 = os.environ.get("SEN_QA_EMBEDDING_LOCK_SHA256")
+    error_code: str | None = None
+    encoder = None
+    vectors: tuple[tuple[float, ...], ...] = ()
+    if model_root_value is None or expected_lock_sha256 is None:
+        error_code = "embedding_environment_invalid"
+    else:
+        try:
+            encoder = DenseEncoder.from_lock(
+                lock_path,
+                model_root=Path(model_root_value),
+                expected_lock_sha256=expected_lock_sha256,
+            )
+            vectors = encoder.encode((text,))
+        except DenseError as error:
+            error_code = error.code
+        except (OSError, RuntimeError, TypeError, ValueError):
+            error_code = "dense_smoke_failed"
+    if error_code is not None or encoder is None or len(vectors) != 1:
+        typer.echo(f"failed=1 error_code={error_code or 'dense_smoke_failed'}")
+        raise SystemExit(1) from None
+    vector = vectors[0]
+    normalized = int(
+        bool(vector) and abs(sum(value * value for value in vector) - 1.0) <= 1e-6
+    )
+    if not normalized:
+        typer.echo("failed=1 error_code=dense_smoke_failed")
+        raise SystemExit(1) from None
+    typer.echo(
+        f"vectors=1 dimension={len(vector)} normalized=1 "
+        f"revision={encoder.revision[:8]} failed=0"
     )
 
 

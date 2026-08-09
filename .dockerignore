@@ -29,6 +29,8 @@ src/**/*.py/**
 !data/manifests/sen_qa_sources.json
 !docker/ingestion.Dockerfile
 !docker/prepare_ocr_models.py
+!docker/indexer.Dockerfile
+!docker/prepare_embedding_model.py
 
 # Keep sensitive or generated file classes closed even inside an allowed tree.
 **/.git

@@ -21,6 +21,8 @@ _DOCKER_CONTEXT_EXCEPTIONS = (
     "data/manifests/sen_qa_sources.json",
     "docker/ingestion.Dockerfile",
     "docker/prepare_ocr_models.py",
+    "docker/indexer.Dockerfile",
+    "docker/prepare_embedding_model.py",
 )
 
 
