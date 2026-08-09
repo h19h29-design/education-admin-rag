@@ -3,10 +3,13 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn, cast
 
@@ -57,8 +60,18 @@ from src.ingestion.review import (
     SegmentManifest,
     validate_review_reason,
 )
+from src.release import (
+    ReleaseError,
+    create_backup_manifest,
+    create_verification_attestation,
+    load_storage_policy,
+    materialize_backup_restore,
+    prepare_backup_payload,
+    start_release_environment,
+    verify_backup_manifest,
+)
 from src.retrieval.dense import DenseEncoder, DenseError
-from src.retrieval.lexical import LexicalError, LexicalIndex
+from src.retrieval.lexical import LexicalError, LexicalIndex, build_lexical_index
 from src.retrieval.query import QueryError
 from src.retrieval.service import SearchResponse
 
@@ -78,6 +91,28 @@ def _current_os_actor() -> str:
 
 
 _review_actor_provider: Callable[[], str] = _current_os_actor
+
+
+def _current_release_time() -> datetime:
+    return datetime.now(UTC)
+
+
+def _current_git_sha() -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    value = completed.stdout.strip()
+    if completed.returncode != 0 or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None:
+        raise OSError("git revision is unavailable")
+    return value.lower()
+
+
+_release_clock_provider: Callable[[], datetime] = _current_release_time
+_release_git_sha_provider: Callable[[], str] = _current_git_sha
 
 
 def _review_actor(declared_reviewer_id: str | None) -> str:
@@ -122,6 +157,180 @@ def version() -> None:
     typer.echo("education-admin-rag 0.1.0")
 
 
+@app.command("start-release")
+def start_release(
+    source_root: Path = typer.Option(  # noqa: B008 - Typer declares CLI parameters this way.
+        ..., "--source-root", exists=True, file_okay=False
+    ),
+    artifact_root: Path = typer.Option(  # noqa: B008
+        ..., "--artifact-root", exists=True, file_okay=False
+    ),
+    private_eval_root: Path = typer.Option(  # noqa: B008
+        ..., "--private-eval-root", exists=True, file_okay=False
+    ),
+    env_file: Path = typer.Option(..., "--env-file", dir_okay=False),  # noqa: B008
+) -> None:
+    """Create one immutable release identity and minimal root envelope."""
+    environment = None
+    try:
+        environment = start_release_environment(
+            source_root=source_root,
+            artifact_root=artifact_root,
+            private_eval_root=private_eval_root,
+            env_file=env_file,
+            released_at=_release_clock_provider(),
+            git_sha=_release_git_sha_provider(),
+        )
+    except (ReleaseError, OSError, subprocess.SubprocessError, TypeError, ValueError):
+        pass
+    if environment is None:
+        typer.echo("failed=1 error_code=release_setup_failed")
+        raise SystemExit(1) from None
+    typer.echo(f"release_id={environment.release_id} failed=0")
+
+
+@app.command("backup-manifest")
+def backup_manifest(
+    root: Path = typer.Option(..., "--root", exists=True, file_okay=False),  # noqa: B008
+    release_id: str = typer.Option(..., "--release-id"),
+) -> None:
+    """Hash the exact encrypted backup payload and create its immutable manifest."""
+    manifest = None
+    try:
+        manifest = create_backup_manifest(root, release_id=release_id)
+    except (ReleaseError, OSError, TypeError, ValueError):
+        pass
+    if manifest is None:
+        typer.echo("failed=1 error_code=backup_bundle_invalid")
+        raise SystemExit(1) from None
+    typer.echo(f"bundle_sha256={manifest.bundle_sha256} failed=0")
+
+
+@app.command("prepare-backup")
+def prepare_backup(
+    output: Path = typer.Option(..., "--output", file_okay=False),  # noqa: B008
+    canonical_database: Path = typer.Option(  # noqa: B008
+        ..., "--canonical-db", exists=True, dir_okay=False, readable=True
+    ),
+    qdrant_snapshot: Path = typer.Option(  # noqa: B008
+        ..., "--qdrant-snapshot", exists=True, dir_okay=False, readable=True
+    ),
+    source_manifest: Path = typer.Option(  # noqa: B008
+        ..., "--source-manifest", exists=True, dir_okay=False, readable=True
+    ),
+    model_lock: Path = typer.Option(  # noqa: B008
+        ..., "--model-lock", exists=True, dir_okay=False, readable=True
+    ),
+    evaluation_report: Path = typer.Option(  # noqa: B008
+        ..., "--evaluation-report", exists=True, dir_okay=False, readable=True
+    ),
+) -> None:
+    """Stage a SQLite online backup and exact public release artifacts."""
+    prepared = None
+    try:
+        prepared = prepare_backup_payload(
+            output,
+            canonical_database=canonical_database,
+            qdrant_snapshot=qdrant_snapshot,
+            source_manifest=source_manifest,
+            model_lock=model_lock,
+            evaluation_report=evaluation_report,
+        )
+    except (ReleaseError, OSError, sqlite3.Error, TypeError, ValueError):
+        pass
+    if prepared is None:
+        typer.echo("failed=1 error_code=backup_payload_invalid")
+        raise SystemExit(1) from None
+    typer.echo("prepared=1 failed=0")
+
+
+@app.command("storage-policy-env")
+def storage_policy_env(
+    policy_path: Path = typer.Option(  # noqa: B008
+        ..., "--policy", exists=True, dir_okay=False, readable=True
+    ),
+) -> None:
+    """Emit only strict, shell-quoted permission-probe policy fields."""
+    policy = None
+    try:
+        policy = load_storage_policy(policy_path)
+    except (ReleaseError, OSError, TypeError, ValueError):
+        pass
+    if policy is None:
+        typer.echo("failed=1 error_code=storage_policy_invalid")
+        raise SystemExit(1) from None
+    values: tuple[tuple[str, str | int], ...] = (
+        ("SEN_QA_POLICY_INGESTION_UID", policy.ingestion_uid),
+        ("SEN_QA_POLICY_SEARCH_UID", policy.search_uid),
+        ("SEN_QA_POLICY_EVALUATOR_UID", policy.evaluator_uid),
+        ("SEN_QA_POLICY_REVIEWER_GID", policy.reviewer_gid),
+        ("SEN_QA_POLICY_SOURCE_ROOT", policy.source_root),
+        ("SEN_QA_POLICY_ARTIFACT_ROOT", policy.artifact_root),
+        ("SEN_QA_POLICY_PRIVATE_EVAL_ROOT", policy.private_eval_root),
+    )
+    for name, value in values:
+        typer.echo(f"{name}={shlex.quote(str(value))}")
+
+
+@app.command("verify-backup")
+def verify_backup(
+    root: Path = typer.Option(..., "--root", exists=True, file_okay=False),  # noqa: B008
+) -> None:
+    """Verify every byte in one encrypted backup bundle without restoring it."""
+    manifest = None
+    try:
+        manifest = verify_backup_manifest(root)
+    except (ReleaseError, OSError, TypeError, ValueError):
+        pass
+    if manifest is None:
+        typer.echo("failed=1 error_code=backup_bundle_invalid")
+        raise SystemExit(1) from None
+    typer.echo(f"bundle_sha256={manifest.bundle_sha256} failed=0")
+
+
+@app.command("materialize-backup")
+def materialize_backup(
+    root: Path = typer.Option(  # noqa: B008
+        ..., "--root", exists=True, file_okay=False, readable=True
+    ),
+    output: Path = typer.Option(..., "--output", file_okay=False),  # noqa: B008
+) -> None:
+    """Materialize stable canonical/Qdrant bytes in an isolated restore root."""
+    restored = None
+    try:
+        restored = materialize_backup_restore(root, output)
+    except (ReleaseError, OSError, TypeError, ValueError):
+        pass
+    if restored is None:
+        typer.echo("failed=1 error_code=backup_restore_invalid")
+        raise SystemExit(1) from None
+    typer.echo("materialized=1 failed=0")
+
+
+@app.command("create-verification-attestation")
+def create_verification_attestation_command(
+    evidence: Path = typer.Option(  # noqa: B008
+        ..., "--evidence", exists=True, dir_okay=False, readable=True
+    ),
+    output: Path = typer.Option(..., "--output", dir_okay=False),  # noqa: B008
+    release_id: str = typer.Option(..., "--release-id"),
+) -> None:
+    """Create an attestation only from complete, canonical green gate evidence."""
+    attestation = None
+    try:
+        attestation = create_verification_attestation(
+            evidence,
+            output=output,
+            expected_release_id=release_id,
+        )
+    except (ReleaseError, OSError, TypeError, ValueError):
+        pass
+    if attestation is None:
+        typer.echo("failed=1 error_code=release_evidence_invalid")
+        raise SystemExit(1) from None
+    typer.echo(f"bundle_sha256={attestation.bundle_sha256} failed=0")
+
+
 @app.command("inspect-lexical-plan")
 def inspect_lexical_plan(
     database: Path = typer.Option(  # noqa: B008 - Typer declares CLI parameters this way.
@@ -146,6 +355,40 @@ def inspect_lexical_plan(
         f"full_table_scan={int(plan.full_table_scan)} "
         f"restricted_candidates={plan.restricted_candidates} "
         f"plan_steps={plan.plan_steps} failed=0"
+    )
+
+
+@app.command("build-lexical-index")
+def build_lexical_index_command(
+    canonical_database: Path = typer.Option(  # noqa: B008
+        ..., "--canonical-db", exists=True, dir_okay=False, readable=True
+    ),
+    output: Path = typer.Option(..., "--output", dir_okay=False),  # noqa: B008
+    config: Path = typer.Option(  # noqa: B008
+        Path("config/retrieval.toml"),
+        "--config",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+    ),
+) -> None:
+    """Build one immutable candidate lexical index without changing production."""
+    result = None
+    try:
+        result = build_lexical_index(
+            canonical_database,
+            output,
+            config_path=config,
+        )
+    except (LexicalError, OSError, sqlite3.Error, TypeError, ValueError):
+        pass
+    if result is None:
+        typer.echo("failed=1 error_code=index_build_failed")
+        raise SystemExit(1) from None
+    typer.echo(
+        f"indexed_chunks={result.indexed_chunks} "
+        f"skipped_chunks={result.skipped_chunks} "
+        f"config_sha256={result.config_sha256} failed=0"
     )
 
 

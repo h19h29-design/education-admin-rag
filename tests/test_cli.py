@@ -1,7 +1,9 @@
 import hashlib
 import json
+import re
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -77,6 +79,152 @@ def test_module_entrypoint_reports_version() -> None:
     assert completed.stdout.strip() == "education-admin-rag 0.1.0"
 
 
+def test_start_release_cli_creates_minimal_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches the operator entrypoint omitting or expanding the trusted envelope."""
+    source_root = tmp_path / "source"
+    artifact_root = tmp_path / "artifacts"
+    private_eval_root = tmp_path / "private-eval"
+    for root in (source_root, artifact_root, private_eval_root):
+        root.mkdir()
+    env_file = artifact_root / "active-release.env"
+    monkeypatch.setattr(
+        cli_module,
+        "_release_clock_provider",
+        lambda: datetime(2025, 8, 8, 12, 34, 56, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_release_git_sha_provider",
+        lambda: "deadbeef" + "1" * 32,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "start-release",
+            "--source-root",
+            str(source_root),
+            "--artifact-root",
+            str(artifact_root),
+            "--private-eval-root",
+            str(private_eval_root),
+            "--env-file",
+            str(env_file),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == (
+        "release_id=corpus-20250808123456-deadbeef failed=0"
+    )
+    assert env_file.exists()
+
+
+def test_start_release_cli_sanitizes_git_and_storage_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches source paths or subprocess diagnostics leaking on setup failure."""
+    sentinel = "PRIVATE_RELEASE_SETUP_SENTINEL"
+    source_root = tmp_path / sentinel
+    artifact_root = tmp_path / "artifacts"
+    private_eval_root = tmp_path / "private-eval"
+    for root in (source_root, artifact_root, private_eval_root):
+        root.mkdir()
+    monkeypatch.setattr(
+        cli_module,
+        "_release_git_sha_provider",
+        lambda: (_ for _ in ()).throw(OSError(sentinel)),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "start-release",
+            "--source-root",
+            str(source_root),
+            "--artifact-root",
+            str(artifact_root),
+            "--private-eval-root",
+            str(private_eval_root),
+            "--env-file",
+            str(artifact_root / "active-release.env"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout.strip() == "failed=1 error_code=release_setup_failed"
+    assert sentinel not in result.stdout + result.stderr
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_backup_manifest_cli_creates_then_verifies_exact_bundle(
+    tmp_path: Path,
+) -> None:
+    """Catches shell backup orchestration using divergent hash implementations."""
+    from src.release import BACKUP_PAYLOAD_PATHS
+
+    root = tmp_path / "backup"
+    for index, relative in enumerate(BACKUP_PAYLOAD_PATHS, start=1):
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(f"payload-{index}".encode("ascii"))
+
+    created = CliRunner().invoke(
+        app,
+        [
+            "backup-manifest",
+            "--root",
+            str(root),
+            "--release-id",
+            "corpus-20250808123456-deadbeef",
+        ],
+    )
+    verified = CliRunner().invoke(app, ["verify-backup", "--root", str(root)])
+
+    assert created.exit_code == verified.exit_code == 0
+    assert re.fullmatch(r"bundle_sha256=[0-9a-f]{64} failed=0\n", created.stdout)
+    assert verified.stdout == created.stdout
+
+
+def test_storage_policy_env_cli_emits_only_shell_quoted_policy_fields(
+    tmp_path: Path,
+) -> None:
+    """Catches shell probes using ambient identities or unvalidated root paths."""
+    policy = tmp_path / "storage-policy.toml"
+    policy.write_text(
+        "\n".join(
+            (
+                'schema_version = "sen-qa-storage-policy/v1"',
+                "ingestion_uid = 21001",
+                "search_uid = 21002",
+                "evaluator_uid = 21003",
+                "reviewer_gid = 22001",
+                f'source_root = "{tmp_path}/source"',
+                f'artifact_root = "{tmp_path}/artifacts"',
+                f'private_eval_root = "{tmp_path}/private-eval"',
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["storage-policy-env", "--policy", str(policy)])
+
+    assert result.exit_code == 0
+    assert result.stdout.splitlines() == [
+        "SEN_QA_POLICY_INGESTION_UID=21001",
+        "SEN_QA_POLICY_SEARCH_UID=21002",
+        "SEN_QA_POLICY_EVALUATOR_UID=21003",
+        "SEN_QA_POLICY_REVIEWER_GID=22001",
+        f"SEN_QA_POLICY_SOURCE_ROOT={tmp_path}/source",
+        f"SEN_QA_POLICY_ARTIFACT_ROOT={tmp_path}/artifacts",
+        f"SEN_QA_POLICY_PRIVATE_EVAL_ROOT={tmp_path}/private-eval",
+    ]
+
+
 def test_inspect_lexical_plan_reports_only_safe_plan_metadata(tmp_path: Path) -> None:
     canonical = tmp_path / "canonical.sqlite3"
     index = tmp_path / "lexical.sqlite3"
@@ -100,6 +248,33 @@ def test_inspect_lexical_plan_reports_only_safe_plan_metadata(tmp_path: Path) ->
     )
     assert result.stdout.rstrip().endswith("failed=0")
     assert "PRIVATE_QUERY_SENTINEL" not in result.stdout
+
+
+def test_build_lexical_index_cli_publishes_candidate_without_alias_mutation(
+    tmp_path: Path,
+) -> None:
+    """Catches the release wrapper omitting the real atomic lexical builder."""
+    canonical = tmp_path / "canonical.sqlite3"
+    index = tmp_path / "lexical.sqlite3"
+    _write_canonical_database(canonical)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "build-lexical-index",
+            "--canonical-db",
+            str(canonical),
+            "--output",
+            str(index),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert re.fullmatch(
+        r"indexed_chunks=2 skipped_chunks=2 config_sha256=[0-9a-f]{64} failed=0\n",
+        result.stdout,
+    )
+    assert index.is_file()
 
 
 def test_inspect_lexical_plan_sanitizes_invalid_index_error(tmp_path: Path) -> None:

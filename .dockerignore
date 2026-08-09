@@ -31,6 +31,9 @@ src/**/*.py/**
 !docker/prepare_ocr_models.py
 !docker/indexer.Dockerfile
 !docker/prepare_embedding_model.py
+!config/backup-tools.lock.json
+!docker/backup.Dockerfile
+!docker/prepare_backup_tools.py
 
 # Keep sensitive or generated file classes closed even inside an allowed tree.
 **/.git

@@ -1,0 +1,188 @@
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+SCRIPTS = (
+    "build-corpus.sh",
+    "build-indexes.sh",
+    "evaluate-release.sh",
+    "verify-release.sh",
+    "backup-release.sh",
+    "restore-release.sh",
+    "promote-release.sh",
+    "verify-storage-permissions.sh",
+)
+RELEASE_ID = "corpus-20250808123456-deadbeef"
+
+
+def _release_environment(tmp_path: Path) -> dict[str, str]:
+    environment = {"PATH": os.environ["PATH"]}
+    for name in ("source", "artifacts", "private-eval"):
+        (tmp_path / name).mkdir()
+    environment.update(
+        {
+            "SEN_QA_RELEASE_ID": RELEASE_ID,
+            "SEN_QA_SOURCE_ROOT": str(tmp_path / "source"),
+            "SEN_QA_ARTIFACT_ROOT": str(tmp_path / "artifacts"),
+            "SEN_QA_PRIVATE_EVAL_ROOT": str(tmp_path / "private-eval"),
+        }
+    )
+    return environment
+
+
+@pytest.mark.parametrize("script", SCRIPTS)
+def test_release_script_fails_closed_without_active_release(script: str) -> None:
+    """Catches ambient defaults accidentally targeting production storage."""
+    environment = {"PATH": os.environ["PATH"]}
+    completed = subprocess.run(
+        ["bash", f"scripts/{script}"],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "failed=1 error_code=release_environment_missing\n"
+
+
+def test_release_scripts_have_valid_shell_syntax() -> None:
+    """Catches an operator discovering syntax drift during the release window."""
+    completed = subprocess.run(
+        ["bash", "-n", *(f"scripts/{script}" for script in SCRIPTS)],
+        cwd=Path.cwd(),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_backup_rejects_same_storage_tree_before_reading_keys(tmp_path: Path) -> None:
+    """Catches a same-NAS artifacts directory being mislabeled external backup."""
+    environment = _release_environment(tmp_path)
+    environment["SEN_QA_BACKUP_IMAGE"] = "sen-qa-backup:v1@sha256:" + "a" * 64
+    target = tmp_path / "artifacts" / "backup"
+    target.mkdir()
+
+    completed = subprocess.run(
+        ["bash", "scripts/backup-release.sh", str(target)],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stderr == "failed=1 error_code=backup_target_not_external\n"
+
+
+def test_index_build_stops_before_container_without_review_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """Catches indexing machine-extracted cases before the human checkpoint."""
+    environment = _release_environment(tmp_path)
+    environment["SEN_QA_INDEXER_IMAGE"] = "sen-qa-index:v1@sha256:" + "b" * 64
+    canonical = (
+        tmp_path
+        / "artifacts"
+        / "releases"
+        / RELEASE_ID
+        / "canonical"
+        / "canonical.sqlite3"
+    )
+    canonical.parent.mkdir(parents=True)
+    canonical.write_bytes(b"SQLite format 3\0")
+
+    completed = subprocess.run(
+        ["bash", "scripts/build-indexes.sh"],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stderr == "failed=1 error_code=review_checkpoint_missing\n"
+
+
+def test_storage_probe_rejects_policy_for_different_roots(tmp_path: Path) -> None:
+    """Catches a valid policy file being replayed against another release tree."""
+    environment = _release_environment(tmp_path)
+    environment["SEN_QA_PERMISSION_PROBE_IMAGE"] = "sen-qa-backup:v1@sha256:" + "c" * 64
+    policy = tmp_path / "policy.toml"
+    policy.write_text(
+        """schema_version = "sen-qa-storage-policy/v1"
+ingestion_uid = 21001
+search_uid = 21002
+evaluator_uid = 21003
+reviewer_gid = 22001
+source_root = "/different/source"
+artifact_root = "/different/artifacts"
+private_eval_root = "/different/private"
+""",
+        encoding="utf-8",
+    )
+    environment["SEN_QA_STORAGE_POLICY"] = str(policy)
+
+    completed = subprocess.run(
+        ["bash", "scripts/verify-storage-permissions.sh"],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stderr == "failed=1 error_code=storage_policy_root_mismatch\n"
+
+
+def test_active_release_rejects_nested_roots_before_any_job(tmp_path: Path) -> None:
+    """Catches a hand-edited active environment bypassing start-release isolation."""
+    environment = _release_environment(tmp_path)
+    nested = tmp_path / "artifacts" / "private"
+    nested.mkdir()
+    environment["SEN_QA_PRIVATE_EVAL_ROOT"] = str(nested)
+
+    completed = subprocess.run(
+        ["bash", "scripts/evaluate-release.sh"],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stderr == "failed=1 error_code=release_environment_invalid\n"
+
+
+def test_runbooks_preserve_predeployment_blockers_and_no_fake_keys() -> None:
+    """Catches documentation silently turning a missing authority into a default."""
+    index_runbook = Path("docs/runbooks/index-release.md").read_text(encoding="utf-8")
+    backup_runbook = Path("docs/runbooks/backup-restore.md").read_text(encoding="utf-8")
+    recipients = Path("config/backup-recipients.txt.example").read_text(
+        encoding="utf-8"
+    )
+
+    assert "candidate_review_bridge_required" in index_runbook
+    assert "dense_index_driver_required" in index_runbook
+    assert "qdrant_alias_broker_required" in index_runbook
+    assert "restore_evaluation_driver_required" in backup_runbook
+    assert "age1" not in recipients
+    assert "AGE-SECRET-KEY" not in recipients

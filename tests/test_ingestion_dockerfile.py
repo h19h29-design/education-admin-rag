@@ -23,6 +23,9 @@ _DOCKER_CONTEXT_EXCEPTIONS = (
     "docker/prepare_ocr_models.py",
     "docker/indexer.Dockerfile",
     "docker/prepare_embedding_model.py",
+    "config/backup-tools.lock.json",
+    "docker/backup.Dockerfile",
+    "docker/prepare_backup_tools.py",
 )
 
 
