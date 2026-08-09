@@ -27,6 +27,8 @@ from src.evaluation.release_report import (
     canonical_release_evaluation_bytes,
 )
 from src.ingestion.privacy import classify_privacy, scan_text
+from src.retrieval.dense import DenseBuildResult
+from src.retrieval.lexical import LexicalError, inspect_lexical_index
 
 _RELEASE_RE = re.compile(r"^corpus-\d{14}-[0-9a-f]{8}$")
 _COLLECTION_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,190}[a-z0-9]$")
@@ -857,6 +859,79 @@ def _stable_file_sha256(path: Path) -> str | None:
         except OSError:
             failed = True
     return None if failed else digest.hexdigest()
+
+
+def create_index_release_evidence(
+    *,
+    canonical_database: Path,
+    lexical_index: Path,
+    dense_result: DenseBuildResult,
+    output: Path,
+    expected_release_id: str,
+) -> IndexReleaseEvidence:
+    """Bind physical canonical/lexical bytes to one verified dense candidate."""
+    if (
+        not all(
+            isinstance(path, Path)
+            for path in (canonical_database, lexical_index, output)
+        )
+        or type(expected_release_id) is not str
+        or _RELEASE_RE.fullmatch(expected_release_id) is None
+        or type(dense_result) is not DenseBuildResult
+    ):
+        _raise("index_evidence_invalid")
+    canonical_sha256 = _stable_file_sha256(canonical_database)
+    lexical_sha256 = _stable_file_sha256(lexical_index)
+    failed = False
+    canonical_release: object = None
+    lexical_metadata = None
+    try:
+        with connect_canonical_storage(canonical_database) as connection:
+            row = connection.execute(
+                "SELECT release_id FROM build_meta WHERE singleton=1"
+            ).fetchone()
+            canonical_release = row[0] if type(row) is tuple and len(row) == 1 else None
+        lexical_metadata = inspect_lexical_index(lexical_index)
+    except (StorageError, LexicalError, OSError, sqlite3.Error, TypeError, ValueError):
+        failed = True
+    if (
+        failed
+        or canonical_sha256 is None
+        or lexical_sha256 is None
+        or _stable_file_sha256(canonical_database) != canonical_sha256
+        or _stable_file_sha256(lexical_index) != lexical_sha256
+        or canonical_release != expected_release_id
+        or lexical_metadata is None
+        or lexical_metadata.release_id != expected_release_id
+        or dense_result.release_id != expected_release_id
+        or dense_result.collection_name != f"{expected_release_id}-bge-m3"
+        or type(dense_result.embedding_version) is not str
+        or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", dense_result.embedding_version
+        )
+        is None
+        or type(dense_result.point_count) is not int
+        or dense_result.point_count != lexical_metadata.indexed_chunks
+        or type(dense_result.sampled_vector_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", dense_result.sampled_vector_sha256) is None
+    ):
+        _raise("index_evidence_invalid")
+    try:
+        evidence = IndexReleaseEvidence(
+            schema_version="sen-qa-index-evidence/v1",
+            release_id=expected_release_id,
+            canonical_database_sha256=canonical_sha256,
+            lexical_index_sha256=lexical_sha256,
+            dense_sample_sha256=dense_result.sampled_vector_sha256,
+            eligible_chunks=lexical_metadata.indexed_chunks,
+            lexical_chunks=lexical_metadata.indexed_chunks,
+            dense_points=dense_result.point_count,
+            collection_name=dense_result.collection_name,
+        )
+    except (ValidationError, TypeError, ValueError):
+        _raise("index_evidence_invalid")
+    _write_new_file(output, _canonical_json(evidence))
+    return evidence
 
 
 _EvidenceModelT = TypeVar("_EvidenceModelT", bound=_ReleaseModel)

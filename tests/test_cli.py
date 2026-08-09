@@ -22,7 +22,8 @@ from src.ingestion.review import (
     SegmentManifest,
     VerifiedCanonicalReviewRegistry,
 )
-from src.release import ReleaseVerificationEvidence
+from src.release import IndexReleaseEvidence, ReleaseVerificationEvidence
+from src.retrieval.dense import DenseBuildResult
 from src.retrieval.lexical import build_lexical_index
 from tests.ingestion.test_parse_metadata import (
     _native_quarantine_records,
@@ -195,6 +196,83 @@ def test_assemble_release_evidence_cli_uses_measured_artifacts(
     assert result.stdout.strip() == f"bundle_sha256={'a' * 64} failed=0"
     assert captured["canonical_manifest"] == inputs[0]
     assert captured["output"] == output
+
+
+def test_build_dense_index_cli_builds_candidate_and_writes_index_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canonical = tmp_path / "canonical.sqlite3"
+    lexical = tmp_path / "lexical.sqlite3"
+    lock = tmp_path / "models.lock.json"
+    model_root = tmp_path / "model"
+    output = tmp_path / "index-attestation.json"
+    for path in (canonical, lexical, lock):
+        path.write_bytes(b"input")
+    model_root.mkdir()
+    monkeypatch.setenv("SEN_QA_EMBEDDING_MODEL_ROOT", str(model_root))
+    monkeypatch.setenv("SEN_QA_EMBEDDING_LOCK_SHA256", "a" * 64)
+    captured: dict[str, object] = {}
+
+    class FakeEncoder:
+        @classmethod
+        def from_lock(cls, *args: object, **kwargs: object) -> object:
+            captured["encoder"] = (args, kwargs)
+            return object()
+
+    class FakeClient:
+        def close(self) -> None:
+            captured["closed"] = True
+
+    dense = DenseBuildResult(
+        collection_name="corpus-20250808123456-deadbeef-bge-m3",
+        release_id="corpus-20250808123456-deadbeef",
+        embedding_version="bge-m3-pinned",
+        point_count=3,
+        sampled_vector_sha256="b" * 64,
+    )
+    monkeypatch.setattr(cli_module, "DenseEncoder", FakeEncoder)
+    monkeypatch.setattr(cli_module, "create_qdrant_client", lambda _url: FakeClient())
+    monkeypatch.setattr(cli_module, "build_dense_candidate", lambda *a, **k: dense)
+
+    def fake_evidence(**kwargs: object) -> IndexReleaseEvidence:
+        captured.update(kwargs)
+        return IndexReleaseEvidence(
+            schema_version="sen-qa-index-evidence/v1",
+            release_id=dense.release_id,
+            canonical_database_sha256="c" * 64,
+            lexical_index_sha256="d" * 64,
+            dense_sample_sha256=dense.sampled_vector_sha256,
+            eligible_chunks=3,
+            lexical_chunks=3,
+            dense_points=3,
+            collection_name=dense.collection_name,
+        )
+
+    monkeypatch.setattr(cli_module, "create_index_release_evidence", fake_evidence)
+    result = CliRunner().invoke(
+        app,
+        [
+            "build-dense-index",
+            "--canonical-db",
+            str(canonical),
+            "--lexical-index",
+            str(lexical),
+            "--output",
+            str(output),
+            "--release-id",
+            dense.release_id,
+            "--lock",
+            str(lock),
+            "--qdrant-url",
+            "http://qdrant:6333",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "dense_points=3 failed=0"
+    assert captured["dense_result"] == dense
+    assert captured["output"] == output
+    assert captured["closed"] is True
 
 
 def test_module_entrypoint_reports_version() -> None:

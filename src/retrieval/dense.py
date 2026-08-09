@@ -38,7 +38,9 @@ _MAX_TEXT_CHARACTERS = 16_384
 _MAX_POINTS_PER_CALL = 10_000
 _MAX_SOURCE_REFERENCES = 4_096
 _MAX_DENSE_RECORDS = 100_000
+_MAX_DENSE_SERIALIZED_BYTES = 512 * 1024 * 1024
 _POINT_NAMESPACE = uuid.UUID("4d8b3e8e-1f41-51c2-88ea-54ddf572304d")
+_APPROVED_QDRANT_URLS = frozenset({"http://qdrant:6333", "http://127.0.0.1:6333"})
 
 
 class DenseError(ValueError):
@@ -62,6 +64,8 @@ class _CountResult(Protocol):
 
 
 class _DenseStore(Protocol):
+    def close(self, **kwargs: object) -> None: ...
+
     def collection_exists(self, collection_name: str, **kwargs: object) -> bool: ...
 
     def get_collection(self, collection_name: str, **kwargs: object) -> object: ...
@@ -87,6 +91,28 @@ class _DenseStore(Protocol):
         query_filter: object,
         **kwargs: object,
     ) -> object: ...
+
+
+def create_qdrant_client(url: str) -> _DenseStore:
+    """Create a client only for the reviewed local/internal Qdrant endpoints."""
+    if type(url) is not str or url not in _APPROVED_QDRANT_URLS:
+        _raise("qdrant_endpoint_invalid")
+    client: object = None
+    try:
+        module = importlib.import_module("qdrant_client")
+        client_type = cast(Any, module).QdrantClient
+        client = client_type(
+            url=url,
+            prefer_grpc=False,
+            timeout=60,
+            cloud_inference=False,
+            check_compatibility=True,
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        client = None
+    if client is None:
+        _raise("qdrant_endpoint_invalid")
+    return cast(_DenseStore, client)
 
 
 def _load_sentence_transformer(model_root: Path) -> _EncoderBackend:
@@ -1010,6 +1036,8 @@ def _load_dense_records(
 ) -> tuple[tuple[Document, Case, Chunk], ...]:
     records: list[tuple[Document, Case, Chunk]] = []
     failed = False
+    expected_count = -1
+    total_bytes = 0
     try:
         with connect_canonical_storage(database) as connection:
             count = connection.execute("SELECT count(*) FROM chunks").fetchone()
@@ -1021,22 +1049,21 @@ def _load_dense_records(
                 or count[0] > _MAX_DENSE_RECORDS
             ):
                 failed = True
-            rows: list[tuple[object, object, object]] = []
+            else:
+                expected_count = count[0]
             if not failed:
-                rows = cast(
-                    list[tuple[object, object, object]],
-                    connection.execute(
-                        "SELECT d.payload_json,c.payload_json,ch.payload_json "
-                        "FROM chunks AS ch JOIN cases AS c ON c.case_id=ch.case_id "
-                        "JOIN documents AS d "
-                        "ON d.doc_id=json_extract(c.payload_json,'$.doc_id') "
-                        "ORDER BY ch.chunk_id"
-                    ).fetchall(),
+                cursor = connection.execute(
+                    "SELECT d.payload_json,c.payload_json,ch.payload_json "
+                    "FROM chunks AS ch JOIN cases AS c ON c.case_id=ch.case_id "
+                    "JOIN documents AS d "
+                    "ON d.doc_id=json_extract(c.payload_json,'$.doc_id') "
+                    "ORDER BY ch.chunk_id"
                 )
-                if len(rows) != count[0]:
-                    failed = True
-            if not failed:
-                for document_value, case_value, chunk_value in rows:
+                for row in cursor:
+                    if type(row) is not tuple or len(row) != 3:
+                        failed = True
+                        break
+                    document_value, case_value, chunk_value = row
                     if any(
                         type(value) is not str
                         or len(value.encode("utf-8")) > _MAX_TEXT_CHARACTERS * 16
@@ -1047,6 +1074,16 @@ def _load_dense_records(
                     raw_document = cast(str, document_value)
                     raw_case = cast(str, case_value)
                     raw_chunk = cast(str, chunk_value)
+                    total_bytes += sum(
+                        len(raw.encode("utf-8"))
+                        for raw in (raw_document, raw_case, raw_chunk)
+                    )
+                    if (
+                        total_bytes > _MAX_DENSE_SERIALIZED_BYTES
+                        or len(records) >= expected_count
+                    ):
+                        failed = True
+                        break
                     for raw in (raw_document, raw_case, raw_chunk):
                         decoded = json.loads(
                             raw,
@@ -1062,6 +1099,8 @@ def _load_dense_records(
                     case = Case.model_validate_json(raw_case)
                     chunk = Chunk.model_validate_json(raw_chunk)
                     records.append((document, case, chunk))
+                if len(records) != expected_count:
+                    failed = True
     except (
         StorageError,
         sqlite3.Error,

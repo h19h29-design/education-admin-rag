@@ -66,6 +66,13 @@ class LexicalBuildResult:
 
 
 @dataclass(frozen=True, slots=True)
+class LexicalIndexMetadata:
+    release_id: str
+    indexed_chunks: int
+    config_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class LexicalHit:
     chunk_id: str
     case_id: str
@@ -598,6 +605,56 @@ def _connect_index(path: Path, config: RetrievalConfig) -> Iterator[sqlite3.Conn
         yield connection
     finally:
         connection.close()
+
+
+def inspect_lexical_index(
+    path: Path, *, config_path: Path = _DEFAULT_CONFIG
+) -> LexicalIndexMetadata:
+    """Revalidate a closed lexical index and return aggregate-only metadata."""
+    config = load_retrieval_config(config_path)
+    failed = False
+    release_id: object = None
+    record_count: object = None
+    fts_count: object = None
+    mismatch: object = None
+    try:
+        with _connect_index(path, config) as connection:
+            meta = connection.execute(
+                "SELECT release_id,config_sha256 FROM index_meta WHERE singleton=1"
+            ).fetchone()
+            release_id = (
+                meta[0] if isinstance(meta, sqlite3.Row) and len(meta) == 2 else None
+            )
+            record_count = connection.execute(
+                "SELECT count(*) FROM lexical_records"
+            ).fetchone()[0]
+            fts_count = connection.execute(
+                "SELECT count(*) FROM lexical_fts"
+            ).fetchone()[0]
+            mismatch = connection.execute(
+                "SELECT EXISTS(SELECT row_id FROM lexical_records "
+                "EXCEPT SELECT rowid FROM lexical_fts) OR "
+                "EXISTS(SELECT rowid FROM lexical_fts "
+                "EXCEPT SELECT row_id FROM lexical_records)"
+            ).fetchone()[0]
+    except (LexicalError, OSError, sqlite3.Error, TypeError, ValueError):
+        failed = True
+    if (
+        failed
+        or type(release_id) is not str
+        or not release_id
+        or len(release_id) > 80
+        or type(record_count) is not int
+        or not 1 <= record_count <= config.max_records
+        or fts_count != record_count
+        or mismatch != 0
+    ):
+        _raise("index_invalid")
+    return LexicalIndexMetadata(
+        release_id=release_id,
+        indexed_chunks=record_count,
+        config_sha256=config.fingerprint_sha256,
+    )
 
 
 class LexicalIndex:

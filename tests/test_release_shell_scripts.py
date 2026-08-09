@@ -181,7 +181,7 @@ def test_runbooks_preserve_predeployment_blockers_and_no_fake_keys() -> None:
     )
 
     assert "candidate_review_bridge_required" in index_runbook
-    assert "dense_index_driver_required" in index_runbook
+    assert "index-attestation.json" in index_runbook
     assert "qdrant_alias_broker_required" in index_runbook
     assert "restore_evaluation_driver_required" in backup_runbook
     assert "age1" not in recipients
@@ -206,3 +206,11 @@ def test_verification_script_derives_evidence_before_signing() -> None:
         "create-verification-attestation"
     )
     assert "release_evidence_exists" in script
+
+
+def test_index_script_builds_dense_candidate_and_index_attestation() -> None:
+    script = Path("scripts/build-indexes.sh").read_text(encoding="utf-8")
+
+    assert "build-dense-index" in script
+    assert "index-attestation.json" in script
+    assert "dense_index_driver_required" not in script

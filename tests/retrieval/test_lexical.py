@@ -9,7 +9,12 @@ import pytest
 
 import src.retrieval.lexical as lexical_module
 from src.corpus.models import Case, Chunk, Document, LawRef, SourceSpan
-from src.retrieval.lexical import LexicalError, LexicalIndex, build_lexical_index
+from src.retrieval.lexical import (
+    LexicalError,
+    LexicalIndex,
+    build_lexical_index,
+    inspect_lexical_index,
+)
 from src.retrieval.query import QueryFilters
 
 CASE_PUBLIC = "senqa-2025-contract-contract-general-1"
@@ -196,6 +201,21 @@ def lexical_index(tmp_path: Path) -> LexicalIndex:
     assert result.indexed_chunks == 2
     assert result.skipped_chunks == 2
     return LexicalIndex(target)
+
+
+def test_inspect_lexical_index_revalidates_release_and_exact_record_count(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical.sqlite3"
+    target = tmp_path / "lexical.sqlite3"
+    _write_canonical_database(canonical)
+    built = build_lexical_index(canonical, target)
+
+    inspected = inspect_lexical_index(target)
+
+    assert inspected.release_id == built.release_id
+    assert inspected.indexed_chunks == built.indexed_chunks
+    assert inspected.config_sha256 == built.config_sha256
 
 
 def test_spacing_variant_and_exact_article_are_retrieved(

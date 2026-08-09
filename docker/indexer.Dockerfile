@@ -54,4 +54,5 @@ COPY --from=builder /work/config /work/config
 
 USER 65532:65532
 
-CMD ["/opt/venv/bin/python", "-m", "src.cli"]
+ENTRYPOINT ["/opt/venv/bin/python", "-m", "src.cli"]
+CMD ["--help"]

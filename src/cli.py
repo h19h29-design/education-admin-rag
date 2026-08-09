@@ -69,6 +69,7 @@ from src.release import (
     ReleaseError,
     assemble_release_verification_evidence,
     create_backup_manifest,
+    create_index_release_evidence,
     create_verification_attestation,
     load_storage_policy,
     materialize_backup_restore,
@@ -76,7 +77,12 @@ from src.release import (
     start_release_environment,
     verify_backup_manifest,
 )
-from src.retrieval.dense import DenseEncoder, DenseError
+from src.retrieval.dense import (
+    DenseEncoder,
+    DenseError,
+    build_dense_candidate,
+    create_qdrant_client,
+)
 from src.retrieval.lexical import LexicalError, LexicalIndex, build_lexical_index
 from src.retrieval.query import QueryError
 from src.retrieval.service import SearchResponse
@@ -585,6 +591,64 @@ def dense_smoke(
         f"vectors=1 dimension={len(vector)} normalized=1 "
         f"revision={encoder.revision[:8]} failed=0"
     )
+
+
+@app.command("build-dense-index")
+def build_dense_index_command(
+    canonical_database: Path = typer.Option(  # noqa: B008
+        ..., "--canonical-db", exists=True, dir_okay=False, readable=True
+    ),
+    lexical_index: Path = typer.Option(  # noqa: B008
+        ..., "--lexical-index", exists=True, dir_okay=False, readable=True
+    ),
+    output: Path = typer.Option(..., "--output", dir_okay=False),  # noqa: B008
+    release_id: str = typer.Option(..., "--release-id"),
+    lock_path: Path = typer.Option(  # noqa: B008
+        Path("config/models.lock.json"), "--lock", exists=True, dir_okay=False
+    ),
+    qdrant_url: str = typer.Option("http://qdrant:6333", "--qdrant-url"),
+) -> None:
+    """Build and attest one isolated dense candidate without alias mutation."""
+    model_root_value = os.environ.get("SEN_QA_EMBEDDING_MODEL_ROOT")
+    expected_lock_sha256 = os.environ.get("SEN_QA_EMBEDDING_LOCK_SHA256")
+    client = None
+    evidence = None
+    try:
+        if model_root_value is None or expected_lock_sha256 is None:
+            raise DenseError("embedding_environment_invalid")
+        encoder = DenseEncoder.from_lock(
+            lock_path,
+            model_root=Path(model_root_value),
+            expected_lock_sha256=expected_lock_sha256,
+        )
+        client = create_qdrant_client(qdrant_url)
+        dense_result = build_dense_candidate(
+            canonical_database,
+            client=client,
+            encoder=encoder,
+            release_id=release_id,
+        )
+        client.close()
+        client = None
+        evidence = create_index_release_evidence(
+            canonical_database=canonical_database,
+            lexical_index=lexical_index,
+            dense_result=dense_result,
+            output=output,
+            expected_release_id=release_id,
+        )
+    except (DenseError, ReleaseError, OSError, RuntimeError, TypeError, ValueError):
+        pass
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
+    if evidence is None:
+        typer.echo("failed=1 error_code=dense_index_build_failed")
+        raise SystemExit(1) from None
+    typer.echo(f"dense_points={evidence.dense_points} failed=0")
 
 
 @review_app.command("verify-fields")

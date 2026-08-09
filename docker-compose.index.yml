@@ -1,6 +1,7 @@
 services:
   qdrant:
     image: qdrant/qdrant:v1.18.3-unprivileged@sha256:affb67e1d6f2f93d7d20b90d238a7d4b974d36351c162e73bda794e4b2e03483
+    pull_policy: never
     platform: linux/amd64
     restart: "no"
     ports:
@@ -18,6 +19,24 @@ services:
     pids_limit: 512
     networks:
       - qdrant_internal
+
+  indexer:
+    image: ${SEN_QA_INDEXER_IMAGE:?digest-qualified indexer image required}
+    pull_policy: never
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 8g
+    volumes:
+      - "${SEN_QA_RELEASE_ROOT:?release root required}:/sen-qa/release:rw"
+    networks:
+      - qdrant_internal
+    command: ["--help"]
 
 volumes:
   qdrant_storage:

@@ -76,11 +76,15 @@ Treating metadata as canonical would bypass the review boundary.
 
 Likewise, `build-indexes.sh` first requires the canonical DB and an independent
 `review-ready.attestation.json`. It builds the lexical candidate through the
-real atomic builder, then exits with `dense_index_driver_required` until the
-offline BGE-M3/Qdrant job writes a count-and-vector-hash attestation without
-changing the production alias.
+real atomic builder, starts the digest-pinned isolated Qdrant service, verifies
+the complete offline BGE-M3 cache, and builds a release-named dense candidate.
+The job checks the exact point count and a deterministic vector sample against
+what it just encoded, then binds those results to the physical canonical and
+lexical database hashes in `index-attestation.json`. It never changes the
+production alias.
 
-These code gaps are pre-deployment blockers, not operator override points.
+The remaining corpus review bridge is a pre-deployment blocker, not an operator
+override point.
 
 ## Evaluation and verification
 

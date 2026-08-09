@@ -22,6 +22,7 @@ from src.release import (
     ReleaseAttestation,
     assemble_release_verification_evidence,
     create_backup_manifest,
+    create_index_release_evidence,
     create_verification_attestation,
     load_backup_tool_lock,
     materialize_backup_restore,
@@ -32,6 +33,7 @@ from src.release import (
     verify_backup_manifest,
     write_release_attestation,
 )
+from src.retrieval.dense import DenseBuildResult
 from src.retrieval.lexical import build_lexical_index
 from tests.corpus.test_storage import _batch, _build
 from tests.evaluation.test_release_report import _gold, _ingestion, _retrieval
@@ -394,6 +396,58 @@ def test_release_evidence_is_derived_from_canonical_index_and_evaluation_bytes(
             expected_release_id=RELEASE_ID,
         )
     assert not unresolved_output.exists()
+
+
+def test_index_evidence_is_written_from_physical_indexes_and_dense_result(
+    tmp_path: Path,
+) -> None:
+    canonical_bundle = _build(
+        tmp_path,
+        _batch(release_id=RELEASE_ID),
+        registry_name="index-issuance.sqlite3",
+        output_name="index-canonical-output",
+    )
+    canonical = canonical_bundle.bundle_path / "canonical.sqlite3"
+    lexical_path = tmp_path / "lexical.sqlite3"
+    output = tmp_path / "index-attestation.json"
+    lexical = build_lexical_index(canonical, lexical_path)
+    dense = DenseBuildResult(
+        collection_name=f"{lexical.release_id}-bge-m3",
+        release_id=lexical.release_id,
+        embedding_version="bge-m3-pinned",
+        point_count=lexical.indexed_chunks,
+        sampled_vector_sha256="6" * 64,
+    )
+
+    evidence = create_index_release_evidence(
+        canonical_database=canonical,
+        lexical_index=lexical_path,
+        dense_result=dense,
+        output=output,
+        expected_release_id=lexical.release_id,
+    )
+
+    assert evidence.lexical_chunks == lexical.indexed_chunks
+    assert evidence.dense_points == lexical.indexed_chunks
+    assert evidence.dense_sample_sha256 == "6" * 64
+    assert json.loads(output.read_bytes())["collection_name"] == dense.collection_name
+
+    rejected = tmp_path / "rejected-index-attestation.json"
+    with pytest.raises(release_module.ReleaseError, match="index_evidence_invalid"):
+        create_index_release_evidence(
+            canonical_database=canonical,
+            lexical_index=lexical_path,
+            dense_result=DenseBuildResult(
+                collection_name=dense.collection_name,
+                release_id=dense.release_id,
+                embedding_version=dense.embedding_version,
+                point_count=dense.point_count + 1,
+                sampled_vector_sha256=dense.sampled_vector_sha256,
+            ),
+            output=rejected,
+            expected_release_id=lexical.release_id,
+        )
+    assert not rejected.exists()
 
 
 def test_backup_tool_lock_pins_exact_linux_amd64_archives() -> None:

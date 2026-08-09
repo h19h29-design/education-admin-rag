@@ -25,6 +25,7 @@ from src.retrieval.dense import (
     DensePoint,
     DenseSearchFilters,
     build_dense_candidate,
+    create_qdrant_client,
 )
 from tests.retrieval.test_lexical import (
     CASE_PUBLIC,
@@ -917,6 +918,7 @@ def test_indexer_image_is_pinned_offline_nonroot_and_uses_index_extra() -> None:
     assert "HF_HUB_OFFLINE=1" in dockerfile
     assert "TRANSFORMERS_OFFLINE=1" in dockerfile
     assert "USER 65532:65532" in dockerfile
+    assert 'ENTRYPOINT ["/opt/venv/bin/python", "-m", "src.cli"]' in dockerfile
     assert "find /opt/models/bge-m3 -type d -exec chmod 0555 {} +" in dockerfile
     assert "find /opt/models/bge-m3 -type f -exec chmod 0444 {} +" in dockerfile
     assert "5617a9f61b028005a4858fdac845db406aefb181" in dockerfile
@@ -924,6 +926,14 @@ def test_indexer_image_is_pinned_offline_nonroot_and_uses_index_extra() -> None:
     assert " latest" not in dockerfile
     assert "response.geturl() != source_url" not in preparer
     assert "hmac.compare_digest(digest.hexdigest(), sha256)" in preparer
+
+
+def test_qdrant_client_rejects_nonlocal_endpoints_before_network_io() -> None:
+    with pytest.raises(DenseError, match="qdrant_endpoint_invalid") as captured:
+        create_qdrant_client("https://unreviewed.example.invalid")
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
 
 
 def test_qdrant_compose_is_digest_pinned_local_only_and_memory_bounded() -> None:
@@ -934,6 +944,7 @@ def test_qdrant_compose_is_digest_pinned_local_only_and_memory_bounded() -> None
         "affb67e1d6f2f93d7d20b90d238a7d4b974d36351c162e73bda794e4b2e03483"
     ) in compose
     assert '"127.0.0.1:6333:6333"' in compose
+    assert compose.count("pull_policy: never") == 2
     assert "mem_limit: 2g" in compose
     assert "read_only: true" in compose
     assert "no-new-privileges:true" in compose

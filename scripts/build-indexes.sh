@@ -11,6 +11,10 @@ READY="$RELEASE_ROOT/review/review-ready.attestation.json"
 release_require_regular "$CANONICAL_DB" canonical_bundle_missing
 release_require_regular "$READY" review_checkpoint_missing
 install -d -m 0700 "$RELEASE_ROOT/indexes"
+INDEX_EVIDENCE="$RELEASE_ROOT/indexes/index-attestation.json"
+if [[ -e "$INDEX_EVIDENCE" || -L "$INDEX_EVIDENCE" ]]; then
+  release_fail index_evidence_exists
+fi
 
 docker run --rm --network none --read-only --cap-drop ALL \
   --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=512m \
@@ -19,4 +23,14 @@ docker run --rm --network none --read-only --cap-drop ALL \
   --canonical-db /sen-qa/release/canonical/canonical.sqlite3 \
   --output /sen-qa/release/indexes/lexical.sqlite3
 
-release_fail dense_index_driver_required 3
+export SEN_QA_RELEASE_ROOT="$RELEASE_ROOT"
+COMPOSE_FILE="$SCRIPT_DIR/../docker-compose.index.yml"
+docker compose -f "$COMPOSE_FILE" up -d qdrant
+docker compose -f "$COMPOSE_FILE" run --rm --no-deps indexer \
+  build-dense-index \
+  --canonical-db /sen-qa/release/canonical/canonical.sqlite3 \
+  --lexical-index /sen-qa/release/indexes/lexical.sqlite3 \
+  --output /sen-qa/release/indexes/index-attestation.json \
+  --release-id "$SEN_QA_RELEASE_ID" \
+  --lock /work/config/models.lock.json \
+  --qdrant-url http://qdrant:6333
