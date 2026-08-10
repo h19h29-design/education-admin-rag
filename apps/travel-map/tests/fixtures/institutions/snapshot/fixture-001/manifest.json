@@ -15,10 +15,17 @@
       "fetchedAt": "2026-08-01T00:00:00Z",
       "sourceAsOf": "2026-08-01",
       "rawSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "normalizedSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "requestRegionCode": "B10",
+      "requestTiming": null,
       "pageCount": 1,
+      "fetchedRowCount": 10,
+      "normalizedRowCount": 10,
+      "preservedRowCount": 0,
       "rowCount": 10
     }
   ],
+  "enrichments": [],
   "institutionsSha256": "fc8b64f16517b3a257f34a6541839b363a385158b105548e9718ffb1c257beb6",
   "sitesSha256": "27b304bbc3cad9f7838ca0be395bb49838a491e15440c8af2fef193eebac09fd",
   "institutionCount": 10,

@@ -1,0 +1,32 @@
+# source_url=https://e-childschoolinfo.moe.go.kr/openApi/sidoSigunguCode.do
+# source_as_of=2026-08-10
+# source_sha256=94bb20b042c7b4bde170b8264c7116076e07dc98f8d97132841bc8f6c91e8925
+# timing=20261
+# license_name=PUBLIC_DATA_PORTAL_TERMS
+# attribution=Source: Ministry of Education Kindergarten Info
+sido_code,sgg_code,district
+11,11110,Jongno-gu
+11,11140,Jung-gu
+11,11170,Yongsan-gu
+11,11200,Seongdong-gu
+11,11215,Gwangjin-gu
+11,11230,Dongdaemun-gu
+11,11260,Jungnang-gu
+11,11290,Seongbuk-gu
+11,11305,Gangbuk-gu
+11,11320,Dobong-gu
+11,11350,Nowon-gu
+11,11380,Eunpyeong-gu
+11,11410,Seodaemun-gu
+11,11440,Mapo-gu
+11,11470,Yangcheon-gu
+11,11500,Gangseo-gu
+11,11530,Guro-gu
+11,11545,Geumcheon-gu
+11,11560,Yeongdeungpo-gu
+11,11590,Dongjak-gu
+11,11620,Gwanak-gu
+11,11650,Seocho-gu
+11,11680,Gangnam-gu
+11,11710,Songpa-gu
+11,11740,Gangdong-gu

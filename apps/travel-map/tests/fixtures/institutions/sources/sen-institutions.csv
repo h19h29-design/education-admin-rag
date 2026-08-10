@@ -1,0 +1,7 @@
+# source_url=https://www.sen.go.kr/www/website.jsp
+# source_as_of=2026-08-10
+# source_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+# license_name=KOGL_TYPE_1_ATTRIBUTION
+# attribution=Source: Seoul Metropolitan Office of Education
+institution_id,official_name,institution_type,foundation_type,education_office,road_address,district,latitude,longitude
+sen:headquarters,\uc11c\uc6b8\ud2b9\ubcc4\uc2dc\uad50\uc721\uccad,HEADQUARTERS,PUBLIC,\uc11c\uc6b8\ud2b9\ubcc4\uc2dc\uad50\uc721\uccad,\uc11c\uc6b8\ud2b9\ubcc4\uc2dc \uc885\ub85c\uad6c \uc1a1\uc6d4\uae38 48,\uc885\ub85c\uad6c,37.5710,126.9680

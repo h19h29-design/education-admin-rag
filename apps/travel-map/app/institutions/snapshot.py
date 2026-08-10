@@ -22,6 +22,7 @@ _MANIFEST_FIELDS = {
     "approvedAt",
     "approvedByRole",
     "sources",
+    "enrichments",
     "institutionsSha256",
     "sitesSha256",
     "institutionCount",
@@ -42,8 +43,29 @@ _SOURCE_FIELDS = {
     "fetchedAt",
     "sourceAsOf",
     "rawSha256",
+    "normalizedSha256",
+    "requestRegionCode",
+    "requestTiming",
     "pageCount",
+    "fetchedRowCount",
+    "normalizedRowCount",
+    "preservedRowCount",
     "rowCount",
+}
+_ENRICHMENT_FIELDS = {
+    "source",
+    "endpoint",
+    "licenseName",
+    "attribution",
+    "fetchedAt",
+    "sourceAsOf",
+    "rawSha256",
+    "normalizedSha256",
+    "requestRegionCode",
+    "requestTiming",
+    "pageCount",
+    "fetchedRowCount",
+    "matchedRowCount",
 }
 _DIFF_FIELDS = {
     "previousSnapshotId",
@@ -242,6 +264,16 @@ def _verify_manifest_fields(value: object) -> None:
                 raise SnapshotIntegrityError(
                     "manifest.json fields must exactly match schema version 1"
                 )
+    enrichments = value["enrichments"]
+    if type(enrichments) is not list:
+        raise SnapshotIntegrityError(
+            "manifest.json fields must exactly match schema version 1"
+        )
+    for enrichment in enrichments:
+        if type(enrichment) is not dict or set(enrichment) != _ENRICHMENT_FIELDS:
+            raise SnapshotIntegrityError(
+                "manifest.json fields must exactly match schema version 1"
+            )
     diff = value["diff"]
     if type(diff) is dict and set(diff) != _DIFF_FIELDS:
         raise SnapshotIntegrityError(
@@ -503,6 +535,12 @@ def _verify_source_counts(
         if row_count != actual[source_name]:
             raise SnapshotIntegrityError(
                 f"source {source_name} rowCount does not match institution records"
+            )
+    for source in manifest.sources:
+        if source.normalized_row_count + source.preserved_row_count != source.row_count:
+            raise SnapshotIntegrityError(
+                f"source {source.source} normalized/preserved row counts "
+                "do not match rowCount"
             )
     source_dates = {
         source.source: source.source_as_of for source in manifest.sources

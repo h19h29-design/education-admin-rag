@@ -224,7 +224,13 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
     fetched_at: str
     source_as_of: str
     raw_sha256: str
+    normalized_sha256: str
+    request_region_code: str
+    request_timing: str | None
     page_count: int = Field(ge=0)
+    fetched_row_count: int = Field(ge=0)
+    normalized_row_count: int = Field(ge=0)
+    preserved_row_count: int = Field(ge=0)
     row_count: int = Field(ge=0)
 
     @field_validator(
@@ -234,12 +240,13 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
         "attribution",
         "fetched_at",
         "source_as_of",
+        "request_region_code",
     )
     @classmethod
     def required_strings_are_nonblank(cls, value: str) -> str:
         return _require_nonblank(value)
 
-    @field_validator("raw_sha256")
+    @field_validator("raw_sha256", "normalized_sha256")
     @classmethod
     def raw_hash_is_lowercase_sha256(cls, value: str) -> str:
         return _require_sha256(value)
@@ -258,6 +265,78 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
 
     @model_validator(mode="after")
     def source_date_is_not_after_fetch(self) -> Self:
+        if _parse_iso_date(self.source_as_of) > _parse_rfc3339_timestamp(
+            self.fetched_at
+        ).date():
+            raise ValueError("sourceAsOf must not be later than fetchedAt date")
+        return self
+
+    @field_validator("request_timing")
+    @classmethod
+    def request_timing_is_nonblank_when_present(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        return None if value is None else _require_nonblank(value)
+
+
+class EnrichmentSnapshotInfo(_StrictSnapshotModel):
+    source: str
+    endpoint: str
+    license_name: str
+    attribution: str
+    fetched_at: str
+    source_as_of: str
+    raw_sha256: str
+    normalized_sha256: str
+    request_region_code: str
+    request_timing: str | None
+    page_count: int = Field(ge=0)
+    fetched_row_count: int = Field(ge=0)
+    matched_row_count: int = Field(ge=0)
+
+    @field_validator(
+        "source",
+        "endpoint",
+        "license_name",
+        "attribution",
+        "fetched_at",
+        "source_as_of",
+        "request_region_code",
+    )
+    @classmethod
+    def required_strings_are_nonblank(cls, value: str) -> str:
+        return _require_nonblank(value)
+
+    @field_validator("raw_sha256", "normalized_sha256")
+    @classmethod
+    def hashes_are_lowercase_sha256(cls, value: str) -> str:
+        return _require_sha256(value)
+
+    @field_validator("source_as_of")
+    @classmethod
+    def source_date_is_iso_date(cls, value: str) -> str:
+        _parse_iso_date(value)
+        return value
+
+    @field_validator("fetched_at")
+    @classmethod
+    def fetched_timestamp_is_timezone_aware(cls, value: str) -> str:
+        _parse_rfc3339_timestamp(value)
+        return value
+
+    @field_validator("request_timing")
+    @classmethod
+    def request_timing_is_nonblank_when_present(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        return None if value is None else _require_nonblank(value)
+
+    @model_validator(mode="after")
+    def enrichment_counts_and_dates_are_consistent(self) -> Self:
+        if self.matched_row_count > self.fetched_row_count:
+            raise ValueError("matchedRowCount must not exceed fetchedRowCount")
         if _parse_iso_date(self.source_as_of) > _parse_rfc3339_timestamp(
             self.fetched_at
         ).date():
@@ -292,6 +371,7 @@ class SnapshotManifest(_StrictSnapshotModel):
     approved_at: str | None
     approved_by_role: str | None
     sources: tuple[SourceSnapshotInfo, ...]
+    enrichments: tuple[EnrichmentSnapshotInfo, ...]
     institutions_sha256: str
     sites_sha256: str
     institution_count: int = Field(ge=0)
@@ -357,6 +437,17 @@ class SnapshotManifest(_StrictSnapshotModel):
                 raise ValueError(
                     f"source {source.source} sourceAsOf must not be later than "
                     "manifest snapshotAsOf"
+                )
+        for enrichment in self.enrichments:
+            if _parse_rfc3339_timestamp(enrichment.fetched_at) > created_at:
+                raise ValueError(
+                    f"enrichment {enrichment.source} fetchedAt must not be later "
+                    "than manifest createdAt"
+                )
+            if _parse_iso_date(enrichment.source_as_of) > snapshot_as_of:
+                raise ValueError(
+                    f"enrichment {enrichment.source} sourceAsOf must not be later "
+                    "than manifest snapshotAsOf"
                 )
         return self
 
