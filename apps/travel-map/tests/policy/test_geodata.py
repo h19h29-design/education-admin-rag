@@ -9,7 +9,8 @@ from shapely.geometry import Point, shape
 
 FIXTURE_ROOT = Path("apps/travel-map/tests/fixtures/geodata")
 SCRIPT = Path("apps/travel-map/scripts/build-geodata.py")
-SOURCE_PAGE_URL = "https://www.data.go.kr/data/15059008/openapi.do"
+SGIS_PAGE_URL = "https://www.data.go.kr/data/15129688/fileData.do"
+ARCHIVE_SHA256 = "0000000000000000000000000000000000000000000000000000000000000001"
 
 
 # Production break caught: buffering longitude degrees instead of 12,000 projected meters.
@@ -31,12 +32,34 @@ def test_builder_normalizes_boundary_builds_buffer_and_records_hashes(
     assert seoul.covers(Point(126.98, 37.55))
     assert support_area.covers(Point(127.09, 37.55))
     assert not support_area.covers(Point(127.30, 37.55))
-    assert manifest["source"] == {
-        "pageUrl": SOURCE_PAGE_URL,
+    assert manifest["generatedAt"] == "2026-08-10T00:00:00Z"
+    assert manifest["coverage"] == {
+        "purpose": "MAP_SUPPORT_AREA_ONLY",
+        "bufferDistanceMeters": 12_000,
+        "legalClassificationBasis": "NETWORK_ROUND_TRIP_DISTANCE",
+    }
+    assert manifest["sourceArchive"] == {
+        "pageUrl": SGIS_PAGE_URL,
+        "datasetName": "국가데이터처_SGIS 행정구역 통계 및 경계_20250630",
+        "referencePeriod": "2025 Q2",
+        "fileIdentifier": "FILE_000000003681593",
+        "detailNumber": 1,
+        "sha256": ARCHIVE_SHA256,
+        "layer": "bnd_sido_00_2025_2Q",
+        "crs": {
+            "authority": "ESRI:102080",
+            "name": "Korea_2000_Korea_Unified_Coordinate_System",
+        },
+        "featureCount": 17,
         "collectedAt": "2026-08-10T00:00:00Z",
+    }
+    assert manifest["source"] == {
         "crs": "OGC:CRS84",
         "sha256": sha256(source),
         "featureCount": 1,
+        "baseDate": "20250630",
+        "administrativeCode": "11",
+        "administrativeName": "서울특별시",
     }
     assert manifest["outputs"]["seoul.geojson"] == {
         "crs": "OGC:CRS84",
@@ -48,6 +71,19 @@ def test_builder_normalizes_boundary_builds_buffer_and_records_hashes(
         "sha256": sha256(buffer_path),
         "featureCount": 1,
     }
+
+
+# Production break caught: serializing projection noise beyond useful WGS84 precision.
+def test_builder_limits_output_coordinates_to_seven_decimal_places(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "geodata"
+    run_builder(FIXTURE_ROOT / "seoul-square.geojson", output)
+
+    for filename in ("seoul.geojson", "seoul-plus-12km.geojson"):
+        payload = json.loads((output / filename).read_text(encoding="utf-8"))
+        coordinates = payload["features"][0]["geometry"]["coordinates"]
+        assert all(value == round(value, 7) for value in coordinate_values(coordinates))
 
 
 # Production break caught: emitting self-intersecting production boundary geometry.
@@ -63,14 +99,22 @@ def test_builder_repairs_invalid_polygon(tmp_path: Path) -> None:
 # Production break caught: approving a source that does not contain Seoul City Hall.
 def test_builder_rejects_non_seoul_source(tmp_path: Path) -> None:
     source = tmp_path / "not-seoul.geojson"
+    fixture_payload = json.loads(
+        (FIXTURE_ROOT / "seoul-square.geojson").read_text(encoding="utf-8")
+    )
     source.write_text(
         json.dumps(
             {
                 "type": "FeatureCollection",
+                "_provenance": fixture_payload["_provenance"],
                 "features": [
                     {
                         "type": "Feature",
-                        "properties": {},
+                        "properties": {
+                            "BASE_DATE": "20250630",
+                            "SIDO_CD": "11",
+                            "SIDO_NM": "서울특별시",
+                        },
                         "geometry": {
                             "type": "Polygon",
                             "coordinates": [
@@ -131,3 +175,12 @@ def read_single_geometry(path: Path) -> Any:
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def coordinate_values(value: Any) -> list[float]:
+    if isinstance(value, (float, int)):
+        return [float(value)]
+    values: list[float] = []
+    for child in value:
+        values.extend(coordinate_values(child))
+    return values

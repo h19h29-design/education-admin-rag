@@ -1,0 +1,43 @@
+{
+  "coverage": {
+    "bufferDistanceMeters": 12000,
+    "legalClassificationBasis": "NETWORK_ROUND_TRIP_DISTANCE",
+    "purpose": "MAP_SUPPORT_AREA_ONLY"
+  },
+  "generatedAt": "2026-08-10T08:13:10Z",
+  "outputs": {
+    "seoul-plus-12km.geojson": {
+      "crs": "OGC:CRS84",
+      "featureCount": 1,
+      "sha256": "52307a5aa715cbb3f6de564be5737930c122507d444b90d7afd7757a170112ca"
+    },
+    "seoul.geojson": {
+      "crs": "OGC:CRS84",
+      "featureCount": 1,
+      "sha256": "3ed5447cb5e714085f3e7381a7519520363a07415bfb177d515b4b27dd419849"
+    }
+  },
+  "source": {
+    "administrativeCode": "11",
+    "administrativeName": "서울특별시",
+    "baseDate": "20250630",
+    "crs": "OGC:CRS84",
+    "featureCount": 1,
+    "sha256": "dba7f5c78efa4b58b342235a7dba1d316fc7544a7e77884858391de874e16292"
+  },
+  "sourceArchive": {
+    "collectedAt": "2026-08-10T08:10:45Z",
+    "crs": {
+      "authority": "ESRI:102080",
+      "name": "Korea_2000_Korea_Unified_Coordinate_System"
+    },
+    "datasetName": "국가데이터처_SGIS 행정구역 통계 및 경계_20250630",
+    "detailNumber": 1,
+    "featureCount": 17,
+    "fileIdentifier": "FILE_000000003681593",
+    "layer": "bnd_sido_00_2025_2Q",
+    "pageUrl": "https://www.data.go.kr/data/15129688/fileData.do",
+    "referencePeriod": "2025 Q2",
+    "sha256": "f1cf0f9de453ac7eaacb273f39cee52851183372b9ddfda428a967c3a670b2c6"
+  }
+}

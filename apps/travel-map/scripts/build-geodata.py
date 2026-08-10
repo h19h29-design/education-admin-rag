@@ -20,12 +20,21 @@ from shapely.geometry import shape as shape_geometry  # type: ignore[import-unty
 from shapely.geometry.base import BaseGeometry  # type: ignore[import-untyped]
 from shapely.ops import transform, unary_union  # type: ignore[import-untyped]
 
-SOURCE_PAGE_URL = "https://www.data.go.kr/data/15059008/openapi.do"
+SOURCE_PAGE_URL = "https://www.data.go.kr/data/15129688/fileData.do"
+DATASET_NAME = "국가데이터처_SGIS 행정구역 통계 및 경계_20250630"
+REFERENCE_PERIOD = "2025 Q2"
+FILE_IDENTIFIER = "FILE_000000003681593"
+SOURCE_LAYER = "bnd_sido_00_2025_2Q"
+SOURCE_LAYER_CRS = {
+    "authority": "ESRI:102080",
+    "name": "Korea_2000_Korea_Unified_Coordinate_System",
+}
 OUTPUT_CRS = "OGC:CRS84"
 PROJECTED_CRS = "EPSG:5179"
 BUFFER_DISTANCE_M = 12_000
+COORDINATE_PRECISION = 7
 SEOUL_CITY_HALL = Point(126.9780, 37.5665)
-INCHEON_CITY_HALL = Point(126.7052, 37.4563)
+SUWON_CITY_HALL = Point(127.0284632, 37.2629820)
 
 
 def main() -> None:
@@ -64,12 +73,23 @@ def build_geodata(
     features = source_payload.get("features")
     if not isinstance(features, list) or not features:
         raise ValueError("source FeatureCollection must contain at least one feature")
+    if len(features) != 1:
+        raise ValueError("source FeatureCollection must contain exactly one feature")
+    provenance = read_provenance(source_payload)
+    feature = cast(dict[str, Any], features[0])
+    properties = feature.get("properties")
+    if not isinstance(properties, dict):
+        raise TypeError("source feature properties must be an object")
+    expected_properties = {
+        "BASE_DATE": "20250630",
+        "SIDO_CD": "11",
+        "SIDO_NM": "서울특별시",
+    }
+    if any(properties.get(key) != value for key, value in expected_properties.items()):
+        raise ValueError("source feature is not the 2025 Q2 Seoul boundary")
 
     source_crs, source_crs_label = read_source_crs(source_payload)
-    source_geometries = [
-        shape_geometry(cast(dict[str, Any], feature)["geometry"])
-        for feature in features
-    ]
+    source_geometries = [shape_geometry(feature["geometry"])]
     source_boundary = polygonal_geometry(unary_union(source_geometries))
     to_wgs84 = Transformer.from_crs(source_crs, "EPSG:4326", always_xy=True)
     seoul_wgs84 = polygonal_geometry(transform(to_wgs84.transform, source_boundary))
@@ -83,8 +103,8 @@ def build_geodata(
     support_wgs84 = polygonal_geometry(
         transform(to_output.transform, support_projected)
     )
-    if support_wgs84.covers(INCHEON_CITY_HALL):
-        raise ValueError("12 km support area unexpectedly contains Incheon City Hall")
+    if support_wgs84.covers(SUWON_CITY_HALL):
+        raise ValueError("12 km support area unexpectedly contains Suwon City Hall")
 
     output_directory.mkdir(parents=True, exist_ok=True)
     seoul_path = output_directory / "seoul.geojson"
@@ -105,12 +125,31 @@ def build_geodata(
     )
 
     manifest = {
+        "generatedAt": collected_at,
+        "coverage": {
+            "purpose": "MAP_SUPPORT_AREA_ONLY",
+            "bufferDistanceMeters": BUFFER_DISTANCE_M,
+            "legalClassificationBasis": "NETWORK_ROUND_TRIP_DISTANCE",
+        },
+        "sourceArchive": {
+            "pageUrl": provenance["pageUrl"],
+            "datasetName": provenance["datasetName"],
+            "referencePeriod": provenance["referencePeriod"],
+            "fileIdentifier": provenance["fileIdentifier"],
+            "detailNumber": provenance["detailNumber"],
+            "sha256": provenance["archiveSha256"],
+            "layer": provenance["sourceLayer"],
+            "crs": provenance["sourceLayerCrs"],
+            "featureCount": provenance["sourceLayerFeatureCount"],
+            "collectedAt": provenance["collectedAt"],
+        },
         "source": {
-            "pageUrl": SOURCE_PAGE_URL,
-            "collectedAt": collected_at,
             "crs": source_crs_label,
             "sha256": sha256(source_path),
             "featureCount": len(features),
+            "baseDate": properties["BASE_DATE"],
+            "administrativeCode": properties["SIDO_CD"],
+            "administrativeName": properties["SIDO_NM"],
         },
         "outputs": {
             seoul_path.name: {
@@ -146,6 +185,35 @@ def read_source_crs(payload: dict[str, Any]) -> tuple[CRS, str]:
     return crs, label
 
 
+def read_provenance(payload: dict[str, Any]) -> dict[str, Any]:
+    provenance = payload.get("_provenance")
+    if not isinstance(provenance, dict):
+        raise TypeError("source GeoJSON _provenance must be an object")
+    expected_values: dict[str, Any] = {
+        "pageUrl": SOURCE_PAGE_URL,
+        "datasetName": DATASET_NAME,
+        "referencePeriod": REFERENCE_PERIOD,
+        "fileIdentifier": FILE_IDENTIFIER,
+        "detailNumber": 1,
+        "sourceLayer": SOURCE_LAYER,
+        "sourceLayerCrs": SOURCE_LAYER_CRS,
+    }
+    for key, expected in expected_values.items():
+        if provenance.get(key) != expected:
+            raise ValueError(f"unexpected source provenance {key}")
+    archive_sha256 = provenance.get("archiveSha256")
+    if (
+        not isinstance(archive_sha256, str)
+        or len(archive_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in archive_sha256)
+    ):
+        raise ValueError("source provenance archiveSha256 must be lowercase SHA-256")
+    if not isinstance(provenance.get("sourceLayerFeatureCount"), int):
+        raise TypeError("source provenance feature count must be an integer")
+    normalize_collected_at(cast(str, provenance.get("collectedAt")))
+    return provenance
+
+
 def polygonal_geometry(geometry: BaseGeometry) -> BaseGeometry:
     repaired = make_valid(geometry)
     polygon_parts = tuple(iter_polygons(repaired))
@@ -177,22 +245,50 @@ def write_geojson(
             {
                 "type": "Feature",
                 "properties": properties,
-                "geometry": mapping(geometry),
+                "geometry": rounded_mapping(geometry),
             }
         ],
     }
-    write_json(path, payload)
+    write_json(path, payload, compact=True)
 
 
-def write_json(path: Path, payload: dict[str, Any]) -> None:
+def write_json(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    compact: bool = False,
+) -> None:
     path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=None if compact else 2,
+            separators=(",", ":") if compact else None,
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
 
 
 def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def rounded_mapping(geometry: BaseGeometry) -> dict[str, Any]:
+    geometry_mapping = dict(mapping(geometry))
+    geometry_mapping["coordinates"] = round_coordinates(geometry_mapping["coordinates"])
+    return geometry_mapping
+
+
+def round_coordinates(value: Any) -> Any:
+    if isinstance(value, (float, int)):
+        return round(float(value), COORDINATE_PRECISION)
+    return [round_coordinates(child) for child in value]
 
 
 def normalize_collected_at(value: str | None) -> str:
