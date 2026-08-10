@@ -97,6 +97,7 @@ queue/corrections는 별도 mount이고 임의 host path, 이미지, command를 
 /volume1/education-admin/raw             -> /data/raw:ro
 /volume1/education-admin/canonical       -> /data/canonical:ro
 review-registry.json + expected SHA-256  -> /input/review-registry.json:ro
+/etc/passwd                              -> /etc/passwd:ro
 /volume1/education-admin/review-state    -> /data/review-state:rw
 /volume1/education-admin/review-queue    -> /data/review-queue:rw
 /volume1/education-admin/corrections     -> /data/corrections:rw
@@ -196,6 +197,7 @@ export SEN_QA_REVIEW_GID="$(getent group "$SEN_QA_REVIEW_GROUP" | cut -d: -f3)"
   -v "$SEN_QA_CANONICAL_DIR:/data/canonical:ro" \
   -v "$SEN_QA_REVIEW_STATE_DIR:/data/review-state:rw" \
   -v "$SEN_QA_BROKER_DIR:/run/sen-qa:rw" \
+  -v "/etc/passwd:/etc/passwd:ro" \
   --entrypoint /opt/venv/bin/python \
   "$SEN_QA_BROKER_IMAGE" -m src.ingestion.review_broker \
   --socket /run/sen-qa/review.sock \

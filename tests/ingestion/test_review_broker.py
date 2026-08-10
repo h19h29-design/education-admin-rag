@@ -390,3 +390,4 @@ def test_manual_review_runbook_launches_the_fixed_broker_boundary() -> None:
     assert '"$SEN_QA_RAW_DIR:/data/raw:ro"' in runbook
     assert '"$SEN_QA_CANONICAL_DIR:/data/canonical:ro"' in runbook
     assert '"$SEN_QA_REVIEW_STATE_DIR:/data/review-state:rw"' in runbook
+    assert '"/etc/passwd:/etc/passwd:ro"' in runbook
