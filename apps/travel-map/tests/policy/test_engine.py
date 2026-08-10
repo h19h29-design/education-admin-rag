@@ -1,4 +1,5 @@
-from datetime import datetime, timedelta
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -144,6 +145,27 @@ def test_same_day_four_hour_trip_uses_remaining_daily_ceiling(
     assert result.allowance.amount_krw == amount_krw
 
 
+# Production break caught: replacing the vehicle-adjusted base with a larger
+# same-day remainder instead of applying both independent limits.
+@pytest.mark.parametrize(
+    ("previous_allowance_krw", "amount_krw"), [(5_000, 10_000), (15_000, 5_000)]
+)
+def test_same_day_ceiling_caps_the_vehicle_adjusted_allowance(
+    previous_allowance_krw: int,
+    amount_krw: int,
+) -> None:
+    result = make_policy_engine().calculate(
+        make_policy_input(
+            minutes=240,
+            vehicle_use=VehicleUse.OFFICIAL_OR_RENTED,
+            has_other_local_trips_today=True,
+            previous_allowance_krw=previous_allowance_krw,
+        )
+    )
+
+    assert result.allowance.amount_krw == amount_krw
+
+
 # Production break caught: inventing a same-day under-four-hour payment interpretation.
 def test_same_day_under_four_hour_trip_requires_review() -> None:
     result = make_policy_engine().calculate(
@@ -221,6 +243,56 @@ def test_policy_input_rejects_nonpositive_duration(minutes: int) -> None:
         make_policy_engine().calculate(make_policy_input(minutes=minutes))
 
 
+# Production break caught: selecting a rule by the caller's UTC date instead of
+# the legal calendar date in Asia/Seoul.
+@pytest.mark.parametrize(
+    ("starts_at", "expected_rule_set_id"),
+    [
+        (datetime(2026, 6, 30, 14, 59, tzinfo=UTC), None),
+        (datetime(2026, 6, 30, 15, 0, tzinfo=UTC), "local-travel-2026-07-01"),
+    ],
+)
+def test_rule_effective_date_uses_the_korean_start_date(
+    starts_at: datetime,
+    expected_rule_set_id: str | None,
+) -> None:
+    policy_input = make_policy_input(starts_at=starts_at)
+
+    if expected_rule_set_id is None:
+        with pytest.raises(LookupError, match="no rule set for 2026-06-30"):
+            make_policy_engine().calculate(policy_input)
+        return
+
+    result = make_policy_engine().calculate(policy_input)
+
+    assert result.rule_set_id == expected_rule_set_id
+    assert result.effective_from == "2026-07-01"
+
+
+# Production break caught: accepting booleans, fractions, or numeric strings as
+# measured distance or prior allowance values.
+@pytest.mark.parametrize("field_name", ["round_trip_distance_m", "previous_allowance_krw"])
+@pytest.mark.parametrize("invalid_value", [True, 1.5, "3000"])
+def test_policy_input_rejects_non_integer_numeric_values(
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    policy_input = replace(make_policy_input(), **{field_name: invalid_value})
+
+    with pytest.raises(ValueError, match=rf"{field_name} must be an integer"):
+        make_policy_engine().calculate(policy_input)
+
+
+# Production break caught: letting negative distance misclassify a trip or a
+# negative prior payment increase the daily allowance ceiling.
+@pytest.mark.parametrize("field_name", ["round_trip_distance_m", "previous_allowance_krw"])
+def test_policy_input_rejects_negative_numeric_values(field_name: str) -> None:
+    policy_input = replace(make_policy_input(), **{field_name: -1})
+
+    with pytest.raises(ValueError, match=rf"{field_name} must be non-negative"):
+        make_policy_engine().calculate(policy_input)
+
+
 def make_policy_engine() -> PolicyEngine:
     return PolicyEngine(
         RuleRepository.from_directory("apps/travel-map/resources/rules")
@@ -236,8 +308,10 @@ def make_policy_input(
     vehicle_use: VehicleUse = VehicleUse.NONE,
     has_other_local_trips_today: bool = False,
     previous_allowance_krw: int = 0,
+    starts_at: datetime | None = None,
 ) -> PolicyInput:
-    starts_at = datetime(2026, 8, 10, 9, 0, tzinfo=SEOUL)
+    if starts_at is None:
+        starts_at = datetime(2026, 8, 10, 9, 0, tzinfo=SEOUL)
     return PolicyInput(
         destination_in_seoul=destination_in_seoul,
         round_trip_distance_m=round_trip_distance_m,

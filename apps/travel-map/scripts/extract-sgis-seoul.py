@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -29,6 +30,9 @@ DATASET_NAME = "국가데이터처_SGIS 행정구역 통계 및 경계_20250630"
 REFERENCE_PERIOD = "2025 Q2"
 FILE_IDENTIFIER = "FILE_000000003681593"
 DETAIL_NUMBER = 1
+OFFICIAL_ARCHIVE_SHA256 = (
+    "f1cf0f9de453ac7eaacb273f39cee52851183372b9ddfda428a967c3a670b2c6"
+)
 SOURCE_LAYER = "bnd_sido_00_2025_2Q"
 EXPECTED_CRS_AUTHORITY = ("ESRI", "102080")
 EXPECTED_CRS_NAME = "Korea_2000_Korea_Unified_Coordinate_System"
@@ -50,6 +54,14 @@ MAX_MEMBER_BYTES = {
     ".prj": 100_000,
     ".cpg": 100,
 }
+
+
+@dataclass(frozen=True)
+class ValidatedSgisGeometry:
+    record: dict[str, str]
+    geometry: BaseGeometry
+    source_crs_name: str
+    source_layer_feature_count: int
 
 
 def main() -> None:
@@ -81,6 +93,48 @@ def extract_seoul(
     collected_at: str,
 ) -> None:
     archive_sha256 = sha256(archive_path)
+    if archive_sha256 != OFFICIAL_ARCHIVE_SHA256:
+        raise ValueError(
+            "archive SHA-256 does not match the pinned official SGIS file"
+        )
+    extracted = read_sgis_geometry_without_official_provenance(archive_path)
+    payload = {
+        "type": "FeatureCollection",
+        "name": "seoul-boundary-sgis-2025-q2",
+        "_provenance": {
+            "pageUrl": PAGE_URL,
+            "datasetName": DATASET_NAME,
+            "referencePeriod": REFERENCE_PERIOD,
+            "fileIdentifier": FILE_IDENTIFIER,
+            "detailNumber": DETAIL_NUMBER,
+            "archiveSha256": archive_sha256,
+            "sourceLayer": SOURCE_LAYER,
+            "sourceLayerCrs": {
+                "authority": ":".join(EXPECTED_CRS_AUTHORITY),
+                "name": extracted.source_crs_name,
+            },
+            "sourceLayerFeatureCount": extracted.source_layer_feature_count,
+            "collectedAt": collected_at,
+        },
+        "crs": {
+            "type": "name",
+            "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"},
+        },
+        "features": [
+            {
+                "type": "Feature",
+                "properties": extracted.record,
+                "geometry": rounded_mapping(extracted.geometry),
+            }
+        ],
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(output_path, payload, compact=True)
+
+
+def read_sgis_geometry_without_official_provenance(
+    archive_path: Path,
+) -> ValidatedSgisGeometry:
     with ZipFile(archive_path) as zip_file, TemporaryDirectory() as temporary:
         temporary_root = Path(temporary)
         members = find_layer_members(zip_file)
@@ -123,38 +177,12 @@ def extract_seoul(
         if not seoul_wgs84.covers(SEOUL_CITY_HALL):
             raise ValueError("extracted boundary does not contain Seoul City Hall")
 
-        payload = {
-            "type": "FeatureCollection",
-            "name": "seoul-boundary-sgis-2025-q2",
-            "_provenance": {
-                "pageUrl": PAGE_URL,
-                "datasetName": DATASET_NAME,
-                "referencePeriod": REFERENCE_PERIOD,
-                "fileIdentifier": FILE_IDENTIFIER,
-                "detailNumber": DETAIL_NUMBER,
-                "archiveSha256": archive_sha256,
-                "sourceLayer": SOURCE_LAYER,
-                "sourceLayerCrs": {
-                    "authority": ":".join(EXPECTED_CRS_AUTHORITY),
-                    "name": source_crs.name,
-                },
-                "sourceLayerFeatureCount": len(reader),
-                "collectedAt": collected_at,
-            },
-            "crs": {
-                "type": "name",
-                "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"},
-            },
-            "features": [
-                {
-                    "type": "Feature",
-                    "properties": record,
-                    "geometry": rounded_mapping(seoul_wgs84),
-                }
-            ],
-        }
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        write_json(output_path, payload, compact=True)
+        return ValidatedSgisGeometry(
+            record=record,
+            geometry=seoul_wgs84,
+            source_crs_name=source_crs.name,
+            source_layer_feature_count=len(reader),
+        )
 
 
 def find_layer_members(zip_file: ZipFile) -> dict[str, ZipInfo]:

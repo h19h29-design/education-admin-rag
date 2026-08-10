@@ -1,3 +1,5 @@
+from zoneinfo import ZoneInfo
+
 from app.policy.models import (
     AllowanceResult,
     AllowanceStatus,
@@ -9,6 +11,8 @@ from app.policy.models import (
 )
 from app.policy.rules import RuleRepository, RuleSet
 
+SEOUL_TIMEZONE = ZoneInfo("Asia/Seoul")
+
 
 class PolicyEngine:
     def __init__(self, rule_repository: RuleRepository) -> None:
@@ -16,7 +20,8 @@ class PolicyEngine:
 
     def calculate(self, policy_input: PolicyInput) -> PolicyResult:
         self._validate_input(policy_input)
-        rules = self._rule_repository.for_date(policy_input.starts_at.date())
+        korean_start_date = policy_input.starts_at.astimezone(SEOUL_TIMEZONE).date()
+        rules = self._rule_repository.for_date(korean_start_date)
         classification = self._classify(policy_input, rules)
         duration_minutes = int(
             (policy_input.returns_at - policy_input.starts_at).total_seconds() // 60
@@ -61,10 +66,11 @@ class PolicyEngine:
                 policy_input.has_other_local_trips_today
                 and duration_minutes >= rules.four_hours_minutes
             ):
-                base = max(
+                remaining_daily_ceiling = max(
                     0,
                     rules.four_hours_or_more_krw - policy_input.previous_allowance_krw,
                 )
+                base = min(base, remaining_daily_ceiling)
             elif policy_input.has_other_local_trips_today:
                 return PolicyResult(
                     classification=classification,
@@ -92,6 +98,12 @@ class PolicyEngine:
 
     @staticmethod
     def _validate_input(policy_input: PolicyInput) -> None:
+        for field_name in ("round_trip_distance_m", "previous_allowance_krw"):
+            value = getattr(policy_input, field_name)
+            if type(value) is not int:
+                raise ValueError(f"{field_name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{field_name} must be non-negative")
         if (
             policy_input.starts_at.tzinfo is None
             or policy_input.starts_at.utcoffset() is None

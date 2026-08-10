@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -24,6 +25,9 @@ SOURCE_PAGE_URL = "https://www.data.go.kr/data/15129688/fileData.do"
 DATASET_NAME = "국가데이터처_SGIS 행정구역 통계 및 경계_20250630"
 REFERENCE_PERIOD = "2025 Q2"
 FILE_IDENTIFIER = "FILE_000000003681593"
+OFFICIAL_ARCHIVE_SHA256 = (
+    "f1cf0f9de453ac7eaacb273f39cee52851183372b9ddfda428a967c3a670b2c6"
+)
 SOURCE_LAYER = "bnd_sido_00_2025_2Q"
 SOURCE_LAYER_CRS = {
     "authority": "ESRI:102080",
@@ -32,9 +36,25 @@ SOURCE_LAYER_CRS = {
 OUTPUT_CRS = "OGC:CRS84"
 PROJECTED_CRS = "EPSG:5179"
 BUFFER_DISTANCE_M = 12_000
+PROVIDER_BUFFER_QUAD_SEGS = 64
+PROVIDER_BUFFER_PADDING_M = 2
+PROVIDER_BUFFER_DISTANCE_M = BUFFER_DISTANCE_M + PROVIDER_BUFFER_PADDING_M
+MAXIMUM_CHORD_ERROR_M = 0.904
+MAXIMUM_COORDINATE_ROUNDING_ERROR_M = 0.02
+MINIMUM_COVERAGE_MARGIN_M = 1.076
+MAXIMUM_OVERCOVERAGE_M = 2.02
 COORDINATE_PRECISION = 7
 SEOUL_CITY_HALL = Point(126.9780, 37.5665)
 SUWON_CITY_HALL = Point(127.0284632, 37.2629820)
+
+
+@dataclass(frozen=True)
+class PreparedGeodata:
+    seoul_wgs84: BaseGeometry
+    support_wgs84: BaseGeometry
+    source_crs_label: str
+    source_feature_count: int
+    source_properties: dict[str, Any]
 
 
 def main() -> None:
@@ -68,55 +88,20 @@ def build_geodata(
     source_payload = cast(
         dict[str, Any], json.loads(source_path.read_text(encoding="utf-8"))
     )
-    if source_payload.get("type") != "FeatureCollection":
-        raise ValueError("source must be a GeoJSON FeatureCollection")
-    features = source_payload.get("features")
-    if not isinstance(features, list) or not features:
-        raise ValueError("source FeatureCollection must contain at least one feature")
-    if len(features) != 1:
-        raise ValueError("source FeatureCollection must contain exactly one feature")
     provenance = read_provenance(source_payload)
-    feature = cast(dict[str, Any], features[0])
-    properties = feature.get("properties")
-    if not isinstance(properties, dict):
-        raise TypeError("source feature properties must be an object")
-    expected_properties = {
-        "BASE_DATE": "20250630",
-        "SIDO_CD": "11",
-        "SIDO_NM": "서울특별시",
-    }
-    if any(properties.get(key) != value for key, value in expected_properties.items()):
-        raise ValueError("source feature is not the 2025 Q2 Seoul boundary")
-
-    source_crs, source_crs_label = read_source_crs(source_payload)
-    source_geometries = [shape_geometry(feature["geometry"])]
-    source_boundary = polygonal_geometry(unary_union(source_geometries))
-    to_wgs84 = Transformer.from_crs(source_crs, "EPSG:4326", always_xy=True)
-    seoul_wgs84 = polygonal_geometry(transform(to_wgs84.transform, source_boundary))
-    if not seoul_wgs84.covers(SEOUL_CITY_HALL):
-        raise ValueError("source boundary does not contain Seoul City Hall")
-
-    to_projected = Transformer.from_crs("EPSG:4326", PROJECTED_CRS, always_xy=True)
-    to_output = Transformer.from_crs(PROJECTED_CRS, "EPSG:4326", always_xy=True)
-    seoul_projected = polygonal_geometry(transform(to_projected.transform, seoul_wgs84))
-    support_projected = polygonal_geometry(seoul_projected.buffer(BUFFER_DISTANCE_M))
-    support_wgs84 = polygonal_geometry(
-        transform(to_output.transform, support_projected)
-    )
-    if support_wgs84.covers(SUWON_CITY_HALL):
-        raise ValueError("12 km support area unexpectedly contains Suwon City Hall")
+    prepared = prepare_geodata(source_payload)
 
     output_directory.mkdir(parents=True, exist_ok=True)
     seoul_path = output_directory / "seoul.geojson"
     support_path = output_directory / "seoul-plus-12km.geojson"
     write_geojson(
         seoul_path,
-        seoul_wgs84,
+        prepared.seoul_wgs84,
         properties={"name": "서울특별시", "sourcePageUrl": SOURCE_PAGE_URL},
     )
     write_geojson(
         support_path,
-        support_wgs84,
+        prepared.support_wgs84,
         properties={
             "name": "서울특별시 12km 지원영역",
             "bufferDistanceMeters": BUFFER_DISTANCE_M,
@@ -130,6 +115,21 @@ def build_geodata(
             "purpose": "MAP_SUPPORT_AREA_ONLY",
             "bufferDistanceMeters": BUFFER_DISTANCE_M,
             "legalClassificationBasis": "NETWORK_ROUND_TRIP_DISTANCE",
+            "runtimeClassification": "EXACT_PROJECTED_DISTANCE_LTE_BUFFER",
+            "providerPolygonApproximation": {
+                "method": "CONSERVATIVE_PROJECTED_ROUND_BUFFER",
+                "projectedCrs": PROJECTED_CRS,
+                "quadSegments": PROVIDER_BUFFER_QUAD_SEGS,
+                "nominalBufferDistanceMeters": BUFFER_DISTANCE_M,
+                "generatedBufferDistanceMeters": PROVIDER_BUFFER_DISTANCE_M,
+                "conservativePaddingMeters": PROVIDER_BUFFER_PADDING_M,
+                "maximumChordErrorMeters": MAXIMUM_CHORD_ERROR_M,
+                "maximumCoordinateRoundingErrorMeters": (
+                    MAXIMUM_COORDINATE_ROUNDING_ERROR_M
+                ),
+                "minimumCoverageMarginMeters": MINIMUM_COVERAGE_MARGIN_M,
+                "maximumOvercoverageMeters": MAXIMUM_OVERCOVERAGE_M,
+            },
         },
         "sourceArchive": {
             "pageUrl": provenance["pageUrl"],
@@ -144,12 +144,12 @@ def build_geodata(
             "collectedAt": provenance["collectedAt"],
         },
         "source": {
-            "crs": source_crs_label,
+            "crs": prepared.source_crs_label,
             "sha256": sha256(source_path),
-            "featureCount": len(features),
-            "baseDate": properties["BASE_DATE"],
-            "administrativeCode": properties["SIDO_CD"],
-            "administrativeName": properties["SIDO_NM"],
+            "featureCount": prepared.source_feature_count,
+            "baseDate": prepared.source_properties["BASE_DATE"],
+            "administrativeCode": prepared.source_properties["SIDO_CD"],
+            "administrativeName": prepared.source_properties["SIDO_NM"],
         },
         "outputs": {
             seoul_path.name: {
@@ -165,6 +165,57 @@ def build_geodata(
         },
     }
     write_json(output_directory / "manifest.json", manifest)
+
+
+def prepare_geodata(source_payload: dict[str, Any]) -> PreparedGeodata:
+    if source_payload.get("type") != "FeatureCollection":
+        raise ValueError("source must be a GeoJSON FeatureCollection")
+    features = source_payload.get("features")
+    if not isinstance(features, list) or not features:
+        raise ValueError("source FeatureCollection must contain at least one feature")
+    if len(features) != 1:
+        raise ValueError("source FeatureCollection must contain exactly one feature")
+    feature = cast(dict[str, Any], features[0])
+    properties = feature.get("properties")
+    if not isinstance(properties, dict):
+        raise TypeError("source feature properties must be an object")
+    expected_properties = {
+        "BASE_DATE": "20250630",
+        "SIDO_CD": "11",
+        "SIDO_NM": "서울특별시",
+    }
+    if any(properties.get(key) != value for key, value in expected_properties.items()):
+        raise ValueError("source feature is not the 2025 Q2 Seoul boundary")
+
+    source_crs, source_crs_label = read_source_crs(source_payload)
+    source_boundary = polygonal_geometry(shape_geometry(feature["geometry"]))
+    to_wgs84 = Transformer.from_crs(source_crs, "EPSG:4326", always_xy=True)
+    seoul_wgs84 = polygonal_geometry(transform(to_wgs84.transform, source_boundary))
+    if not seoul_wgs84.covers(SEOUL_CITY_HALL):
+        raise ValueError("source boundary does not contain Seoul City Hall")
+
+    to_projected = Transformer.from_crs("EPSG:4326", PROJECTED_CRS, always_xy=True)
+    to_output = Transformer.from_crs(PROJECTED_CRS, "EPSG:4326", always_xy=True)
+    seoul_projected = polygonal_geometry(transform(to_projected.transform, seoul_wgs84))
+    support_projected = polygonal_geometry(
+        seoul_projected.buffer(
+            PROVIDER_BUFFER_DISTANCE_M,
+            quad_segs=PROVIDER_BUFFER_QUAD_SEGS,
+        )
+    )
+    support_wgs84 = polygonal_geometry(
+        transform(to_output.transform, support_projected)
+    )
+    if support_wgs84.covers(SUWON_CITY_HALL):
+        raise ValueError("12 km support area unexpectedly contains Suwon City Hall")
+
+    return PreparedGeodata(
+        seoul_wgs84=seoul_wgs84,
+        support_wgs84=support_wgs84,
+        source_crs_label=source_crs_label,
+        source_feature_count=len(features),
+        source_properties=properties,
+    )
 
 
 def read_source_crs(payload: dict[str, Any]) -> tuple[CRS, str]:
@@ -195,23 +246,20 @@ def read_provenance(payload: dict[str, Any]) -> dict[str, Any]:
         "referencePeriod": REFERENCE_PERIOD,
         "fileIdentifier": FILE_IDENTIFIER,
         "detailNumber": 1,
+        "archiveSha256": OFFICIAL_ARCHIVE_SHA256,
         "sourceLayer": SOURCE_LAYER,
         "sourceLayerCrs": SOURCE_LAYER_CRS,
     }
     for key, expected in expected_values.items():
         if provenance.get(key) != expected:
             raise ValueError(f"unexpected source provenance {key}")
-    archive_sha256 = provenance.get("archiveSha256")
-    if (
-        not isinstance(archive_sha256, str)
-        or len(archive_sha256) != 64
-        or any(character not in "0123456789abcdef" for character in archive_sha256)
-    ):
-        raise ValueError("source provenance archiveSha256 must be lowercase SHA-256")
     if not isinstance(provenance.get("sourceLayerFeatureCount"), int):
         raise TypeError("source provenance feature count must be an integer")
-    normalize_collected_at(cast(str, provenance.get("collectedAt")))
-    return provenance
+    validated = dict(provenance)
+    validated["collectedAt"] = normalize_provenance_collected_at(
+        provenance.get("collectedAt")
+    )
+    return validated
 
 
 def polygonal_geometry(geometry: BaseGeometry) -> BaseGeometry:
@@ -297,6 +345,24 @@ def normalize_collected_at(value: str | None) -> str:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("collected-at must include a timezone")
+    return (
+        parsed.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
+
+
+def normalize_provenance_collected_at(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("source provenance collectedAt must be a string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(
+            "source provenance collectedAt must be a timezone-aware ISO-8601 timestamp"
+        ) from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(
+            "source provenance collectedAt must be a timezone-aware ISO-8601 timestamp"
+        )
     return (
         parsed.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     )

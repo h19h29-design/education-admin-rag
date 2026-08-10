@@ -1,13 +1,14 @@
-import hashlib
-import json
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import pytest
 import shapefile
 from pyproj import CRS, Transformer
-from shapely.geometry import Point, shape
+from shapely.geometry import Point
 
 SCRIPT = Path("apps/travel-map/scripts/extract-sgis-seoul.py")
 SOURCE_WKT = (
@@ -22,8 +23,29 @@ SOURCE_WKT = (
 )
 
 
-# Production break caught: extracting a province other than observed SIDO_CD 11.
-def test_extractor_selects_only_seoul_and_transforms_observed_crs(
+# Production break caught: breaking generic SGIS geometry inspection while
+# separating synthetic fixtures from the official provenance-producing path.
+def test_unverified_geometry_reader_selects_seoul_and_transforms_observed_crs(
+    tmp_path: Path,
+) -> None:
+    archive = make_sgis_archive(tmp_path)
+    extracted = load_extractor_module().read_sgis_geometry_without_official_provenance(
+        archive
+    )
+
+    assert extracted.record == {
+        "BASE_DATE": "20250630",
+        "SIDO_CD": "11",
+        "SIDO_NM": "서울특별시",
+    }
+    assert extracted.geometry.covers(Point(126.9780, 37.5665))
+    assert not extracted.geometry.covers(Point(129.05, 35.15))
+    assert extracted.source_layer_feature_count == 2
+
+
+# Production break caught: assigning official SGIS identifiers to a structurally
+# valid archive whose bytes do not match the pinned official download.
+def test_official_extractor_rejects_structurally_valid_wrong_hash_archive(
     tmp_path: Path,
 ) -> None:
     archive = make_sgis_archive(tmp_path)
@@ -36,47 +58,17 @@ def test_extractor_selects_only_seoul_and_transforms_observed_crs(
         text=True,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    payload = json.loads(output.read_text(encoding="utf-8"))
-    assert len(payload["features"]) == 1
-    assert payload["features"][0]["properties"] == {
-        "BASE_DATE": "20250630",
-        "SIDO_CD": "11",
-        "SIDO_NM": "서울특별시",
-    }
-    geometry = shape(payload["features"][0]["geometry"])
-    assert geometry.covers(Point(126.9780, 37.5665))
-    assert not geometry.covers(Point(129.05, 35.15))
-    assert payload["_provenance"] == {
-        "pageUrl": "https://www.data.go.kr/data/15129688/fileData.do",
-        "datasetName": "국가데이터처_SGIS 행정구역 통계 및 경계_20250630",
-        "referencePeriod": "2025 Q2",
-        "fileIdentifier": "FILE_000000003681593",
-        "detailNumber": 1,
-        "archiveSha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
-        "sourceLayer": "bnd_sido_00_2025_2Q",
-        "sourceLayerCrs": {
-            "authority": "ESRI:102080",
-            "name": "Korea_2000_Korea_Unified_Coordinate_System",
-        },
-        "sourceLayerFeatureCount": 2,
-        "collectedAt": "2026-08-10T08:00:00Z",
-    }
+    assert completed.returncode != 0
+    assert "archive SHA-256 does not match the pinned official SGIS file" in completed.stderr
+    assert not output.exists()
 
 
 # Production break caught: silently transforming an unverified shapefile CRS.
 def test_extractor_rejects_unexpected_source_crs(tmp_path: Path) -> None:
     archive = make_sgis_archive(tmp_path, source_wkt=CRS.from_epsg(4326).to_wkt())
 
-    completed = subprocess.run(
-        extractor_command(archive, tmp_path / "seoul-boundary.geojson"),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode != 0
-    assert "source CRS must be ESRI:102080" in completed.stderr
+    with pytest.raises(ValueError, match="source CRS must be ESRI:102080"):
+        load_extractor_module().read_sgis_geometry_without_official_provenance(archive)
 
 
 def make_sgis_archive(tmp_path: Path, *, source_wkt: str = SOURCE_WKT) -> Path:
@@ -155,3 +147,12 @@ def extractor_command(archive: Path, output: Path) -> list[str]:
         "--collected-at",
         "2026-08-10T08:00:00Z",
     ]
+
+
+def load_extractor_module() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("extract_sgis_seoul", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module

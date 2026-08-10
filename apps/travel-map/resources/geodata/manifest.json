@@ -2,14 +2,27 @@
   "coverage": {
     "bufferDistanceMeters": 12000,
     "legalClassificationBasis": "NETWORK_ROUND_TRIP_DISTANCE",
-    "purpose": "MAP_SUPPORT_AREA_ONLY"
+    "providerPolygonApproximation": {
+      "conservativePaddingMeters": 2,
+      "generatedBufferDistanceMeters": 12002,
+      "maximumChordErrorMeters": 0.904,
+      "maximumCoordinateRoundingErrorMeters": 0.02,
+      "maximumOvercoverageMeters": 2.02,
+      "method": "CONSERVATIVE_PROJECTED_ROUND_BUFFER",
+      "minimumCoverageMarginMeters": 1.076,
+      "nominalBufferDistanceMeters": 12000,
+      "projectedCrs": "EPSG:5179",
+      "quadSegments": 64
+    },
+    "purpose": "MAP_SUPPORT_AREA_ONLY",
+    "runtimeClassification": "EXACT_PROJECTED_DISTANCE_LTE_BUFFER"
   },
   "generatedAt": "2026-08-10T08:13:10Z",
   "outputs": {
     "seoul-plus-12km.geojson": {
       "crs": "OGC:CRS84",
       "featureCount": 1,
-      "sha256": "52307a5aa715cbb3f6de564be5737930c122507d444b90d7afd7757a170112ca"
+      "sha256": "507384ccd9fffb46f313ebf63a4c84605a1876605c065147b1118893d49240cd"
     },
     "seoul.geojson": {
       "crs": "OGC:CRS84",

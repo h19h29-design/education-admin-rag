@@ -16,11 +16,11 @@ class CoverageService:
         self,
         *,
         seoul_projected: BaseGeometry,
-        support_area_projected: BaseGeometry,
+        buffer_distance_m: int,
         wgs84_to_projected: Transformer,
     ) -> None:
         self._seoul = seoul_projected
-        self._support_area = support_area_projected
+        self._buffer_distance_m = buffer_distance_m
         self._wgs84_to_projected = wgs84_to_projected
 
     @classmethod
@@ -39,7 +39,7 @@ class CoverageService:
         seoul_projected = transform(transformer.transform, seoul_wgs84)
         return cls(
             seoul_projected=seoul_projected,
-            support_area_projected=seoul_projected.buffer(buffer_distance_m),
+            buffer_distance_m=buffer_distance_m,
             wgs84_to_projected=transformer,
         )
 
@@ -50,6 +50,6 @@ class CoverageService:
         )
         if self._seoul.covers(projected_point):
             return CoverageState.SEOUL
-        if self._support_area.covers(projected_point):
+        if self._seoul.distance(projected_point) <= self._buffer_distance_m:
             return CoverageState.BUFFER
         return CoverageState.OUTSIDE

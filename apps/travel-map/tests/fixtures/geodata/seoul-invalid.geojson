@@ -1,21 +1,6 @@
 {
   "type": "FeatureCollection",
   "name": "synthetic-invalid-seoul-test-fixture",
-  "_provenance": {
-    "pageUrl": "https://www.data.go.kr/data/15129688/fileData.do",
-    "datasetName": "국가데이터처_SGIS 행정구역 통계 및 경계_20250630",
-    "referencePeriod": "2025 Q2",
-    "fileIdentifier": "FILE_000000003681593",
-    "detailNumber": 1,
-    "archiveSha256": "0000000000000000000000000000000000000000000000000000000000000001",
-    "sourceLayer": "bnd_sido_00_2025_2Q",
-    "sourceLayerCrs": {
-      "authority": "ESRI:102080",
-      "name": "Korea_2000_Korea_Unified_Coordinate_System"
-    },
-    "sourceLayerFeatureCount": 17,
-    "collectedAt": "2026-08-10T00:00:00Z"
-  },
   "crs": {
     "type": "name",
     "properties": {
