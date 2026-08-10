@@ -21,6 +21,13 @@ _REGION_SOURCE_URL = (
     "https://e-childschoolinfo.moe.go.kr/openApi/sidoSigunguCode.do"
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_PINNED_REGION_RAW_SHA256 = (
+    "94bb20b042c7b4bde170b8264c7116076e07dc98f8d97132841bc8f6c91e8925"
+)
+_PINNED_REGION_NORMALIZED_SHA256 = (
+    "13d86558212df3cc0739d240ee902cfd38da4d6d54ae87cea71bda112d5cd1f3"
+)
+_MAX_CUMULATIVE_BYTES = 25 * 1024 * 1024
 
 _FOUNDATION_TYPES = {
     "\uad6d\ub9bd": "NATIONAL",
@@ -58,11 +65,27 @@ class KindergartenSource:
         self._page_size = page_size
 
     async def fetch(self) -> SourceFetchResult:
+        failure: str | None = None
+        try:
+            return await self._fetch_impl()
+        except SourceDataError as exc:
+            failure = str(exc)
+        finally:
+            self.clear_credentials()
+        raise SourceDataError(
+            failure or "kindergarten source validation failed"
+        )
+
+    def clear_credentials(self) -> None:
+        self._api_key = ""
+
+    async def _fetch_impl(self) -> SourceFetchResult:
         regions = parse_kindergarten_region_codes(
             self._regions_path,
             expected_timing=self._timing,
         )
         pages: list[bytes] = []
+        cumulative_bytes = 0
         records: list[SourceInstitutionRecord] = []
         for sido_code, sgg_code, _district in regions:
             seen_page_ids: set[tuple[str, ...]] = set()
@@ -86,6 +109,11 @@ class KindergartenSource:
                     headers=None,
                     source_label="kindergarten",
                 )
+                cumulative_bytes += len(raw)
+                if cumulative_bytes > _MAX_CUMULATIVE_BYTES:
+                    raise SourceDataError(
+                        "kindergarten cumulative response size exceeds the trusted limit"
+                    )
                 _validate_response_echo(
                     payload,
                     sido_code=sido_code,
@@ -179,6 +207,7 @@ def parse_kindergarten_region_codes(
         "source_url",
         "source_as_of",
         "source_sha256",
+        "normalized_sha256",
         "timing",
         "license_name",
         "attribution",
@@ -187,10 +216,31 @@ def parse_kindergarten_region_codes(
         raise SourceDataError("kindergarten region provenance is incomplete")
     if metadata["source_url"] != _REGION_SOURCE_URL:
         raise SourceDataError("kindergarten region source URL is not official")
-    if _SHA256.fullmatch(metadata["source_sha256"]) is None:
+    if (
+        _SHA256.fullmatch(metadata["source_sha256"]) is None
+        or metadata["source_sha256"] != _PINNED_REGION_RAW_SHA256
+    ):
         raise SourceDataError("kindergarten region source SHA-256 is invalid")
+    normalized_digest = hashlib.sha256(
+        ("\n".join(data_lines) + "\n").encode("utf-8")
+    ).hexdigest()
+    if (
+        metadata["normalized_sha256"] != normalized_digest
+        or expected_count == 25
+        and normalized_digest != _PINNED_REGION_NORMALIZED_SHA256
+    ):
+        raise SourceDataError(
+            "kindergarten region normalized resource is not reviewed"
+        )
     if re.fullmatch(r"\d{4}[12]", metadata["timing"]) is None:
         raise SourceDataError("kindergarten region timing is invalid")
+    if (
+        metadata["source_as_of"] != "2026-08-10"
+        or metadata["license_name"] != "PUBLIC_DATA_PORTAL_TERMS"
+        or metadata["attribution"]
+        != "Source: Ministry of Education Kindergarten Info"
+    ):
+        raise SourceDataError("kindergarten region provenance is not reviewed")
     if (
         expected_timing is not None
         and metadata["timing"] != expected_timing

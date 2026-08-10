@@ -12,6 +12,7 @@ from app.institutions.sources.common import (
     EnrichmentProvenance,
     SourceDataError,
     SourceInstitutionRecord,
+    get_bytes_with_retry,
     utc_now,
 )
 
@@ -26,6 +27,7 @@ PINNED_SHA256 = "05fc53d5920aea0161cbb5f31aedb9c466450c7939fd60083b797095afe9eab
 PINNED_SOURCE_AS_OF = "2026-03-20"
 PINNED_SEOUL_COUNT = 1_313
 PINNED_NATIONWIDE_COUNT = 12_011
+_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 
 _FIELDS = [
     "\ud559\uad50ID",
@@ -84,54 +86,42 @@ class StandardSchoolLocationSource:
         self._client = client
 
     async def fetch(self) -> StandardSchoolLocationFetch:
-        timeout = httpx.Timeout(5.0, connect=2.0)
-        for attempt in range(2):
-            try:
-                response = await self._client.get(DOWNLOAD_URL, timeout=timeout)
-                if response.status_code >= 500 and attempt == 0:
-                    continue
-                response.raise_for_status()
-                raw = response.content
-                digest = hashlib.sha256(raw).hexdigest()
-                if digest != PINNED_SHA256:
-                    raise SourceDataError(
-                        "official school-location attachment SHA-256 changed"
-                    )
-                locations = parse_standard_school_locations(
-                    raw,
-                    expected_seoul_count=PINNED_SEOUL_COUNT,
-                    expected_total_count=PINNED_NATIONWIDE_COUNT,
-                )
-                return StandardSchoolLocationFetch(
-                    locations=locations,
-                    raw_sha256=digest,
-                    download_url=DOWNLOAD_URL,
-                    provenance=EnrichmentProvenance(
-                        source="OFFICIAL_STANDARD_SCHOOL_LOCATION",
-                        endpoint=DOWNLOAD_URL,
-                        license_name="PUBLIC_DATA_NO_USE_RESTRICTION",
-                        attribution="Korea Education Facilities Safety Authority",
-                        fetched_at=utc_now(),
-                        source_as_of=PINNED_SOURCE_AS_OF,
-                        raw_sha256=digest,
-                        normalized_sha256=_locations_sha256(locations),
-                        request_region_code="7010000",
-                        request_timing=None,
-                        page_count=1,
-                        fetched_row_count=PINNED_NATIONWIDE_COUNT,
-                        matched_row_count=0,
-                    ),
-                )
-            except (httpx.RequestError, httpx.HTTPStatusError) as exc:
-                if attempt == 0 and (
-                    isinstance(exc, httpx.RequestError)
-                    or exc.response.status_code >= 500
-                ):
-                    continue
-                raise SourceDataError(
-                    "official school-location download failed"
-                ) from exc
-        raise SourceDataError("official school-location download failed")
+        raw = await get_bytes_with_retry(
+            client=self._client,
+            url=DOWNLOAD_URL,
+            source_label="official school-location download",
+            max_response_bytes=_MAX_RESPONSE_BYTES,
+        )
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != PINNED_SHA256:
+            raise SourceDataError(
+                "official school-location attachment SHA-256 changed"
+            )
+        locations = parse_standard_school_locations(
+            raw,
+            expected_seoul_count=PINNED_SEOUL_COUNT,
+            expected_total_count=PINNED_NATIONWIDE_COUNT,
+        )
+        return StandardSchoolLocationFetch(
+            locations=locations,
+            raw_sha256=digest,
+            download_url=DOWNLOAD_URL,
+            provenance=EnrichmentProvenance(
+                source="OFFICIAL_STANDARD_SCHOOL_LOCATION",
+                endpoint=DOWNLOAD_URL,
+                license_name="PUBLIC_DATA_NO_USE_RESTRICTION",
+                attribution="Korea Education Facilities Safety Authority",
+                fetched_at=utc_now(),
+                source_as_of=PINNED_SOURCE_AS_OF,
+                raw_sha256=digest,
+                normalized_sha256=_locations_sha256(locations),
+                request_region_code="7010000",
+                request_timing=None,
+                page_count=1,
+                fetched_row_count=PINNED_NATIONWIDE_COUNT,
+                matched_row_count=0,
+            ),
+        )
 
 
 def parse_standard_school_locations(

@@ -12,6 +12,17 @@ class SourceDataError(ValueError):
 
 
 @dataclass(frozen=True)
+class SourceInstitutionSiteRecord:
+    site_code: str
+    site_name: str
+    road_address: str
+    district: str
+    latitude: float | None
+    longitude: float | None
+    coordinate_quality: str
+
+
+@dataclass(frozen=True)
 class SourceInstitutionRecord:
     institution_id: str
     official_name: str
@@ -26,6 +37,8 @@ class SourceInstitutionRecord:
     source_region_code: str
     source_as_of: str
     coordinate_quality: str
+    site_name: str = "main"
+    additional_sites: tuple[SourceInstitutionSiteRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -60,6 +73,7 @@ class EnrichmentProvenance:
     page_count: int
     fetched_row_count: int
     matched_row_count: int
+    matched_normalized_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,23 +89,53 @@ async def get_json_with_retry(
     params: dict[str, str | int],
     headers: dict[str, str] | None,
     source_label: str,
+    max_response_bytes: int = 5 * 1024 * 1024,
 ) -> tuple[dict[str, Any], bytes]:
+    failure: str | None = None
+    try:
+        return await _get_json_with_retry_impl(
+            client=client,
+            url=url,
+            params=params,
+            headers=headers,
+            source_label=source_label,
+            max_response_bytes=max_response_bytes,
+        )
+    except SourceDataError as exc:
+        failure = str(exc)
+    except Exception:  # noqa: BLE001
+        # This is the public secret-scrubbing boundary for transport callbacks.
+        failure = f"{source_label} request failed"
+    finally:
+        params.clear()
+        if headers is not None:
+            headers.clear()
+    raise SourceDataError(failure or f"{source_label} request failed")
+
+
+async def get_bytes_with_retry(
+    *,
+    client: httpx.AsyncClient,
+    url: str,
+    source_label: str,
+    max_response_bytes: int,
+) -> bytes:
+    """Download a public attachment without buffering beyond its trusted limit."""
     timeout = httpx.Timeout(5.0, connect=2.0)
     for attempt in range(2):
         try:
-            response = await client.get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=timeout,
-            )
-            if response.status_code >= 500 and attempt == 0:
-                continue
-            response.raise_for_status()
-            value = response.json()
-            if type(value) is not dict:
-                raise SourceDataError(f"{source_label} response must be a JSON object")
-            return value, response.content
+            async with client.stream("GET", url, timeout=timeout) as response:
+                if response.status_code >= 500 and attempt == 0:
+                    continue
+                response.raise_for_status()
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(body) + len(chunk) > max_response_bytes:
+                        raise SourceDataError(
+                            f"{source_label} response size exceeds the trusted limit"
+                        )
+                    body.extend(chunk)
+            return bytes(body)
         except (httpx.RequestError, httpx.HTTPStatusError) as exc:
             if attempt == 0 and (
                 isinstance(exc, httpx.RequestError)
@@ -99,6 +143,52 @@ async def get_json_with_retry(
             ):
                 continue
             raise SourceDataError(f"{source_label} request failed") from None
+    raise SourceDataError(f"{source_label} request failed")
+
+
+async def _get_json_with_retry_impl(
+    *,
+    client: httpx.AsyncClient,
+    url: str,
+    params: dict[str, str | int],
+    headers: dict[str, str] | None,
+    source_label: str,
+    max_response_bytes: int,
+) -> tuple[dict[str, Any], bytes]:
+    timeout = httpx.Timeout(5.0, connect=2.0)
+    for attempt in range(2):
+        try:
+            async with client.stream(
+                "GET",
+                url,
+                params=params,
+                headers=headers,
+                timeout=timeout,
+            ) as response:
+                if response.status_code >= 500 and attempt == 0:
+                    continue
+                response.raise_for_status()
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(body) + len(chunk) > max_response_bytes:
+                        raise SourceDataError(
+                            f"{source_label} response size exceeds the trusted limit"
+                        )
+                    body.extend(chunk)
+            raw = bytes(body)
+            value = json.loads(raw)
+            if type(value) is not dict:
+                raise SourceDataError(f"{source_label} response must be a JSON object")
+            return value, raw
+        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            if attempt == 0 and (
+                isinstance(exc, httpx.RequestError)
+                or exc.response.status_code >= 500
+            ):
+                continue
+            raise SourceDataError(f"{source_label} request failed") from None
+        except SourceDataError:
+            raise
         except ValueError:
             raise SourceDataError(
                 f"{source_label} response is not valid JSON"
@@ -114,7 +204,45 @@ def normalized_records_sha256(
     records: tuple[SourceInstitutionRecord, ...] | list[SourceInstitutionRecord],
 ) -> str:
     normalized = json.dumps(
-        [record.__dict__ for record in sorted(records, key=lambda row: row.institution_id)],
+        [
+            {
+                "institution_id": record.institution_id,
+                "official_name": record.official_name,
+                "institution_type": record.institution_type,
+                "foundation_type": record.foundation_type,
+                "education_office": record.education_office,
+                "source": record.source,
+                "source_region_code": record.source_region_code,
+                "source_as_of": record.source_as_of,
+                "sites": [
+                    {
+                        "site_code": site.site_code,
+                        "site_name": site.site_name,
+                        "road_address": site.road_address,
+                        "district": site.district,
+                        "latitude": site.latitude,
+                        "longitude": site.longitude,
+                        "coordinate_quality": site.coordinate_quality,
+                    }
+                    for site in sorted(
+                        (
+                            SourceInstitutionSiteRecord(
+                                site_code="main",
+                                site_name=record.site_name,
+                                road_address=record.road_address,
+                                district=record.district,
+                                latitude=record.latitude,
+                                longitude=record.longitude,
+                                coordinate_quality=record.coordinate_quality,
+                            ),
+                            *record.additional_sites,
+                        ),
+                        key=lambda item: item.site_code,
+                    )
+                ],
+            }
+            for record in sorted(records, key=lambda row: row.institution_id)
+        ],
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

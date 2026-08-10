@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import re
 from collections import Counter
 from collections.abc import Mapping
@@ -33,6 +34,15 @@ _FIELDS = {
 }
 _SOURCE_URL = "https://www.sen.go.kr/www/website.jsp"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_PINNED_SOURCE_SHA256 = (
+    "9f202202edc653b09b4debb5a0ff939cf9fcdc64dd58174b28f8d009bb1b7424"
+)
+_PINNED_NORMALIZED_SHA256 = (
+    "47a2b2ceadca2a6240fa08088ad0655098409016a4345844a9f81683257078b8"
+)
+_PINNED_RECORDS_SHA256 = (
+    "79f7405bfb90c0848162dd6c9ca22487b10b9375df998efd5ad39ee9244efd9d"
+)
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
 
 
@@ -48,6 +58,17 @@ class SenCsvSource:
 
     def load(self) -> SourceFetchResult:
         records, metadata = _parse_sen_csv(self._path)
+        if (
+            metadata["source_sha256"] != _PINNED_SOURCE_SHA256
+            or metadata["normalized_sha256"] != _PINNED_NORMALIZED_SHA256
+            or normalized_records_sha256(records) != _PINNED_RECORDS_SHA256
+            or metadata["source_as_of"] != "2026-08-10"
+            or metadata["license_name"] != "KOGL_TYPE_1_ATTRIBUTION"
+            or metadata["attribution"]
+            != "Source: Seoul Metropolitan Office of Education "
+            "(organization directory and 2026 civil-service handbook)"
+        ):
+            raise SourceDataError("SEN CSV is not the reviewed official resource")
         actual_counts = Counter(record.institution_type for record in records)
         if actual_counts != Counter(self._expected_type_counts):
             raise SourceDataError("SEN CSV organization totals do not match official counts")
@@ -94,6 +115,7 @@ def _parse_sen_csv(
         "source_url",
         "source_as_of",
         "source_sha256",
+        "normalized_sha256",
         "license_name",
         "attribution",
     }:
@@ -102,6 +124,14 @@ def _parse_sen_csv(
         raise SourceDataError("SEN CSV source URL is not official")
     if _SHA256.fullmatch(metadata["source_sha256"]) is None:
         raise SourceDataError("SEN CSV source SHA-256 is invalid")
+    normalized_digest = hashlib.sha256(
+        ("\n".join(data_lines) + "\n").encode("utf-8")
+    ).hexdigest()
+    if (
+        _SHA256.fullmatch(metadata["normalized_sha256"]) is None
+        or metadata["normalized_sha256"] != normalized_digest
+    ):
+        raise SourceDataError("SEN CSV normalized resource SHA-256 is invalid")
     reader = csv.DictReader(data_lines)
     if reader.fieldnames is None or set(reader.fieldnames) != _FIELDS:
         raise SourceDataError("SEN CSV fields are invalid")

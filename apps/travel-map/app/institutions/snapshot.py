@@ -29,6 +29,7 @@ _MANIFEST_FIELDS = {
     "siteCount",
     "quarantinedCount",
     "possibleMatchCount",
+    "possibleMatches",
     "countsByType",
     "countsByFoundation",
     "countsByStatus",
@@ -43,6 +44,7 @@ _SOURCE_FIELDS = {
     "fetchedAt",
     "sourceAsOf",
     "rawSha256",
+    "sourceNormalizedSha256",
     "normalizedSha256",
     "requestRegionCode",
     "requestTiming",
@@ -60,12 +62,15 @@ _ENRICHMENT_FIELDS = {
     "fetchedAt",
     "sourceAsOf",
     "rawSha256",
+    "sourceNormalizedSha256",
     "normalizedSha256",
     "requestRegionCode",
     "requestTiming",
     "pageCount",
     "fetchedRowCount",
     "matchedRowCount",
+    "preservedMatchedRowCount",
+    "rowCount",
 }
 _DIFF_FIELDS = {
     "previousSnapshotId",
@@ -74,6 +79,7 @@ _DIFF_FIELDS = {
     "missingCount",
     "closedCandidateCount",
 }
+_POSSIBLE_MATCH_FIELDS = {"institutionIds", "reason"}
 _INSTITUTION_FIELDS = {
     "institutionId",
     "officialName",
@@ -139,6 +145,20 @@ def verify_snapshot(snapshot_root: Path) -> VerifiedSnapshot:
     ):
         raise SnapshotIntegrityError("current snapshotId must be a safe slug")
 
+    return _verify_snapshot_directory(root, snapshot_id)
+
+
+def verify_snapshot_directory(
+    snapshot_root: Path,
+    snapshot_id: str,
+) -> VerifiedSnapshot:
+    root = _resolve_directory(Path(snapshot_root), "snapshot root")
+    if _SAFE_SNAPSHOT_ID.fullmatch(snapshot_id) is None:
+        raise SnapshotIntegrityError("snapshotId must be a safe slug")
+    return _verify_snapshot_directory(root, snapshot_id)
+
+
+def _verify_snapshot_directory(root: Path, snapshot_id: str) -> VerifiedSnapshot:
     snapshot_path = _resolve_snapshot_directory(root, snapshot_id)
     manifest_path = _resolve_file(
         snapshot_path / "manifest.json",
@@ -279,6 +299,19 @@ def _verify_manifest_fields(value: object) -> None:
         raise SnapshotIntegrityError(
             "manifest.json fields must exactly match schema version 1"
         )
+    possible_matches = value["possibleMatches"]
+    if type(possible_matches) is not list:
+        raise SnapshotIntegrityError(
+            "manifest.json fields must exactly match schema version 1"
+        )
+    for possible_match in possible_matches:
+        if (
+            type(possible_match) is not dict
+            or set(possible_match) != _POSSIBLE_MATCH_FIELDS
+        ):
+            raise SnapshotIntegrityError(
+                "manifest.json fields must exactly match schema version 1"
+            )
 
 
 def _read_bytes(path: Path, label: str) -> bytes:
@@ -377,6 +410,14 @@ def _verify_records(
         )
     if len(sites) != manifest.site_count:
         raise SnapshotIntegrityError("siteCount does not match sites.jsonl row count")
+    quarantined_count = sum(
+        institution.status.value == "REVIEW_REQUIRED"
+        for institution in institutions
+    )
+    if manifest.quarantined_count != quarantined_count:
+        raise SnapshotIntegrityError(
+            "quarantinedCount does not match institution records"
+        )
 
     institution_ids = _unique_ids(
         (item.institution_id for item in institutions),
@@ -444,6 +485,27 @@ def _verify_records(
         "coordinateQualityCounts",
     )
     _verify_source_counts(manifest, institutions)
+    _verify_possible_matches(manifest, institution_ids)
+
+
+def _verify_possible_matches(
+    manifest: SnapshotManifest,
+    institution_ids: set[str],
+) -> None:
+    if manifest.possible_match_count != len(manifest.possible_matches):
+        raise SnapshotIntegrityError(
+            "possibleMatchCount does not match possibleMatches"
+        )
+    pairs: set[tuple[str, str]] = set()
+    for possible_match in manifest.possible_matches:
+        pair = possible_match.institution_ids
+        if pair in pairs:
+            raise SnapshotIntegrityError("duplicate possible institution match")
+        pairs.add(pair)
+        if any(institution_id not in institution_ids for institution_id in pair):
+            raise SnapshotIntegrityError(
+                "possible institution match references unknown institutionId"
+            )
 
 
 def _unique_ids(values: Iterable[str], label: str) -> set[str]:

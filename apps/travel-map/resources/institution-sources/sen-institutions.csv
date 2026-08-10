@@ -1,6 +1,7 @@
 # source_url=https://www.sen.go.kr/www/website.jsp
 # source_as_of=2026-08-10
 # source_sha256=9f202202edc653b09b4debb5a0ff939cf9fcdc64dd58174b28f8d009bb1b7424
+# normalized_sha256=47a2b2ceadca2a6240fa08088ad0655098409016a4345844a9f81683257078b8
 # license_name=KOGL_TYPE_1_ATTRIBUTION
 # attribution=Source: Seoul Metropolitan Office of Education (organization directory and 2026 civil-service handbook)
 institution_id,official_name,institution_type,foundation_type,education_office,road_address,district,latitude,longitude

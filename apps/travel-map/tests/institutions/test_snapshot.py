@@ -278,7 +278,74 @@ def test_snapshot_recomputes_source_row_counts(tmp_path: Path) -> None:
     manifest["sources"][0]["rowCount"] = 9
     write_manifest(fixture, manifest)
 
-    with pytest.raises(SnapshotIntegrityError, match="source TEST_NEIS rowCount"):
+    with pytest.raises(
+        SnapshotIntegrityError,
+        match="source TEST_NEIS rowCount|normalizedRowCount",
+    ):
+        verify_snapshot(fixture)
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"pageCount": 0}, "page/fetched counts"),
+        ({"fetchedRowCount": 0}, "page/fetched counts"),
+        (
+            {"normalizedRowCount": 11},
+            "normalizedRowCount must not exceed fetchedRowCount",
+        ),
+        (
+            {"normalizedRowCount": 9},
+            r"normalizedRowCount \+ preservedRowCount must equal rowCount",
+        ),
+    ],
+)
+def test_snapshot_rejects_impossible_source_count_relations(
+    tmp_path: Path,
+    updates: dict[str, int],
+    message: str,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    manifest["sources"][0].update(updates)
+    write_manifest(fixture, manifest)
+
+    with pytest.raises(SnapshotIntegrityError, match=message):
+        verify_snapshot(fixture)
+
+
+@pytest.mark.parametrize(
+    ("count", "matches", "message"),
+    [
+        (1, [], "possibleMatchCount"),
+        (
+            1,
+            [
+                {
+                    "institutionIds": [
+                        "test-neis:B10:SEMWATER-ES",
+                        "test-neis:B10:UNKNOWN",
+                    ],
+                    "reason": "EXACT_NORMALIZED_NAME_AND_ADDRESS",
+                }
+            ],
+            "unknown institutionId",
+        ),
+    ],
+)
+def test_snapshot_rechecks_possible_match_identities(
+    tmp_path: Path,
+    count: int,
+    matches: list[dict[str, object]],
+    message: str,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    manifest["possibleMatchCount"] = count
+    manifest["possibleMatches"] = matches
+    write_manifest(fixture, manifest)
+
+    with pytest.raises(SnapshotIntegrityError, match=message):
         verify_snapshot(fixture)
 
 

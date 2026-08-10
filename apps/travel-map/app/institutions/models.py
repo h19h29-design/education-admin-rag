@@ -141,11 +141,15 @@ class InstitutionSite(_StrictSnapshotModel):
     site_name: str
     road_address: str
     district: str
-    latitude: float = Field(ge=-90.0, le=90.0)
-    longitude: float = Field(ge=-180.0, le=180.0)
+    latitude: float | None = Field(default=None, ge=-90.0, le=90.0)
+    longitude: float | None = Field(default=None, ge=-180.0, le=180.0)
     coordinate_quality: str
-    routing_anchor_latitude: float = Field(ge=-90.0, le=90.0)
-    routing_anchor_longitude: float = Field(ge=-180.0, le=180.0)
+    routing_anchor_latitude: float | None = Field(default=None, ge=-90.0, le=90.0)
+    routing_anchor_longitude: float | None = Field(
+        default=None,
+        ge=-180.0,
+        le=180.0,
+    )
     is_default: bool
     status: InstitutionStatus
     effective_from: str
@@ -200,6 +204,22 @@ class InstitutionSite(_StrictSnapshotModel):
             raise ValueError("effectiveTo must not precede effectiveFrom")
         return self
 
+    @model_validator(mode="after")
+    def coordinate_pairs_match_status_and_quality(self) -> Self:
+        has_coordinate = self.latitude is not None
+        if has_coordinate != (self.longitude is not None):
+            raise ValueError("site coordinate pair must be both present or both absent")
+        has_anchor = self.routing_anchor_latitude is not None
+        if has_anchor != (self.routing_anchor_longitude is not None):
+            raise ValueError("routing anchor pair must be both present or both absent")
+        if has_coordinate != has_anchor:
+            raise ValueError("site coordinate and routing anchor presence must match")
+        if has_coordinate == (self.coordinate_quality == "MISSING"):
+            raise ValueError("coordinateQuality must match coordinate presence")
+        if self.status is InstitutionStatus.ACTIVE and not has_coordinate:
+            raise ValueError("ACTIVE site requires coordinates and a routing anchor")
+        return self
+
 
 class InstitutionSearchItem(_StrictSnapshotModel):
     institution_id: str
@@ -224,6 +244,7 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
     fetched_at: str
     source_as_of: str
     raw_sha256: str
+    source_normalized_sha256: str
     normalized_sha256: str
     request_region_code: str
     request_timing: str | None
@@ -246,7 +267,11 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
     def required_strings_are_nonblank(cls, value: str) -> str:
         return _require_nonblank(value)
 
-    @field_validator("raw_sha256", "normalized_sha256")
+    @field_validator(
+        "raw_sha256",
+        "source_normalized_sha256",
+        "normalized_sha256",
+    )
     @classmethod
     def raw_hash_is_lowercase_sha256(cls, value: str) -> str:
         return _require_sha256(value)
@@ -269,6 +294,14 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
             self.fetched_at
         ).date():
             raise ValueError("sourceAsOf must not be later than fetchedAt date")
+        if self.page_count <= 0 or self.fetched_row_count <= 0:
+            raise ValueError("source page/fetched counts must be positive")
+        if self.normalized_row_count > self.fetched_row_count:
+            raise ValueError("normalizedRowCount must not exceed fetchedRowCount")
+        if self.normalized_row_count + self.preserved_row_count != self.row_count:
+            raise ValueError(
+                "normalizedRowCount + preservedRowCount must equal rowCount"
+            )
         return self
 
     @field_validator("request_timing")
@@ -288,12 +321,15 @@ class EnrichmentSnapshotInfo(_StrictSnapshotModel):
     fetched_at: str
     source_as_of: str
     raw_sha256: str
+    source_normalized_sha256: str
     normalized_sha256: str
     request_region_code: str
     request_timing: str | None
     page_count: int = Field(ge=0)
     fetched_row_count: int = Field(ge=0)
     matched_row_count: int = Field(ge=0)
+    preserved_matched_row_count: int = Field(ge=0)
+    row_count: int = Field(ge=0)
 
     @field_validator(
         "source",
@@ -308,7 +344,11 @@ class EnrichmentSnapshotInfo(_StrictSnapshotModel):
     def required_strings_are_nonblank(cls, value: str) -> str:
         return _require_nonblank(value)
 
-    @field_validator("raw_sha256", "normalized_sha256")
+    @field_validator(
+        "raw_sha256",
+        "source_normalized_sha256",
+        "normalized_sha256",
+    )
     @classmethod
     def hashes_are_lowercase_sha256(cls, value: str) -> str:
         return _require_sha256(value)
@@ -337,6 +377,10 @@ class EnrichmentSnapshotInfo(_StrictSnapshotModel):
     def enrichment_counts_and_dates_are_consistent(self) -> Self:
         if self.matched_row_count > self.fetched_row_count:
             raise ValueError("matchedRowCount must not exceed fetchedRowCount")
+        if self.matched_row_count + self.preserved_matched_row_count != self.row_count:
+            raise ValueError(
+                "matchedRowCount + preservedMatchedRowCount must equal rowCount"
+            )
         if _parse_iso_date(self.source_as_of) > _parse_rfc3339_timestamp(
             self.fetched_at
         ).date():
@@ -362,6 +406,28 @@ class SnapshotDiff(_StrictSnapshotModel):
         return None if value is None else _require_snapshot_slug(value)
 
 
+class PossibleInstitutionMatch(_StrictSnapshotModel):
+    institution_ids: tuple[str, str]
+    reason: str
+
+    @field_validator("institution_ids")
+    @classmethod
+    def institution_pair_is_safe_sorted_and_distinct(
+        cls,
+        values: tuple[str, str],
+    ) -> tuple[str, str]:
+        for value in values:
+            _require_namespaced_id(value, "institution")
+        if values[0] >= values[1]:
+            raise ValueError("institutionIds must be distinct and sorted")
+        return values
+
+    @field_validator("reason")
+    @classmethod
+    def reason_is_nonblank(cls, value: str) -> str:
+        return _require_nonblank(value)
+
+
 class SnapshotManifest(_StrictSnapshotModel):
     schema_version: int
     snapshot_id: str
@@ -378,6 +444,7 @@ class SnapshotManifest(_StrictSnapshotModel):
     site_count: int = Field(ge=0)
     quarantined_count: int = Field(ge=0)
     possible_match_count: int = Field(ge=0)
+    possible_matches: tuple[PossibleInstitutionMatch, ...]
     counts_by_type: dict[str, int]
     counts_by_foundation: dict[str, int]
     counts_by_status: dict[str, int]

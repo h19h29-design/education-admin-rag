@@ -12,6 +12,8 @@ from app.institutions.sources.common import (
 )
 
 _ENDPOINT = "https://dapi.kakao.com/v2/local/search/address.json"
+_MAX_REQUEST_COUNT = 5_000
+_MAX_CUMULATIVE_BYTES = 25 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -30,12 +32,25 @@ class KakaoLocalClient:
             )
         self._api_key = api_key
         self._client = client
-        self._raw_responses: list[bytes] = []
+        self._raw_sha256 = hashlib.sha256()
+        self._request_count = 0
+        self._cumulative_bytes = 0
         self._accepted: list[GeocodeResult] = []
 
     async def geocode(self, address: str) -> GeocodeResult | None:
+        failure: str | None = None
+        try:
+            return await self._geocode_impl(address)
+        except SourceDataError as exc:
+            failure = str(exc)
+        self._api_key = ""
+        raise SourceDataError(failure or "Kakao Local validation failed")
+
+    async def _geocode_impl(self, address: str) -> GeocodeResult | None:
         if not address.strip():
             raise SourceDataError("geocoding address must be nonblank")
+        if self._request_count >= _MAX_REQUEST_COUNT:
+            raise SourceDataError("Kakao Local request limit exceeded")
         payload, raw = await get_json_with_retry(
             client=self._client,
             url=_ENDPOINT,
@@ -43,7 +58,13 @@ class KakaoLocalClient:
             headers={"Authorization": f"KakaoAK {self._api_key}"},
             source_label="Kakao Local",
         )
-        self._raw_responses.append(raw)
+        if self._cumulative_bytes + len(raw) > _MAX_CUMULATIVE_BYTES:
+            raise SourceDataError(
+                "Kakao Local cumulative response size exceeds the trusted limit"
+            )
+        self._cumulative_bytes += len(raw)
+        self._request_count += 1
+        self._raw_sha256.update(raw)
         documents = payload.get("documents")
         if type(documents) is not list:
             raise SourceDataError("Kakao Local documents are missing")
@@ -73,10 +94,23 @@ class KakaoLocalClient:
         except ValueError as exc:
             raise SourceDataError("Kakao Local coordinates are invalid") from exc
 
+    def clear_credentials(self) -> None:
+        self._api_key = ""
+
     def provenance(self) -> EnrichmentProvenance:
         fetched_at = utc_now()
         normalized = json.dumps(
-            [result.__dict__ for result in self._accepted],
+            [
+                result.__dict__
+                for result in sorted(
+                    self._accepted,
+                    key=lambda item: (
+                        item.road_address,
+                        item.latitude,
+                        item.longitude,
+                    ),
+                )
+            ],
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -88,12 +122,12 @@ class KakaoLocalClient:
             attribution="Kakao Local API",
             fetched_at=fetched_at,
             source_as_of=fetched_at[:10],
-            raw_sha256=hashlib.sha256(b"".join(self._raw_responses)).hexdigest(),
+            raw_sha256=self._raw_sha256.hexdigest(),
             normalized_sha256=hashlib.sha256(normalized).hexdigest(),
             request_region_code="SEOUL_ADDRESS_BATCH",
             request_timing=None,
-            page_count=len(self._raw_responses),
-            fetched_row_count=len(self._raw_responses),
+            page_count=self._request_count,
+            fetched_row_count=self._request_count,
             matched_row_count=len(self._accepted),
         )
 

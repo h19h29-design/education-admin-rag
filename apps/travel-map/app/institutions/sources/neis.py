@@ -15,6 +15,11 @@ from app.institutions.sources.common import (
 )
 
 _ENDPOINT = "https://open.neis.go.kr/hub/schoolInfo"
+_MAX_DECLARED_ROWS = 5_000
+_MAX_PAGE_COUNT = 200
+_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+_MAX_CUMULATIVE_BYTES = 25 * 1024 * 1024
+_KNOWN_NO_KEY_SAMPLE_ROWS = 5
 
 _FOUNDATION_TYPES = {
     "\uad6d\ub9bd": "NATIONAL",
@@ -54,13 +59,29 @@ class NeisSource:
         self._page_size = page_size
 
     async def fetch(self) -> SourceFetchResult:
+        failure: str | None = None
+        try:
+            return await self._fetch_impl()
+        except SourceDataError as exc:
+            failure = str(exc)
+        finally:
+            self.clear_credentials()
+        raise SourceDataError(failure or "NEIS source validation failed")
+
+    def clear_credentials(self) -> None:
+        self._api_key = ""
+
+    async def _fetch_impl(self) -> SourceFetchResult:
         pages: list[bytes] = []
         records: list[SourceInstitutionRecord] = []
         seen_page_ids: set[tuple[str, ...]] = set()
         declared_total: int | None = None
         raw_row_count = 0
+        cumulative_raw_bytes = 0
         page = 1
         while declared_total is None or raw_row_count < declared_total:
+            if page > _MAX_PAGE_COUNT:
+                raise SourceDataError("NEIS pagination exceeded the page limit")
             payload, raw = await get_json_with_retry(
                 client=self._client,
                 url=_ENDPOINT,
@@ -73,14 +94,40 @@ class NeisSource:
                 },
                 headers=None,
                 source_label="NEIS",
+                max_response_bytes=_MAX_RESPONSE_BYTES,
             )
             _raise_neis_error(payload)
             total = _neis_total(payload)
             if declared_total is None:
+                if total == _KNOWN_NO_KEY_SAMPLE_ROWS:
+                    raise SourceDataError(
+                        "NEIS returned the known five-row no-key sample"
+                    )
+                if total < 1:
+                    raise SourceDataError("NEIS returned no selectable source rows")
+                if total > _MAX_DECLARED_ROWS:
+                    raise SourceDataError("NEIS declared total exceeds row ceiling")
+                expected_pages = (total + self._page_size - 1) // self._page_size
+                if expected_pages > _MAX_PAGE_COUNT:
+                    raise SourceDataError("NEIS declared total exceeds page limit")
                 declared_total = total
             elif total != declared_total:
                 raise SourceDataError("NEIS list_total_count changed during pagination")
             raw_rows = _neis_rows(payload)
+            if len(raw_rows) > self._page_size:
+                raise SourceDataError("NEIS returned more rows than requested page size")
+            if raw_row_count + len(raw_rows) > declared_total:
+                raise SourceDataError("NEIS returned more rows than list_total_count")
+            if (
+                raw_row_count + len(raw_rows) < declared_total
+                and len(raw_rows) != self._page_size
+            ):
+                raise SourceDataError(
+                    "NEIS returned a short page before list_total_count"
+                )
+            cumulative_raw_bytes += len(raw)
+            if cumulative_raw_bytes > _MAX_CUMULATIVE_BYTES:
+                raise SourceDataError("NEIS cumulative response size exceeds limit")
             page_ids = tuple(
                 _required_string_from_object(row, "SD_SCHUL_CODE")
                 for row in raw_rows
@@ -97,6 +144,14 @@ class NeisSource:
             page += 1
         if raw_row_count != declared_total:
             raise SourceDataError("NEIS row count does not match list_total_count")
+        source_dates = {record.source_as_of for record in records}
+        if not records:
+            raise SourceDataError("NEIS returned no selectable source rows")
+        if len(source_dates) != 1:
+            raise SourceDataError(
+                "NEIS records must have one exact source_as_of across all pages"
+            )
+        source_as_of = source_dates.pop()
         return SourceFetchResult(
             records=tuple(records),
             provenance=SourceProvenance(
@@ -105,7 +160,7 @@ class NeisSource:
                 license_name="PUBLIC_DATA_NO_USE_RESTRICTION",
                 attribution="Ministry of Education NEIS education data",
                 fetched_at=utc_now(),
-                source_as_of=max(record.source_as_of for record in records),
+                source_as_of=source_as_of,
                 raw_sha256=hashlib.sha256(b"".join(pages)).hexdigest(),
                 page_count=len(pages),
                 row_count=len(records),

@@ -1,13 +1,15 @@
+import fcntl
 import hashlib
 import json
 import os
 import re
+import stat
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeVar
+from typing import TypeVar, cast
 
 from pydantic import BaseModel, ValidationError
 
@@ -17,12 +19,31 @@ from app.institutions.models import (
     InstitutionStatus,
     SnapshotManifest,
 )
-from app.institutions.snapshot import VerifiedSnapshot, verify_snapshot
+from app.institutions.snapshot import (
+    SnapshotIntegrityError,
+    VerifiedSnapshot,
+    _verify_manifest_fields,
+    verify_snapshot,
+    verify_snapshot_directory,
+)
 from app.institutions.sources.common import (
     EnrichmentProvenance,
     SourceInstitutionRecord,
+    SourceInstitutionSiteRecord,
     SourceProvenance,
     normalized_records_sha256,
+)
+from app.institutions.sources.standard_school import (
+    DOWNLOAD_URL as STANDARD_LOCATION_ENDPOINT,
+)
+from app.institutions.sources.standard_school import (
+    PINNED_NATIONWIDE_COUNT,
+)
+from app.institutions.sources.standard_school import (
+    PINNED_SHA256 as STANDARD_LOCATION_RAW_SHA256,
+)
+from app.institutions.sources.standard_school import (
+    PINNED_SOURCE_AS_OF as STANDARD_LOCATION_SOURCE_AS_OF,
 )
 from app.policy.coverage import CoverageService
 from app.policy.models import CoverageState
@@ -30,6 +51,8 @@ from app.providers.kakao_local import KakaoLocalClient
 from app.routing.models import Coordinate
 
 _SAFE_SNAPSHOT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_SAFE_SITE_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _EXPECTED_REGION_CODES = {
     "NEIS": "B10",
     "KINDERGARTEN_INFO": "11",
@@ -74,13 +97,64 @@ _SOURCE_ENDPOINTS = {
 }
 _SOURCE_LICENSES = {
     "NEIS": "PUBLIC_DATA_NO_USE_RESTRICTION",
-    "KINDERGARTEN_INFO": "ATTRIBUTION_COMMERCIAL_AND_MODIFICATION_ALLOWED",
+    "KINDERGARTEN_INFO": "PUBLIC_DATA_PORTAL_TERMS",
     "SEN_REVIEWED_CSV": "KOGL_TYPE_1_ATTRIBUTION",
 }
 _SOURCE_ATTRIBUTIONS = {
     "NEIS": "Ministry of Education NEIS education data",
     "KINDERGARTEN_INFO": "Ministry of Education Kindergarten Info",
-    "SEN_REVIEWED_CSV": "Seoul Metropolitan Office of Education",
+    "SEN_REVIEWED_CSV": (
+        "Source: Seoul Metropolitan Office of Education "
+        "(organization directory and 2026 civil-service handbook)"
+    ),
+}
+_PINNED_SOURCE_RAW_SHA256 = {
+    "SEN_REVIEWED_CSV": (
+        "9f202202edc653b09b4debb5a0ff939cf9fcdc64dd58174b28f8d009bb1b7424"
+    ),
+}
+_PINNED_SOURCE_NORMALIZED_SHA256 = {
+    "SEN_REVIEWED_CSV": (
+        "79f7405bfb90c0848162dd6c9ca22487b10b9375df998efd5ad39ee9244efd9d"
+    ),
+}
+_STANDARD_LOCATION_NORMALIZED_SHA256 = (
+    "ebb2643be10bda983ca9cb81a7ce2820474a53c2f65fc3ac6a7bcc179527cb4a"
+)
+_KAKAO_ENDPOINT = "https://dapi.kakao.com/v2/local/search/address.json"
+_INSTITUTION_FIELDS = {
+    "institutionId",
+    "officialName",
+    "institutionType",
+    "foundationType",
+    "educationOffice",
+    "status",
+    "statusSource",
+    "effectiveFrom",
+    "effectiveTo",
+    "lastSeenSnapshot",
+    "aliases",
+    "supersedes",
+    "mergedInto",
+    "source",
+    "sourceRegionCode",
+    "sourceAsOf",
+}
+_SITE_FIELDS = {
+    "siteId",
+    "institutionId",
+    "siteName",
+    "roadAddress",
+    "district",
+    "latitude",
+    "longitude",
+    "coordinateQuality",
+    "routingAnchorLatitude",
+    "routingAnchorLongitude",
+    "isDefault",
+    "status",
+    "effectiveFrom",
+    "effectiveTo",
 }
 _SnapshotModel = TypeVar("_SnapshotModel", bound=BaseModel)
 
@@ -95,6 +169,47 @@ class SnapshotBuildResult:
     candidate_path: Path
     approved: bool
     issues: tuple[str, ...]
+    source_attestation_sha256: str
+    enrichment_attestation_sha256: str
+    manifest_attestation_sha256: str
+
+
+def reconcile_selectable_school_counts(
+    records: tuple[SourceInstitutionRecord, ...],
+    *,
+    expected_count: int,
+    tolerance: float = 0.01,
+) -> dict[str, object]:
+    if type(expected_count) is not int or expected_count <= 0:
+        raise SnapshotQualityError("school reconciliation expected count is invalid")
+    if not 0.0 <= tolerance <= 0.1:
+        raise SnapshotQualityError("school reconciliation tolerance is invalid")
+    compared_types = {
+        "ELEMENTARY_SCHOOL",
+        "MIDDLE_SCHOOL",
+        "HIGH_SCHOOL",
+    }
+    actual_count = sum(
+        record.source == "NEIS" and record.institution_type in compared_types
+        for record in records
+    )
+    delta_count = abs(actual_count - expected_count)
+    delta_ratio = delta_count / expected_count
+    result: dict[str, object] = {
+        "population": "NEIS_ELEMENTARY_MIDDLE_HIGH",
+        "expectedCount": expected_count,
+        "actualCount": actual_count,
+        "deltaCount": delta_count,
+        "deltaRatio": delta_ratio,
+        "threshold": tolerance,
+        "passed": delta_ratio <= tolerance,
+    }
+    if delta_ratio > tolerance:
+        raise SnapshotQualityError(
+            "school reconciliation differs from the official count by more than "
+            "one percent"
+        )
+    return result
 
 
 async def geocode_missing_records(
@@ -105,21 +220,39 @@ async def geocode_missing_records(
     for record in records:
         if (record.latitude is None) != (record.longitude is None):
             raise SnapshotQualityError("source coordinate pair is incomplete")
-        if record.latitude is not None:
-            geocoded.append(record)
-            continue
-        result = await client.geocode(record.road_address)
-        if result is None:
-            geocoded.append(record)
-            continue
-        geocoded.append(
-            replace(
-                record,
-                road_address=result.road_address,
-                latitude=result.latitude,
-                longitude=result.longitude,
-                coordinate_quality="GEOCODED",
+        updated = record
+        if record.latitude is None:
+            result = await client.geocode(record.road_address)
+            if result is not None:
+                updated = replace(
+                    record,
+                    road_address=result.road_address,
+                    latitude=result.latitude,
+                    longitude=result.longitude,
+                    coordinate_quality="GEOCODED",
+                )
+        additional_sites: list[SourceInstitutionSiteRecord] = []
+        for site in updated.additional_sites:
+            if (site.latitude is None) != (site.longitude is None):
+                raise SnapshotQualityError("source site coordinate pair is incomplete")
+            if site.latitude is not None:
+                additional_sites.append(site)
+                continue
+            branch_result = await client.geocode(site.road_address)
+            if branch_result is None:
+                additional_sites.append(site)
+                continue
+            additional_sites.append(
+                replace(
+                    site,
+                    road_address=branch_result.road_address,
+                    latitude=branch_result.latitude,
+                    longitude=branch_result.longitude,
+                    coordinate_quality="GEOCODED",
+                )
             )
+        geocoded.append(
+            replace(updated, additional_sites=tuple(additional_sites))
         )
     return tuple(geocoded)
 
@@ -142,9 +275,15 @@ def build_candidate_snapshot(
         )
     root = Path(output_root)
     root.mkdir(parents=True, exist_ok=True)
+    root = _validated_snapshot_root(root)
     candidate_path = root / f".{snapshot_id}.candidate"
     final_path = root / snapshot_id
-    if candidate_path.exists() or final_path.exists():
+    if (
+        candidate_path.is_symlink()
+        or final_path.is_symlink()
+        or candidate_path.exists()
+        or final_path.exists()
+    ):
         raise SnapshotQualityError("snapshot ID already exists")
 
     duplicate_ids = _duplicate_ids(record.institution_id for record in records)
@@ -153,20 +292,41 @@ def build_candidate_snapshot(
     issues: list[str] = []
     for record in records:
         _validate_source_record(record)
-    if source_provenance is not None:
-        expected_sources = {record.source for record in records}
-        if set(source_provenance) != expected_sources:
-            raise SnapshotQualityError("source provenance does not match record sources")
-        if any(
-            key != provenance.source
-            for key, provenance in source_provenance.items()
-        ):
-            raise SnapshotQualityError("source provenance name mismatch")
+    source_dates: dict[str, set[str]] = defaultdict(set)
+    for record in records:
+        source_dates[record.source].add(record.source_as_of)
+    if any(len(dates) != 1 for dates in source_dates.values()):
+        raise SnapshotQualityError(
+            "each source must have one exact source_as_of"
+        )
+    if source_provenance is None:
+        raise SnapshotQualityError("source provenance is required")
+    expected_sources = {record.source for record in records}
+    if set(source_provenance) != expected_sources:
+        raise SnapshotQualityError("source provenance does not match record sources")
+    if any(
+        key != provenance.source
+        for key, provenance in source_provenance.items()
+    ):
+        raise SnapshotQualityError("source provenance name mismatch")
+    current_by_source: dict[str, list[SourceInstitutionRecord]] = defaultdict(list)
+    for record in records:
+        current_by_source[record.source].append(record)
+    for source_name, provenance in source_provenance.items():
+        _validate_source_provenance(
+            source_name,
+            provenance,
+            current_by_source[source_name],
+        )
+    _validate_enrichment_provenance(records, enrichment_provenance)
 
     institutions, sites = _build_current_records(records, snapshot_id, coverage)
     current_coordinate_rate = (
-        sum(site.status is InstitutionStatus.ACTIVE for site in sites)
-        / len(records)
+        sum(
+            institution.status is InstitutionStatus.ACTIVE
+            for institution in institutions
+        )
+        / len(institutions)
         if records
         else 0.0
     )
@@ -187,6 +347,77 @@ def build_candidate_snapshot(
         if previous_active and current_active < previous_active * 0.9:
             issues.append("record count drop exceeds 10 percent")
 
+    effective_source_provenance = dict(source_provenance)
+    output_sources = {institution.source for institution in institutions}
+    if previous is not None:
+        previous_sources = {
+            item.source: item for item in previous.manifest.sources
+        }
+        for source_name in output_sources - set(effective_source_provenance):
+            prior = previous_sources.get(source_name)
+            if prior is None:
+                raise SnapshotQualityError(
+                    "preserved source provenance is unavailable"
+                )
+            effective_source_provenance[source_name] = SourceProvenance(
+                source=prior.source,
+                endpoint=prior.endpoint,
+                license_name=prior.license_name,
+                attribution=prior.attribution,
+                fetched_at=prior.fetched_at,
+                source_as_of=prior.source_as_of,
+                raw_sha256=prior.raw_sha256,
+                page_count=prior.page_count,
+                row_count=prior.normalized_row_count,
+                fetched_row_count=prior.fetched_row_count,
+                request_region_code=prior.request_region_code,
+                request_timing=prior.request_timing,
+                normalized_sha256=prior.source_normalized_sha256,
+            )
+
+    effective_enrichment_provenance = {
+        item.source: item for item in enrichment_provenance
+    }
+    qualities_to_sources = {
+        "OFFICIAL_STANDARD_COORDINATE": "OFFICIAL_STANDARD_SCHOOL_LOCATION",
+        "GEOCODED": "KAKAO_LOCAL_GEOCODING",
+    }
+    required_enrichments = {
+        qualities_to_sources[site.coordinate_quality]
+        for site in sites
+        if site.coordinate_quality in qualities_to_sources
+    }
+    if previous is not None:
+        previous_enrichments = {
+            item.source: item for item in previous.manifest.enrichments
+        }
+        for enrichment_source in (
+            required_enrichments - set(effective_enrichment_provenance)
+        ):
+            prior_enrichment = previous_enrichments.get(enrichment_source)
+            if prior_enrichment is None:
+                raise SnapshotQualityError(
+                    "preserved enrichment provenance is unavailable"
+                )
+            effective_enrichment_provenance[enrichment_source] = (
+                EnrichmentProvenance(
+                    source=prior_enrichment.source,
+                    endpoint=prior_enrichment.endpoint,
+                    license_name=prior_enrichment.license_name,
+                    attribution=prior_enrichment.attribution,
+                    fetched_at=prior_enrichment.fetched_at,
+                    source_as_of=prior_enrichment.source_as_of,
+                    raw_sha256=prior_enrichment.raw_sha256,
+                    normalized_sha256=prior_enrichment.source_normalized_sha256,
+                    request_region_code=prior_enrichment.request_region_code,
+                    request_timing=prior_enrichment.request_timing,
+                    page_count=prior_enrichment.page_count,
+                    fetched_row_count=prior_enrichment.fetched_row_count,
+                    matched_row_count=0,
+                    matched_normalized_sha256=None,
+                )
+            )
+
     if current_coordinate_rate < 0.98:
         issues.append("coordinate validation success rate is below 98 percent")
 
@@ -199,11 +430,14 @@ def build_candidate_snapshot(
     snapshot_as_of = max(
         (
             [item.source_as_of for item in institutions]
-            + [item.source_as_of for item in enrichment_provenance]
+            + [
+                item.source_as_of
+                for item in effective_enrichment_provenance.values()
+            ]
         ),
         default=now[:10],
     )
-    possible_match_count = _possible_match_count(records)
+    possible_matches = _persisted_possible_matches(institutions, sites)
     manifest = _candidate_manifest(
         snapshot_id=snapshot_id,
         created_at=now,
@@ -212,11 +446,14 @@ def build_candidate_snapshot(
         sites=sites,
         institution_bytes=institution_bytes,
         site_bytes=site_bytes,
-        possible_match_count=possible_match_count,
+        possible_matches=possible_matches,
         previous=previous,
-        source_provenance=source_provenance,
+        source_provenance=effective_source_provenance,
         source_records=records,
-        enrichment_provenance=enrichment_provenance,
+        enrichment_provenance=tuple(
+            effective_enrichment_provenance[source]
+            for source in sorted(effective_enrichment_provenance)
+        ),
     )
     _write_json(candidate_path / "manifest.json", manifest)
     return SnapshotBuildResult(
@@ -224,32 +461,128 @@ def build_candidate_snapshot(
         candidate_path=candidate_path,
         approved=False,
         issues=tuple(issues),
+        source_attestation_sha256=_manifest_section_sha256(manifest["sources"]),
+        enrichment_attestation_sha256=_manifest_section_sha256(
+            manifest["enrichments"]
+        ),
+        manifest_attestation_sha256=_manifest_section_sha256(manifest),
     )
 
 
-def promote_snapshot(candidate: SnapshotBuildResult, output_root: Path) -> None:
+def promote_snapshot(
+    candidate: SnapshotBuildResult,
+    output_root: Path,
+    *,
+    coverage: CoverageService,
+) -> None:
+    if _SAFE_SNAPSHOT_ID.fullmatch(candidate.snapshot_id) is None:
+        raise SnapshotQualityError("snapshot ID is unsafe")
     if candidate.issues:
         raise SnapshotQualityError("; ".join(candidate.issues))
-    root = Path(output_root)
-    candidate_path = candidate.candidate_path
+    root = _validated_snapshot_root(Path(output_root))
+    lock_path = root / ".promotion.lock"
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise SnapshotQualityError("promotion lock is invalid") from exc
+    try:
+        if (
+            not stat.S_ISREG(os.fstat(descriptor).st_mode)
+            or lock_path.resolve(strict=True).parent != root
+        ):
+            raise SnapshotQualityError("promotion lock must be a regular root file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _promote_snapshot_locked(candidate, root, coverage=coverage)
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _promote_snapshot_locked(
+    candidate: SnapshotBuildResult,
+    output_root: Path,
+    *,
+    coverage: CoverageService,
+) -> None:
+    if _SAFE_SNAPSHOT_ID.fullmatch(candidate.snapshot_id) is None:
+        raise SnapshotQualityError("snapshot ID is unsafe")
+    if candidate.issues:
+        raise SnapshotQualityError("; ".join(candidate.issues))
+    root = _validated_snapshot_root(Path(output_root))
+    candidate_path = Path(candidate.candidate_path)
+    expected_candidate_name = f".{candidate.snapshot_id}.candidate"
+    try:
+        candidate_parent = candidate_path.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SnapshotQualityError("candidate path parent is invalid") from exc
+    if (
+        candidate_path.name != expected_candidate_name
+        or candidate_parent != root
+    ):
+        raise SnapshotQualityError("candidate path is outside the snapshot root")
+    if candidate_path.is_symlink():
+        raise SnapshotQualityError("candidate path must not be a symlink")
+    candidate_path = root / expected_candidate_name
     final_path = root / candidate.snapshot_id
+    if final_path.is_symlink():
+        raise SnapshotQualityError("final snapshot path must not be a symlink")
+    current_path = root / "current.json"
+    if current_path.is_symlink():
+        raise SnapshotQualityError("current pointer must not be a symlink")
+    if candidate_path.exists() and final_path.exists():
+        raise SnapshotQualityError("candidate and final snapshot both exist")
     selected_path = candidate_path if candidate_path.exists() else final_path
     if not selected_path.is_dir():
         raise SnapshotQualityError("candidate snapshot is missing")
-    manifest_path = selected_path / "manifest.json"
+    manifest_path = _validated_snapshot_file(
+        selected_path / "manifest.json",
+        selected_path,
+        "manifest.json",
+    )
     manifest = _read_json_object(manifest_path)
+    try:
+        _verify_manifest_fields(manifest)
+    except SnapshotIntegrityError as exc:
+        raise SnapshotQualityError("candidate manifest fields are invalid") from exc
     if selected_path == candidate_path and manifest.get("approved") is not False:
         raise SnapshotQualityError("candidate manifest must remain approved=false")
-    if selected_path == final_path and manifest.get("approved") not in (False, True):
+    if (
+        _manifest_section_sha256(manifest.get("sources"))
+        != candidate.source_attestation_sha256
+    ):
+        raise SnapshotQualityError("candidate source provenance attestation mismatch")
+    if (
+        _manifest_section_sha256(manifest.get("enrichments"))
+        != candidate.enrichment_attestation_sha256
+    ):
+        raise SnapshotQualityError(
+            "candidate enrichment provenance attestation mismatch"
+        )
+    if manifest.get("approved") is False:
+        _validate_unapproved_manifest_schema(manifest)
+    elif selected_path == final_path and manifest.get("approved") is True:
+        _validate_approved_manifest_schema(manifest)
+    else:
         raise SnapshotQualityError("recoverable final manifest approval is invalid")
     institutions, sites = _recheck_candidate(
         selected_path,
         manifest,
         candidate.snapshot_id,
     )
-    _recheck_promotion_quality(root, manifest, institutions, sites)
+    _recheck_promotion_quality(root, manifest, institutions, sites, coverage)
+    _recheck_source_provenance(manifest, institutions, sites)
+    _recheck_enrichment_provenance(manifest, institutions, sites)
+    for file_name in ("manifest.json", "institutions.jsonl", "sites.jsonl"):
+        _fsync_file(selected_path / file_name)
+    _fsync_directory(selected_path)
     if selected_path == candidate_path:
         os.replace(candidate_path, final_path)
+        _fsync_directory(root)
         selected_path = final_path
         manifest_path = final_path / "manifest.json"
     if manifest.get("approved") is False:
@@ -257,16 +590,86 @@ def promote_snapshot(candidate: SnapshotBuildResult, output_root: Path) -> None:
         manifest["approvedAt"] = _utc_now()
         manifest["approvedByRole"] = "data-steward"
         temporary_manifest = selected_path / ".manifest.json.tmp"
+        _validate_atomic_temporary_path(
+            temporary_manifest,
+            selected_path,
+            ".manifest.json.tmp",
+        )
         _write_json(temporary_manifest, manifest, durable=True)
         os.replace(temporary_manifest, manifest_path)
+        _fsync_directory(selected_path)
+
+    try:
+        verify_snapshot_directory(root, candidate.snapshot_id)
+    except SnapshotIntegrityError as exc:
+        raise SnapshotQualityError(
+            "strict snapshot verification failed before pointer publication"
+        ) from exc
+    attested_manifest = dict(manifest)
+    attested_manifest["approved"] = False
+    attested_manifest["approvedAt"] = None
+    attested_manifest["approvedByRole"] = None
+    if (
+        _manifest_section_sha256(attested_manifest)
+        != candidate.manifest_attestation_sha256
+    ):
+        raise SnapshotQualityError("candidate manifest attestation mismatch")
 
     temporary_pointer = root / ".current.json.tmp"
+    _validate_atomic_temporary_path(
+        temporary_pointer,
+        root,
+        ".current.json.tmp",
+    )
     _write_json(
         temporary_pointer,
         {"snapshotId": candidate.snapshot_id},
         durable=True,
     )
-    os.replace(temporary_pointer, root / "current.json")
+    os.replace(temporary_pointer, current_path)
+    _fsync_directory(root)
+
+
+def _validated_snapshot_root(root: Path) -> Path:
+    if root.is_symlink():
+        raise SnapshotQualityError("snapshot root must not be a symlink")
+    try:
+        resolved = root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SnapshotQualityError("snapshot root is invalid") from exc
+    if not resolved.is_dir():
+        raise SnapshotQualityError("snapshot root must be a directory")
+    return resolved
+
+
+def _validated_snapshot_file(path: Path, parent: Path, label: str) -> Path:
+    if path.is_symlink():
+        raise SnapshotQualityError(f"{label} must not be a symlink")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SnapshotQualityError(f"candidate {label} is missing") from exc
+    if resolved.parent != parent or not resolved.is_file():
+        raise SnapshotQualityError(
+            f"candidate {label} must be a regular snapshot file"
+        )
+    return resolved
+
+
+def _validate_atomic_temporary_path(
+    path: Path,
+    parent: Path,
+    label: str,
+) -> None:
+    if path.is_symlink():
+        raise SnapshotQualityError(f"{label} must not be a symlink")
+    if path.exists():
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise SnapshotQualityError(f"{label} is invalid") from exc
+        if resolved.parent != parent or not resolved.is_file():
+            raise SnapshotQualityError(f"{label} must be a regular temporary file")
 
 
 def _build_current_records(
@@ -277,14 +680,58 @@ def _build_current_records(
     institutions: list[Institution] = []
     sites: list[InstitutionSite] = []
     for record in sorted(records, key=lambda item: item.institution_id):
-        has_coordinates = record.latitude is not None and record.longitude is not None
-        is_seoul_address = _is_seoul_address(record.road_address)
-        is_seoul_coordinate = (
-            _is_seoul_coordinate(record, coverage) if has_coordinates else False
+        source_sites = (
+            SourceInstitutionSiteRecord(
+                site_code="main",
+                site_name=record.site_name,
+                road_address=record.road_address,
+                district=record.district,
+                latitude=record.latitude,
+                longitude=record.longitude,
+                coordinate_quality=record.coordinate_quality,
+            ),
+            *record.additional_sites,
         )
+        built_sites: list[InstitutionSite] = []
+        for source_site in source_sites:
+            site_status = (
+                InstitutionStatus.ACTIVE
+                if source_site.latitude is not None
+                and source_site.longitude is not None
+                and _is_seoul_address(source_site.road_address)
+                and coverage.classify(
+                    Coordinate(
+                        latitude=source_site.latitude,
+                        longitude=source_site.longitude,
+                    )
+                )
+                is CoverageState.SEOUL
+                else InstitutionStatus.REVIEW_REQUIRED
+            )
+            built_sites.append(
+                InstitutionSite(
+                    site_id=f"{record.institution_id}:{source_site.site_code}",
+                    institution_id=record.institution_id,
+                    site_name=source_site.site_name,
+                    road_address=source_site.road_address,
+                    district=source_site.district,
+                    latitude=source_site.latitude,
+                    longitude=source_site.longitude,
+                    coordinate_quality=source_site.coordinate_quality,
+                    routing_anchor_latitude=source_site.latitude,
+                    routing_anchor_longitude=source_site.longitude,
+                    is_default=source_site.site_code == "main",
+                    status=site_status,
+                    effective_from=record.source_as_of,
+                    effective_to=None,
+                )
+            )
         status = (
             InstitutionStatus.ACTIVE
-            if has_coordinates and is_seoul_address and is_seoul_coordinate
+            if any(
+                site.is_default and site.status is InstitutionStatus.ACTIVE
+                for site in built_sites
+            )
             else InstitutionStatus.REVIEW_REQUIRED
         )
         institutions.append(
@@ -307,28 +754,7 @@ def _build_current_records(
                 source_as_of=record.source_as_of,
             )
         )
-        if has_coordinates:
-            assert record.latitude is not None
-            assert record.longitude is not None
-            site_name = "main"
-            sites.append(
-                InstitutionSite(
-                    site_id=f"{record.institution_id}:main",
-                    institution_id=record.institution_id,
-                    site_name=site_name,
-                    road_address=record.road_address,
-                    district=record.district,
-                    latitude=record.latitude,
-                    longitude=record.longitude,
-                    coordinate_quality=record.coordinate_quality,
-                    routing_anchor_latitude=record.latitude,
-                    routing_anchor_longitude=record.longitude,
-                    is_default=True,
-                    status=status,
-                    effective_from=record.source_as_of,
-                    effective_to=None,
-                )
-            )
+        sites.extend(built_sites)
     return institutions, sites
 
 
@@ -356,6 +782,357 @@ def _validate_source_record(record: SourceInstitutionRecord) -> None:
         raise SnapshotQualityError("source coordinate pair is incomplete")
     if has_latitude == (record.coordinate_quality == "MISSING"):
         raise SnapshotQualityError("source coordinate quality does not match coordinates")
+    if not record.site_name.strip():
+        raise SnapshotQualityError("source main site name must be nonblank")
+    if record.additional_sites and not has_latitude:
+        raise SnapshotQualityError(
+            "source main site needs coordinates when branches are present"
+        )
+    site_codes: set[str] = set()
+    for site in record.additional_sites:
+        if (
+            _SAFE_SITE_CODE.fullmatch(site.site_code) is None
+            or site.site_code == "main"
+            or site.site_code in site_codes
+        ):
+            raise SnapshotQualityError("source branch site code is invalid")
+        site_codes.add(site.site_code)
+        if (
+            not site.site_name.strip()
+            or not site.road_address.strip()
+            or not site.district.strip()
+        ):
+            raise SnapshotQualityError("source branch site fields must be nonblank")
+        has_site_latitude = site.latitude is not None
+        has_site_longitude = site.longitude is not None
+        if has_site_latitude != has_site_longitude:
+            raise SnapshotQualityError("source site coordinate pair is incomplete")
+        if has_site_latitude == (site.coordinate_quality == "MISSING"):
+            raise SnapshotQualityError(
+                "source site coordinate quality does not match coordinates"
+            )
+        if site.coordinate_quality not in _ALLOWED_COORDINATE_QUALITIES:
+            raise SnapshotQualityError("unsupported coordinate quality")
+
+
+def _validate_source_provenance(
+    source_name: str,
+    provenance: SourceProvenance,
+    records: list[SourceInstitutionRecord],
+) -> None:
+    source_dates = {record.source_as_of for record in records}
+    fetched_row_count = provenance.fetched_row_count
+    checked_fetched_row_count = (
+        fetched_row_count if type(fetched_row_count) is int else -1
+    )
+    expected_timing = provenance.request_timing
+    expected_normalized_hash = normalized_records_sha256(
+        [_record_before_enrichment(record) for record in records]
+    )
+    if (
+        provenance.endpoint != _SOURCE_ENDPOINTS[source_name]
+        or provenance.license_name != _SOURCE_LICENSES[source_name]
+        or provenance.attribution != _SOURCE_ATTRIBUTIONS[source_name]
+        or provenance.request_region_code != _EXPECTED_REGION_CODES[source_name]
+        or provenance.source_as_of not in source_dates
+        or len(source_dates) != 1
+        or not _source_pagination_is_valid(
+            source_name,
+            provenance.page_count,
+            checked_fetched_row_count,
+        )
+        or type(provenance.row_count) is not int
+        or provenance.row_count != len(records)
+        or checked_fetched_row_count < provenance.row_count
+        or _SHA256.fullmatch(provenance.raw_sha256) is None
+        or source_name in _PINNED_SOURCE_RAW_SHA256
+        and provenance.raw_sha256 != _PINNED_SOURCE_RAW_SHA256[source_name]
+        or provenance.normalized_sha256 != expected_normalized_hash
+        or source_name in _PINNED_SOURCE_NORMALIZED_SHA256
+        and provenance.normalized_sha256
+        != _PINNED_SOURCE_NORMALIZED_SHA256[source_name]
+    ):
+        raise SnapshotQualityError("source provenance does not match normalized rows")
+    if source_name == "KINDERGARTEN_INFO":
+        if (
+            expected_timing is None
+            or re.fullmatch(r"\d{4}[12]", expected_timing) is None
+            or _kindergarten_timing_date(expected_timing) != provenance.source_as_of
+            or fetched_row_count != provenance.row_count
+        ):
+            raise SnapshotQualityError("source provenance timing/count is invalid")
+    elif expected_timing is not None:
+        raise SnapshotQualityError("source provenance timing is invalid")
+    if source_name == "SEN_REVIEWED_CSV" and fetched_row_count != provenance.row_count:
+        raise SnapshotQualityError("source provenance count is invalid")
+    if (
+        source_name == "NEIS"
+        and checked_fetched_row_count - provenance.row_count > 50
+    ):
+        raise SnapshotQualityError("source provenance count is invalid")
+    try:
+        fetched_at = datetime.fromisoformat(
+            provenance.fetched_at[:-1] + "+00:00"
+            if provenance.fetched_at.endswith("Z")
+            else provenance.fetched_at
+        )
+        source_date = datetime.fromisoformat(provenance.source_as_of)
+    except ValueError as exc:
+        raise SnapshotQualityError("source provenance dates are invalid") from exc
+    if fetched_at.tzinfo is None or source_date.date() > fetched_at.date():
+        raise SnapshotQualityError("source provenance chronology is invalid")
+
+
+def _record_before_enrichment(
+    record: SourceInstitutionRecord,
+) -> SourceInstitutionRecord:
+    if record.coordinate_quality in {
+        "OFFICIAL_STANDARD_COORDINATE",
+        "GEOCODED",
+    }:
+        record = replace(
+            record,
+            latitude=None,
+            longitude=None,
+            coordinate_quality="MISSING",
+        )
+    additional_sites = tuple(
+        replace(
+            site,
+            latitude=None,
+            longitude=None,
+            coordinate_quality="MISSING",
+        )
+        if site.coordinate_quality in {
+            "OFFICIAL_STANDARD_COORDINATE",
+            "GEOCODED",
+        }
+        else site
+        for site in record.additional_sites
+    )
+    return replace(
+        record,
+        additional_sites=additional_sites,
+    )
+
+
+def _kindergarten_timing_date(timing: str) -> str:
+    month_day = "04-01" if timing[-1] == "1" else "10-01"
+    return f"{timing[:4]}-{month_day}"
+
+
+def _source_pagination_is_valid(
+    source: str,
+    page_count: object,
+    fetched_row_count: object,
+) -> bool:
+    if (
+        type(page_count) is not int
+        or type(fetched_row_count) is not int
+        or fetched_row_count <= 0
+    ):
+        return False
+    if source == "NEIS":
+        minimum_pages = (fetched_row_count + 999) // 1_000
+        return (
+            minimum_pages <= page_count <= min(200, fetched_row_count)
+            and fetched_row_count <= 5_000
+        )
+    if source == "KINDERGARTEN_INFO":
+        minimum_pages = max(25, (fetched_row_count + 99) // 100)
+        return (
+            minimum_pages <= page_count <= min(2_500, fetched_row_count + 25)
+            and fetched_row_count <= 250_000
+        )
+    if source == "SEN_REVIEWED_CSV":
+        return page_count == 1
+    return False
+
+
+def _validate_enrichment_provenance(
+    records: tuple[SourceInstitutionRecord, ...],
+    enrichments: tuple[EnrichmentProvenance, ...],
+) -> None:
+    by_source = {item.source: item for item in enrichments}
+    if len(by_source) != len(enrichments):
+        raise SnapshotQualityError("duplicate enrichment provenance")
+    allowed = {
+        "OFFICIAL_STANDARD_SCHOOL_LOCATION",
+        "KAKAO_LOCAL_GEOCODING",
+    }
+    if not set(by_source) <= allowed:
+        raise SnapshotQualityError("unsupported enrichment provenance")
+    qualities = [record.coordinate_quality for record in records]
+    qualities.extend(
+        site.coordinate_quality
+        for record in records
+        for site in record.additional_sites
+    )
+    official_count = qualities.count("OFFICIAL_STANDARD_COORDINATE")
+    geocoded_count = qualities.count("GEOCODED")
+    if official_count and "OFFICIAL_STANDARD_SCHOOL_LOCATION" not in by_source:
+        raise SnapshotQualityError(
+            "official school-location enrichment provenance is required"
+        )
+    if geocoded_count and "KAKAO_LOCAL_GEOCODING" not in by_source:
+        raise SnapshotQualityError("Kakao enrichment provenance is required")
+    standard = by_source.get("OFFICIAL_STANDARD_SCHOOL_LOCATION")
+    if standard is not None and (
+        standard.endpoint != STANDARD_LOCATION_ENDPOINT
+        or standard.license_name != "PUBLIC_DATA_NO_USE_RESTRICTION"
+        or standard.attribution
+        != "Korea Education Facilities Safety Authority"
+        or standard.source_as_of != STANDARD_LOCATION_SOURCE_AS_OF
+        or standard.raw_sha256 != STANDARD_LOCATION_RAW_SHA256
+        or standard.normalized_sha256
+        != _STANDARD_LOCATION_NORMALIZED_SHA256
+        or standard.request_region_code != "7010000"
+        or standard.request_timing is not None
+        or standard.page_count != 1
+        or standard.fetched_row_count != PINNED_NATIONWIDE_COUNT
+        or standard.matched_row_count != official_count
+        or standard.matched_normalized_sha256
+        != enrichment_records_sha256(
+            records,
+            "OFFICIAL_STANDARD_COORDINATE",
+        )
+    ):
+        raise SnapshotQualityError(
+            "official school-location enrichment provenance is invalid"
+        )
+    kakao = by_source.get("KAKAO_LOCAL_GEOCODING")
+    if kakao is not None and (
+        kakao.endpoint != _KAKAO_ENDPOINT
+        or kakao.license_name != "KAKAO_LOCAL_API_TERMS"
+        or kakao.attribution != "Kakao Local API"
+        or kakao.request_region_code != "SEOUL_ADDRESS_BATCH"
+        or kakao.request_timing is not None
+        or type(kakao.page_count) is not int
+        or kakao.page_count <= 0
+        or kakao.fetched_row_count != kakao.page_count
+        or kakao.matched_row_count != geocoded_count
+        or kakao.normalized_sha256 != _geocoded_records_sha256(records)
+        or kakao.matched_normalized_sha256
+        != enrichment_records_sha256(records, "GEOCODED")
+        or _SHA256.fullmatch(kakao.raw_sha256) is None
+        or kakao.source_as_of != kakao.fetched_at[:10]
+    ):
+        raise SnapshotQualityError("Kakao enrichment provenance is invalid")
+    for item in enrichments:
+        try:
+            fetched_at = datetime.fromisoformat(
+                item.fetched_at[:-1] + "+00:00"
+                if item.fetched_at.endswith("Z")
+                else item.fetched_at
+            )
+            source_date = datetime.fromisoformat(item.source_as_of)
+        except ValueError as exc:
+            raise SnapshotQualityError("enrichment provenance date is invalid") from exc
+        if fetched_at.tzinfo is None or source_date.date() > fetched_at.date():
+            raise SnapshotQualityError(
+                "enrichment provenance chronology is invalid"
+            )
+
+
+def _geocoded_records_sha256(
+    records: tuple[SourceInstitutionRecord, ...],
+) -> str:
+    values: list[dict[str, object]] = [
+        {
+            "road_address": record.road_address,
+            "latitude": record.latitude,
+            "longitude": record.longitude,
+            "confidence": "EXACT_ROAD_ADDRESS",
+        }
+        for record in records
+        if record.coordinate_quality == "GEOCODED"
+    ]
+    values.extend(
+        {
+            "road_address": site.road_address,
+            "latitude": site.latitude,
+            "longitude": site.longitude,
+            "confidence": "EXACT_ROAD_ADDRESS",
+        }
+        for record in records
+        for site in record.additional_sites
+        if site.coordinate_quality == "GEOCODED"
+    )
+    values.sort(
+        key=lambda item: (
+            str(item["road_address"]),
+            cast(float, item["latitude"]),
+            cast(float, item["longitude"]),
+        )
+    )
+    normalized = json.dumps(
+        values,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(normalized).hexdigest()
+
+
+def enrichment_records_sha256(
+    records: tuple[SourceInstitutionRecord, ...],
+    coordinate_quality: str,
+) -> str:
+    values: list[dict[str, object]] = []
+    for record in records:
+        source_sites = (
+            SourceInstitutionSiteRecord(
+                site_code="main",
+                site_name=record.site_name,
+                road_address=record.road_address,
+                district=record.district,
+                latitude=record.latitude,
+                longitude=record.longitude,
+                coordinate_quality=record.coordinate_quality,
+            ),
+            *record.additional_sites,
+        )
+        values.extend(
+            {
+                "site_id": f"{record.institution_id}:{site.site_code}",
+                "road_address": site.road_address,
+                "latitude": site.latitude,
+                "longitude": site.longitude,
+            }
+            for site in source_sites
+            if site.coordinate_quality == coordinate_quality
+        )
+    return _canonical_mapping_sha256(values)
+
+
+def _enrichment_sites_sha256(
+    sites: list[InstitutionSite],
+    coordinate_quality: str,
+) -> str:
+    return _canonical_mapping_sha256(
+        [
+            {
+                "site_id": site.site_id,
+                "road_address": site.road_address,
+                "latitude": site.latitude,
+                "longitude": site.longitude,
+            }
+            for site in sites
+            if site.coordinate_quality == coordinate_quality
+        ]
+    )
+
+
+def _canonical_mapping_sha256(values: list[dict[str, object]]) -> str:
+    values.sort(key=lambda item: str(item["site_id"]))
+    return hashlib.sha256(
+        json.dumps(
+            values,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _is_seoul_coordinate(
@@ -382,11 +1159,20 @@ def _preserve_missing_records(
     snapshot_id: str,
 ) -> tuple[list[Institution], list[InstitutionSite]]:
     current_ids = {item.institution_id for item in institutions}
+    current_site_ids = {item.site_id for item in sites}
     source_dates = {
         item.source: item.source_as_of for item in institutions
     }
     for old in previous.institutions:
         if old.institution_id in current_ids:
+            sites.extend(
+                old_site.model_copy(
+                    update={"status": InstitutionStatus.MISSING_FROM_SOURCE}
+                )
+                for old_site in previous.sites
+                if old_site.institution_id == old.institution_id
+                and old_site.site_id not in current_site_ids
+            )
             continue
         source_as_of = source_dates.get(old.source, old.source_as_of)
         institutions.append(
@@ -420,7 +1206,7 @@ def _candidate_manifest(
     sites: list[InstitutionSite],
     institution_bytes: bytes,
     site_bytes: bytes,
-    possible_match_count: int,
+    possible_matches: list[dict[str, object]],
     previous: VerifiedSnapshot | None,
     source_provenance: Mapping[str, SourceProvenance] | None,
     source_records: tuple[SourceInstitutionRecord, ...],
@@ -429,78 +1215,42 @@ def _candidate_manifest(
     by_source: dict[str, list[Institution]] = defaultdict(list)
     for institution in institutions:
         by_source[institution.source].append(institution)
+    sites_by_parent: dict[str, list[InstitutionSite]] = defaultdict(list)
+    for site in sites:
+        sites_by_parent[site.institution_id].append(site)
     current_by_source: dict[str, list[SourceInstitutionRecord]] = defaultdict(list)
     for record in source_records:
         current_by_source[record.source].append(record)
     sources = []
     for source_name, source_rows in sorted(by_source.items()):
         source_as_of = max(row.source_as_of for row in source_rows)
-        raw = json.dumps(
-            [row.model_dump(by_alias=True, mode="json") for row in source_rows],
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-        provenance = (
-            source_provenance.get(source_name)
-            if source_provenance is not None
-            else None
-        )
+        if source_provenance is None or source_name not in source_provenance:
+            raise SnapshotQualityError(
+                "source provenance is required for every output source"
+            )
+        provenance = source_provenance[source_name]
+        if provenance.fetched_row_count is None:
+            raise SnapshotQualityError("source fetched row count is required")
         sources.append(
             {
                 "source": source_name,
-                "endpoint": (
-                    provenance.endpoint
-                    if provenance is not None
-                    else _SOURCE_ENDPOINTS[source_name]
-                ),
-                "licenseName": (
-                    provenance.license_name
-                    if provenance is not None
-                    else _SOURCE_LICENSES[source_name]
-                ),
-                "attribution": (
-                    provenance.attribution
-                    if provenance is not None
-                    else _SOURCE_ATTRIBUTIONS[source_name]
-                ),
-                "fetchedAt": (
-                    provenance.fetched_at
-                    if provenance is not None
-                    else created_at
-                ),
+                "endpoint": provenance.endpoint,
+                "licenseName": provenance.license_name,
+                "attribution": provenance.attribution,
+                "fetchedAt": provenance.fetched_at,
                 "sourceAsOf": source_as_of,
-                "rawSha256": (
-                    provenance.raw_sha256
-                    if provenance is not None
-                    else hashlib.sha256(raw).hexdigest()
-                ),
+                "rawSha256": provenance.raw_sha256,
+                "sourceNormalizedSha256": provenance.normalized_sha256,
                 "normalizedSha256": (
-                    provenance.normalized_sha256
-                    if provenance is not None
-                    and provenance.normalized_sha256 is not None
-                    else normalized_records_sha256(current_by_source[source_name])
+                    _normalized_persisted_source_sha256(
+                        source_rows,
+                        sites_by_parent,
+                    )
                 ),
-                "requestRegionCode": (
-                    provenance.request_region_code
-                    if provenance is not None
-                    and provenance.request_region_code is not None
-                    else _EXPECTED_REGION_CODES[source_name]
-                ),
-                "requestTiming": (
-                    provenance.request_timing
-                    if provenance is not None
-                    else None
-                ),
-                "pageCount": (
-                    provenance.page_count if provenance is not None else 1
-                ),
-                "fetchedRowCount": (
-                    provenance.fetched_row_count
-                    if provenance is not None
-                    and provenance.fetched_row_count is not None
-                    else len(current_by_source[source_name])
-                ),
+                "requestRegionCode": provenance.request_region_code,
+                "requestTiming": provenance.request_timing,
+                "pageCount": provenance.page_count,
+                "fetchedRowCount": provenance.fetched_row_count,
                 "normalizedRowCount": len(current_by_source[source_name]),
                 "preservedRowCount": (
                     len(source_rows) - len(current_by_source[source_name])
@@ -520,12 +1270,63 @@ def _candidate_manifest(
         else {}
     )
     current_by_id = {item.institution_id: item for item in institutions}
+    current_sites_by_parent: dict[str, list[InstitutionSite]] = defaultdict(list)
+    previous_sites_by_parent: dict[str, list[InstitutionSite]] = defaultdict(list)
+    for site in sites:
+        current_sites_by_parent[site.institution_id].append(site)
+    if previous is not None:
+        for site in previous.sites:
+            previous_sites_by_parent[site.institution_id].append(site)
     current_source_ids = {record.institution_id for record in source_records}
     changed_count = sum(
-        _institution_change_key(current_by_id[institution_id])
-        != _institution_change_key(previous_by_id[institution_id])
+        (
+            _institution_change_key(current_by_id[institution_id])
+            != _institution_change_key(previous_by_id[institution_id])
+            or _site_change_key(current_sites_by_parent[institution_id])
+            != _site_change_key(previous_sites_by_parent[institution_id])
+        )
         for institution_id in current_source_ids & previous_ids
     )
+    institutions_by_id = {
+        institution.institution_id: institution for institution in institutions
+    }
+    enrichment_qualities = {
+        "OFFICIAL_STANDARD_SCHOOL_LOCATION": "OFFICIAL_STANDARD_COORDINATE",
+        "KAKAO_LOCAL_GEOCODING": "GEOCODED",
+    }
+    enrichment_entries: list[dict[str, object]] = []
+    for item in enrichment_provenance:
+        quality = enrichment_qualities[item.source]
+        matched_sites = [
+            site for site in sites if site.coordinate_quality == quality
+        ]
+        current_matched_count = sum(
+            site.status is not InstitutionStatus.MISSING_FROM_SOURCE
+            and institutions_by_id[site.institution_id].status
+            is not InstitutionStatus.MISSING_FROM_SOURCE
+            for site in matched_sites
+        )
+        preserved_matched_count = len(matched_sites) - current_matched_count
+        enrichment_entries.append(
+            {
+                "source": item.source,
+                "endpoint": item.endpoint,
+                "licenseName": item.license_name,
+                "attribution": item.attribution,
+                "fetchedAt": item.fetched_at,
+                "sourceAsOf": item.source_as_of,
+                "rawSha256": item.raw_sha256,
+                "sourceNormalizedSha256": item.normalized_sha256,
+                "normalizedSha256": _enrichment_sites_sha256(sites, quality),
+                "requestRegionCode": item.request_region_code,
+                "requestTiming": item.request_timing,
+                "pageCount": item.page_count,
+                "fetchedRowCount": item.fetched_row_count,
+                "matchedRowCount": current_matched_count,
+                "preservedMatchedRowCount": preserved_matched_count,
+                "rowCount": len(matched_sites),
+            }
+        )
     return {
         "schemaVersion": 1,
         "snapshotId": snapshot_id,
@@ -535,24 +1336,7 @@ def _candidate_manifest(
         "approvedAt": None,
         "approvedByRole": None,
         "sources": sources,
-        "enrichments": [
-            {
-                "source": item.source,
-                "endpoint": item.endpoint,
-                "licenseName": item.license_name,
-                "attribution": item.attribution,
-                "fetchedAt": item.fetched_at,
-                "sourceAsOf": item.source_as_of,
-                "rawSha256": item.raw_sha256,
-                "normalizedSha256": item.normalized_sha256,
-                "requestRegionCode": item.request_region_code,
-                "requestTiming": item.request_timing,
-                "pageCount": item.page_count,
-                "fetchedRowCount": item.fetched_row_count,
-                "matchedRowCount": item.matched_row_count,
-            }
-            for item in enrichment_provenance
-        ],
+        "enrichments": enrichment_entries,
         "institutionsSha256": hashlib.sha256(institution_bytes).hexdigest(),
         "sitesSha256": hashlib.sha256(site_bytes).hexdigest(),
         "institutionCount": len(institutions),
@@ -561,7 +1345,8 @@ def _candidate_manifest(
             item.status is InstitutionStatus.REVIEW_REQUIRED
             for item in institutions
         ),
-        "possibleMatchCount": possible_match_count,
+        "possibleMatchCount": len(possible_matches),
+        "possibleMatches": possible_matches,
         "countsByType": dict(Counter(item.institution_type for item in institutions)),
         "countsByFoundation": dict(
             Counter(item.foundation_type for item in institutions)
@@ -593,14 +1378,6 @@ def _jsonl_bytes(models: list[Institution] | list[InstitutionSite]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def _possible_match_count(records: tuple[SourceInstitutionRecord, ...]) -> int:
-    grouped: dict[tuple[str, str], set[str]] = defaultdict(set)
-    for record in records:
-        key = ("".join(record.official_name.split()), "".join(record.road_address.split()))
-        grouped[key].add(record.source)
-    return sum(len(sources) - 1 for sources in grouped.values() if len(sources) > 1)
-
-
 def _institution_change_key(institution: Institution) -> tuple[object, ...]:
     return (
         institution.official_name,
@@ -617,6 +1394,28 @@ def _institution_change_key(institution: Institution) -> tuple[object, ...]:
     )
 
 
+def _site_change_key(sites: list[InstitutionSite]) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        sorted(
+            (
+                site.site_id,
+                site.site_name,
+                site.road_address,
+                site.district,
+                site.latitude,
+                site.longitude,
+                site.coordinate_quality,
+                site.routing_anchor_latitude,
+                site.routing_anchor_longitude,
+                site.is_default,
+                site.status,
+                site.effective_to,
+            )
+            for site in sites
+        )
+    )
+
+
 def _duplicate_ids(values: Iterable[str]) -> set[str]:
     seen: set[str] = set()
     duplicates: set[str] = set()
@@ -628,10 +1427,49 @@ def _duplicate_ids(values: Iterable[str]) -> set[str]:
 
 
 def _read_json_object(path: Path) -> dict[str, object]:
-    value = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        value = _strict_json_loads(path.read_text(encoding="utf-8"))
+    except SnapshotQualityError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SnapshotQualityError("candidate manifest is invalid JSON") from exc
     if type(value) is not dict:
         raise SnapshotQualityError("candidate manifest is not an object")
     return value
+
+
+def _strict_json_loads(data: str | bytes) -> object:
+    return json.loads(
+        data,
+        object_pairs_hook=_reject_duplicate_json_keys,
+        parse_constant=_reject_nonstandard_json_constant,
+    )
+
+
+def _manifest_section_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise SnapshotQualityError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def _reject_nonstandard_json_constant(value: str) -> object:
+    raise SnapshotQualityError(f"nonstandard JSON constant: {value}")
 
 
 def _recheck_candidate(
@@ -641,8 +1479,18 @@ def _recheck_candidate(
 ) -> tuple[list[Institution], list[InstitutionSite]]:
     if manifest.get("snapshotId") != snapshot_id:
         raise SnapshotQualityError("candidate snapshot ID mismatch")
-    institution_bytes = (path / "institutions.jsonl").read_bytes()
-    site_bytes = (path / "sites.jsonl").read_bytes()
+    institution_path = _validated_snapshot_file(
+        path / "institutions.jsonl",
+        path,
+        "institutions.jsonl",
+    )
+    site_path = _validated_snapshot_file(
+        path / "sites.jsonl",
+        path,
+        "sites.jsonl",
+    )
+    institution_bytes = institution_path.read_bytes()
+    site_bytes = site_path.read_bytes()
     if hashlib.sha256(institution_bytes).hexdigest() != manifest.get(
         "institutionsSha256"
     ):
@@ -656,7 +1504,6 @@ def _recheck_candidate(
     )
     sites = _parse_candidate_jsonl(site_bytes, InstitutionSite, "sites.jsonl")
     _recheck_manifest_counts(manifest, institutions, sites)
-    _validate_candidate_manifest_schema(manifest)
     return institutions, sites
 
 
@@ -675,7 +1522,21 @@ def _parse_candidate_jsonl(
     records: list[_SnapshotModel] = []
     for line in lines:
         try:
+            decoded = _strict_json_loads(line)
+            if type(decoded) is not dict:
+                raise SnapshotQualityError(
+                    f"candidate {label} row is not an object"
+                )
+            expected_fields = (
+                _INSTITUTION_FIELDS if model is Institution else _SITE_FIELDS
+            )
+            if set(decoded) != expected_fields:
+                raise SnapshotQualityError(
+                    f"candidate {label} fields are not canonical"
+                )
             records.append(model.model_validate_json(line))
+        except SnapshotQualityError:
+            raise
         except ValidationError as exc:
             raise SnapshotQualityError(f"candidate {label} is invalid") from exc
     return records
@@ -735,9 +1596,369 @@ def _recheck_manifest_counts(
     actual = Counter(institution.source for institution in institutions)
     if declared != dict(actual):
         raise SnapshotQualityError("candidate source rowCount does not match records")
+    actual_matches = _persisted_possible_matches(institutions, sites)
+    if (
+        manifest.get("possibleMatchCount") != len(actual_matches)
+        or manifest.get("possibleMatches") != actual_matches
+    ):
+        raise SnapshotQualityError(
+            "candidate possibleMatches do not match persisted records"
+        )
 
 
-def _validate_candidate_manifest_schema(manifest: dict[str, object]) -> None:
+def _recheck_source_provenance(
+    manifest: dict[str, object],
+    institutions: list[Institution],
+    sites: list[InstitutionSite],
+) -> None:
+    source_entries = manifest.get("sources")
+    if type(source_entries) is not list:
+        raise SnapshotQualityError("candidate source provenance is invalid")
+    by_source: dict[str, list[Institution]] = defaultdict(list)
+    for institution in institutions:
+        by_source[institution.source].append(institution)
+    sites_by_parent: dict[str, list[InstitutionSite]] = defaultdict(list)
+    for site in sites:
+        sites_by_parent[site.institution_id].append(site)
+    for entry in source_entries:
+        if type(entry) is not dict:
+            raise SnapshotQualityError("candidate source provenance is invalid")
+        source = entry.get("source")
+        if type(source) is not str or source not in by_source:
+            raise SnapshotQualityError("candidate source provenance is invalid")
+        rows = by_source[source]
+        current_count = sum(
+            row.status is not InstitutionStatus.MISSING_FROM_SOURCE for row in rows
+        )
+        current_rows = [
+            row
+            for row in rows
+            if row.status is not InstitutionStatus.MISSING_FROM_SOURCE
+        ]
+        preserved_count = len(rows) - current_count
+        source_dates = {row.source_as_of for row in rows}
+        timing = entry.get("requestTiming")
+        source_normalized_matches = current_count == 0 or (
+            entry.get("sourceNormalizedSha256")
+            == _normalized_persisted_source_sha256(
+                current_rows,
+                sites_by_parent,
+                before_enrichment=True,
+            )
+        )
+        if (
+            entry.get("endpoint") != _SOURCE_ENDPOINTS[source]
+            or entry.get("licenseName") != _SOURCE_LICENSES[source]
+            or entry.get("attribution") != _SOURCE_ATTRIBUTIONS[source]
+            or entry.get("requestRegionCode") != _EXPECTED_REGION_CODES[source]
+            or entry.get("sourceAsOf") not in source_dates
+            or len(source_dates) != 1
+            or not _source_pagination_is_valid(
+                source,
+                entry.get("pageCount"),
+                entry.get("fetchedRowCount"),
+            )
+            or entry.get("normalizedRowCount") != current_count
+            or entry.get("preservedRowCount") != preserved_count
+            or not source_normalized_matches
+            or entry.get("normalizedSha256")
+            != _normalized_persisted_source_sha256(rows, sites_by_parent)
+            or type(entry.get("rawSha256")) is not str
+            or _SHA256.fullmatch(entry["rawSha256"]) is None
+            or source in _PINNED_SOURCE_RAW_SHA256
+            and entry["rawSha256"] != _PINNED_SOURCE_RAW_SHA256[source]
+            or source in _PINNED_SOURCE_NORMALIZED_SHA256
+            and entry.get("sourceNormalizedSha256")
+            != _PINNED_SOURCE_NORMALIZED_SHA256[source]
+        ):
+            raise SnapshotQualityError(
+                "candidate source provenance does not match persisted rows"
+            )
+        if source == "KINDERGARTEN_INFO":
+            if (
+                type(timing) is not str
+                or re.fullmatch(r"\d{4}[12]", timing) is None
+                or _kindergarten_timing_date(timing) != entry.get("sourceAsOf")
+                or current_count > 0
+                and entry["fetchedRowCount"] != current_count
+            ):
+                raise SnapshotQualityError(
+                    "candidate source provenance timing/count is invalid"
+                )
+        elif timing is not None:
+            raise SnapshotQualityError(
+                "candidate source provenance timing is invalid"
+            )
+        if source == "NEIS" and entry["fetchedRowCount"] == 5:
+            raise SnapshotQualityError("candidate source provenance is a sample")
+        if (
+            source == "NEIS"
+            and current_count > 0
+            and not current_count
+            <= entry["fetchedRowCount"]
+            <= current_count + 50
+        ):
+            raise SnapshotQualityError(
+                "candidate source provenance count is invalid"
+            )
+        if (
+            source == "SEN_REVIEWED_CSV"
+            and current_count > 0
+            and entry["fetchedRowCount"] != current_count
+        ):
+            raise SnapshotQualityError(
+                "candidate source provenance count is invalid"
+            )
+
+
+def _recheck_enrichment_provenance(
+    manifest: dict[str, object],
+    institutions: list[Institution],
+    sites: list[InstitutionSite],
+) -> None:
+    institutions_by_id = {
+        institution.institution_id: institution for institution in institutions
+    }
+    current_sites = [
+        site
+        for site in sites
+        if site.status is not InstitutionStatus.MISSING_FROM_SOURCE
+        and institutions_by_id[site.institution_id].status
+        is not InstitutionStatus.MISSING_FROM_SOURCE
+    ]
+    entries = manifest.get("enrichments")
+    if type(entries) is not list:
+        raise SnapshotQualityError("candidate enrichment provenance is invalid")
+    by_source: dict[str, dict[str, object]] = {}
+    for entry in entries:
+        if type(entry) is not dict:
+            raise SnapshotQualityError("candidate enrichment provenance is invalid")
+        source = entry.get("source")
+        if type(source) is not str or source in by_source:
+            raise SnapshotQualityError("candidate enrichment provenance is invalid")
+        by_source[source] = entry
+    official_count = sum(
+        site.coordinate_quality == "OFFICIAL_STANDARD_COORDINATE"
+        for site in current_sites
+    )
+    official_total = sum(
+        site.coordinate_quality == "OFFICIAL_STANDARD_COORDINATE" for site in sites
+    )
+    official_preserved = official_total - official_count
+    geocoded_count = sum(
+        site.coordinate_quality == "GEOCODED" for site in current_sites
+    )
+    geocoded_total = sum(
+        site.coordinate_quality == "GEOCODED" for site in sites
+    )
+    geocoded_preserved = geocoded_total - geocoded_count
+    if official_total and "OFFICIAL_STANDARD_SCHOOL_LOCATION" not in by_source:
+        raise SnapshotQualityError(
+            "candidate enrichment provenance is missing official locations"
+        )
+    if geocoded_total and "KAKAO_LOCAL_GEOCODING" not in by_source:
+        raise SnapshotQualityError(
+            "candidate enrichment provenance is missing Kakao"
+        )
+    standard = by_source.pop("OFFICIAL_STANDARD_SCHOOL_LOCATION", None)
+    if standard is not None and (
+        standard.get("endpoint") != STANDARD_LOCATION_ENDPOINT
+        or standard.get("licenseName") != "PUBLIC_DATA_NO_USE_RESTRICTION"
+        or standard.get("attribution")
+        != "Korea Education Facilities Safety Authority"
+        or standard.get("sourceAsOf") != STANDARD_LOCATION_SOURCE_AS_OF
+        or standard.get("rawSha256") != STANDARD_LOCATION_RAW_SHA256
+        or standard.get("sourceNormalizedSha256")
+        != _STANDARD_LOCATION_NORMALIZED_SHA256
+        or standard.get("normalizedSha256")
+        != _enrichment_sites_sha256(
+            sites,
+            "OFFICIAL_STANDARD_COORDINATE",
+        )
+        or standard.get("requestRegionCode") != "7010000"
+        or standard.get("requestTiming") is not None
+        or standard.get("pageCount") != 1
+        or standard.get("fetchedRowCount") != PINNED_NATIONWIDE_COUNT
+        or standard.get("matchedRowCount") != official_count
+        or standard.get("preservedMatchedRowCount") != official_preserved
+        or standard.get("rowCount") != official_total
+    ):
+        raise SnapshotQualityError(
+            "candidate enrichment provenance is invalid"
+        )
+    kakao = by_source.pop("KAKAO_LOCAL_GEOCODING", None)
+    kakao_page_count = kakao.get("pageCount") if kakao is not None else None
+    kakao_raw_sha256 = kakao.get("rawSha256") if kakao is not None else None
+    kakao_source_normalized_matches = kakao is not None and (
+        geocoded_count == 0
+        or kakao.get("sourceNormalizedSha256")
+        == _geocoded_sites_sha256(current_sites)
+    )
+    if kakao is not None and (
+        kakao.get("endpoint") != _KAKAO_ENDPOINT
+        or kakao.get("licenseName") != "KAKAO_LOCAL_API_TERMS"
+        or kakao.get("attribution") != "Kakao Local API"
+        or kakao.get("requestRegionCode") != "SEOUL_ADDRESS_BATCH"
+        or kakao.get("requestTiming") is not None
+        or type(kakao_page_count) is not int
+        or kakao_page_count <= 0
+        or kakao.get("fetchedRowCount") != kakao_page_count
+        or kakao.get("matchedRowCount") != geocoded_count
+        or kakao.get("preservedMatchedRowCount") != geocoded_preserved
+        or kakao.get("rowCount") != geocoded_total
+        or not kakao_source_normalized_matches
+        or kakao.get("normalizedSha256")
+        != _enrichment_sites_sha256(sites, "GEOCODED")
+        or type(kakao_raw_sha256) is not str
+        or _SHA256.fullmatch(kakao_raw_sha256) is None
+    ):
+        raise SnapshotQualityError("candidate enrichment provenance is invalid")
+    if by_source:
+        raise SnapshotQualityError("candidate enrichment provenance is unsupported")
+
+
+def _normalized_persisted_source_sha256(
+    rows: list[Institution],
+    sites_by_parent: Mapping[str, list[InstitutionSite]],
+    *,
+    before_enrichment: bool = False,
+) -> str:
+    records: list[SourceInstitutionRecord] = []
+    for row in rows:
+        parent_sites = [
+            site
+            for site in sites_by_parent.get(row.institution_id, [])
+            if not (
+                before_enrichment
+                and site.status is InstitutionStatus.MISSING_FROM_SOURCE
+            )
+        ]
+        source_sites: list[SourceInstitutionSiteRecord] = []
+        prefix = f"{row.institution_id}:"
+        for site in parent_sites:
+            if not site.site_id.startswith(prefix):
+                raise SnapshotQualityError(
+                    "candidate site ID does not match its institution"
+                )
+            site_code = site.site_id.removeprefix(prefix)
+            if _SAFE_SITE_CODE.fullmatch(site_code) is None:
+                raise SnapshotQualityError("candidate site code is invalid")
+            source_sites.append(
+                SourceInstitutionSiteRecord(
+                    site_code=site_code,
+                    site_name=site.site_name,
+                    road_address=site.road_address,
+                    district=site.district,
+                    latitude=site.latitude,
+                    longitude=site.longitude,
+                    coordinate_quality=site.coordinate_quality,
+                )
+            )
+        main_sites = [site for site in source_sites if site.site_code == "main"]
+        if len(main_sites) != 1:
+            raise SnapshotQualityError(
+                "candidate source row must have one persisted main site"
+            )
+        main = main_sites[0]
+        records.append(
+            SourceInstitutionRecord(
+                institution_id=row.institution_id,
+                official_name=row.official_name,
+                institution_type=row.institution_type,
+                foundation_type=row.foundation_type,
+                education_office=row.education_office,
+                road_address=main.road_address,
+                district=main.district,
+                latitude=main.latitude,
+                longitude=main.longitude,
+                source=row.source,
+                source_region_code=row.source_region_code,
+                source_as_of=row.source_as_of,
+                coordinate_quality=main.coordinate_quality,
+                site_name=main.site_name,
+                additional_sites=tuple(
+                    sorted(
+                        (
+                            site
+                            for site in source_sites
+                            if site.site_code != "main"
+                        ),
+                        key=lambda item: item.site_code,
+                    )
+                ),
+            )
+        )
+    if before_enrichment:
+        records = [_record_before_enrichment(record) for record in records]
+    return normalized_records_sha256(records)
+
+
+def _geocoded_sites_sha256(sites: list[InstitutionSite]) -> str:
+    values = [
+        {
+            "road_address": site.road_address,
+            "latitude": site.latitude,
+            "longitude": site.longitude,
+            "confidence": "EXACT_ROAD_ADDRESS",
+        }
+        for site in sites
+        if site.coordinate_quality == "GEOCODED"
+    ]
+    values.sort(
+        key=lambda item: (
+            str(item["road_address"]),
+            cast(float, item["latitude"]),
+            cast(float, item["longitude"]),
+        )
+    )
+    return hashlib.sha256(
+        json.dumps(
+            values,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _persisted_possible_matches(
+    institutions: list[Institution],
+    sites: list[InstitutionSite],
+) -> list[dict[str, object]]:
+    institutions_by_id = {
+        institution.institution_id: institution for institution in institutions
+    }
+    grouped: dict[tuple[str, str], dict[str, str]] = defaultdict(dict)
+    for site in sites:
+        institution = institutions_by_id[site.institution_id]
+        key = (
+            "".join(institution.official_name.split()),
+            "".join(site.road_address.split()),
+        )
+        grouped[key][institution.institution_id] = institution.source
+    pairs: set[tuple[str, str]] = set()
+    for identities in grouped.values():
+        sorted_ids = sorted(identities)
+        for index, left in enumerate(sorted_ids):
+            for right in sorted_ids[index + 1 :]:
+                if identities[left] != identities[right]:
+                    pairs.add((left, right))
+    return [
+        {
+            "institutionIds": [left, right],
+            "reason": "EXACT_NORMALIZED_NAME_AND_ADDRESS",
+        }
+        for left, right in sorted(pairs)
+    ]
+
+
+def _validate_unapproved_manifest_schema(manifest: dict[str, object]) -> None:
+    if (
+        manifest.get("approved") is not False
+        or manifest.get("approvedAt") is not None
+        or manifest.get("approvedByRole") is not None
+    ):
+        raise SnapshotQualityError("unapproved manifest approval fields are invalid")
     approved = dict(manifest)
     approved["approved"] = True
     approved["approvedAt"] = approved.get("createdAt")
@@ -750,11 +1971,23 @@ def _validate_candidate_manifest_schema(manifest: dict[str, object]) -> None:
         raise SnapshotQualityError("candidate manifest schema is invalid") from exc
 
 
+def _validate_approved_manifest_schema(manifest: dict[str, object]) -> None:
+    try:
+        parsed = SnapshotManifest.model_validate_json(
+            json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
+        )
+    except ValidationError as exc:
+        raise SnapshotQualityError("approved manifest schema is invalid") from exc
+    if parsed.approved_by_role != "data-steward":
+        raise SnapshotQualityError("approved manifest role is invalid")
+
+
 def _recheck_promotion_quality(
     root: Path,
     manifest: dict[str, object],
     institutions: list[Institution],
     sites: list[InstitutionSite],
+    coverage: CoverageService,
 ) -> None:
     for institution in institutions:
         _validate_persisted_institution(institution)
@@ -763,6 +1996,35 @@ def _recheck_promotion_quality(
         for site in sites
     ):
         raise SnapshotQualityError("unsupported coordinate quality")
+    for site in sites:
+        if site.status is not InstitutionStatus.ACTIVE:
+            continue
+        if (
+            site.latitude is None
+            or site.longitude is None
+            or site.routing_anchor_latitude is None
+            or site.routing_anchor_longitude is None
+        ):
+            raise SnapshotQualityError(
+                "persisted ACTIVE site has no complete coordinate anchors"
+            )
+        coordinate_state = coverage.classify(
+            Coordinate(latitude=site.latitude, longitude=site.longitude)
+        )
+        anchor_state = coverage.classify(
+            Coordinate(
+                latitude=site.routing_anchor_latitude,
+                longitude=site.routing_anchor_longitude,
+            )
+        )
+        if (
+            not _is_seoul_address(site.road_address)
+            or coordinate_state is not CoverageState.SEOUL
+            or anchor_state is not CoverageState.SEOUL
+        ):
+            raise SnapshotQualityError(
+                "persisted ACTIVE site failed Seoul coverage replay"
+            )
     current = [
         institution
         for institution in institutions
@@ -783,6 +2045,29 @@ def _recheck_promotion_quality(
         for institution in active
     ):
         raise SnapshotQualityError("active candidate institution has no active site")
+    sites_by_parent: dict[str, list[InstitutionSite]] = defaultdict(list)
+    for site in sites:
+        sites_by_parent[site.institution_id].append(site)
+    for institution in current:
+        parent_sites = sites_by_parent[institution.institution_id]
+        if parent_sites and (
+            sum(site.is_default for site in parent_sites) != 1
+            or not any(
+                site.is_default
+                and site.site_id == f"{institution.institution_id}:main"
+                for site in parent_sites
+            )
+        ):
+            raise SnapshotQualityError(
+                "candidate institution sites need one exact default main site"
+            )
+        if institution.status is InstitutionStatus.ACTIVE and not any(
+            site.is_default and site.status is InstitutionStatus.ACTIVE
+            for site in parent_sites
+        ):
+            raise SnapshotQualityError(
+                "active candidate institution needs an active default site"
+            )
     coordinate_rate = len(active) / len(current) if current else 0.0
     if coordinate_rate < 0.98:
         raise SnapshotQualityError(
@@ -792,21 +2077,33 @@ def _recheck_promotion_quality(
     diff = manifest.get("diff")
     if type(diff) is not dict:
         raise SnapshotQualityError("candidate diff metadata is invalid")
+    verified_current: VerifiedSnapshot | None = None
+    if (root / "current.json").exists():
+        try:
+            verified_current = verify_snapshot(root)
+        except (OSError, ValueError) as exc:
+            raise SnapshotQualityError(
+                "current snapshot cannot be verified"
+            ) from exc
+    if (
+        verified_current is not None
+        and verified_current.manifest.snapshot_id == manifest.get("snapshotId")
+    ):
+        return
     previous_snapshot_id = diff.get("previousSnapshotId")
     if previous_snapshot_id is None:
-        if (root / "current.json").exists():
+        if verified_current is not None:
             raise SnapshotQualityError(
                 "candidate previous snapshot ID is missing"
             )
         return
     if type(previous_snapshot_id) is not str:
         raise SnapshotQualityError("candidate previous snapshot ID is invalid")
-    try:
-        previous = verify_snapshot(root)
-    except (OSError, ValueError) as exc:
+    if verified_current is None:
         raise SnapshotQualityError(
             "candidate previous snapshot cannot be verified"
-        ) from exc
+        )
+    previous = verified_current
     if previous.manifest.snapshot_id != previous_snapshot_id:
         raise SnapshotQualityError("candidate previous snapshot ID mismatch")
     previous_active = sum(
@@ -845,6 +2142,19 @@ def _write_json(path: Path, value: object, *, durable: bool = False) -> None:
         if durable:
             stream.flush()
             os.fsync(stream.fileno())
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _utc_now() -> str:
