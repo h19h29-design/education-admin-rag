@@ -427,7 +427,9 @@ def _verify_lineage(
     institutions: tuple[Institution, ...],
     institution_ids: set[str],
 ) -> None:
-    graph: dict[str, set[str]] = {}
+    graph: dict[str, set[str]] = {
+        institution_id: set() for institution_id in institution_ids
+    }
     for institution in institutions:
         targets = list(institution.supersedes)
         if institution.merged_into is not None:
@@ -448,7 +450,10 @@ def _verify_lineage(
                     f"institution {institution.institution_id} has unknown "
                     f"lineage target {target}"
                 )
-        graph[institution.institution_id] = set(targets)
+        if institution.merged_into is not None:
+            graph[institution.institution_id].add(institution.merged_into)
+        for predecessor in institution.supersedes:
+            graph[predecessor].add(institution.institution_id)
 
     incoming = dict.fromkeys(institution_ids, 0)
     for outgoing_targets in graph.values():

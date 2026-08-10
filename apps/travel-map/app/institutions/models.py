@@ -344,8 +344,20 @@ class SnapshotManifest(_StrictSnapshotModel):
         approved_at = _parse_rfc3339_timestamp(self.approved_at)
         if created_at > approved_at:
             raise ValueError("createdAt must not be later than approvedAt")
-        if _parse_iso_date(self.snapshot_as_of) > created_at.date():
+        snapshot_as_of = _parse_iso_date(self.snapshot_as_of)
+        if snapshot_as_of > created_at.date():
             raise ValueError("snapshotAsOf must not be later than createdAt date")
+        for source in self.sources:
+            if _parse_rfc3339_timestamp(source.fetched_at) > created_at:
+                raise ValueError(
+                    f"source {source.source} fetchedAt must not be later than "
+                    "manifest createdAt"
+                )
+            if _parse_iso_date(source.source_as_of) > snapshot_as_of:
+                raise ValueError(
+                    f"source {source.source} sourceAsOf must not be later than "
+                    "manifest snapshotAsOf"
+                )
         return self
 
     @field_validator("snapshot_as_of")

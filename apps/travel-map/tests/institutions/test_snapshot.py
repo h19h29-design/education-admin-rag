@@ -627,6 +627,51 @@ def test_snapshot_rejects_source_as_of_after_fetch(tmp_path: Path) -> None:
         verify_snapshot(fixture)
 
 
+# Production break caught: accepting a source fetched after the manifest was
+# created, even when the source's local calendar date still matches sourceAsOf.
+def test_snapshot_rejects_source_fetched_after_manifest_creation(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    manifest["sources"][0]["fetchedAt"] = "2026-08-01T00:00:01-01:00"
+    write_manifest(fixture, manifest)
+
+    with pytest.raises(
+        SnapshotIntegrityError,
+        match="source TEST_NEIS fetchedAt must not be later than manifest createdAt",
+    ):
+        verify_snapshot(fixture)
+
+
+# Same chronology guard: a later local wall-clock time can still represent an
+# earlier instant once its UTC offset is applied.
+def test_snapshot_compares_source_fetch_and_creation_as_instants(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    manifest["sources"][0]["fetchedAt"] = "2026-08-01T08:59:59+09:00"
+    write_manifest(fixture, manifest)
+
+    verify_snapshot(fixture)
+
+
+# Production break caught: accepting a source vintage newer than the approved
+# snapshot's as-of date.
+def test_snapshot_rejects_source_as_of_after_manifest_snapshot_as_of(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    update_manifest(fixture, "snapshotAsOf", "2026-07-31")
+
+    with pytest.raises(
+        SnapshotIntegrityError,
+        match="source TEST_NEIS sourceAsOf must not be later than manifest snapshotAsOf",
+    ):
+        verify_snapshot(fixture)
+
+
 # Production break caught: mixing institution rows from a different source vintage
 # while preserving the same source name and row count.
 def test_snapshot_requires_institution_and_manifest_source_as_of_match(
@@ -898,9 +943,9 @@ def test_snapshot_rejects_duplicate_lineage_reference(tmp_path: Path) -> None:
         verify_snapshot(fixture)
 
 
-# Production break caught: approving a cycle composed across mergedInto and
-# supersedes edges.
-def test_snapshot_rejects_cyclic_lineage_graph(tmp_path: Path) -> None:
+# Production break caught: treating reciprocal predecessor/successor declarations as
+# opposing graph edges instead of the same chronological transition.
+def test_snapshot_accepts_reciprocal_lineage_declarations(tmp_path: Path) -> None:
     fixture = copy_fixture_snapshot(tmp_path)
     change_jsonl_record(
         fixture,
@@ -915,6 +960,40 @@ def test_snapshot_rejects_cyclic_lineage_graph(tmp_path: Path) -> None:
         record_index=1,
         field_name="supersedes",
         value=["test-neis:B10:SEMWATER-KG"],
+    )
+
+    verified = verify_snapshot(fixture)
+
+    assert verified.institutions[0].merged_into == "test-neis:B10:SEMWATER-ES"
+    assert verified.institutions[1].supersedes == (
+        "test-neis:B10:SEMWATER-KG",
+    )
+
+
+# Production break caught: overlooking a genuine directed cycle when mergedInto and
+# supersedes declarations need different chronological orientations.
+def test_snapshot_rejects_three_node_lineage_cycle(tmp_path: Path) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    change_jsonl_record(
+        fixture,
+        "institutions.jsonl",
+        record_index=0,
+        field_name="mergedInto",
+        value="test-neis:B10:SEMWATER-ES",
+    )
+    change_jsonl_record(
+        fixture,
+        "institutions.jsonl",
+        record_index=0,
+        field_name="supersedes",
+        value=["test-neis:B10:HANBIT-GANGNAM"],
+    )
+    change_jsonl_record(
+        fixture,
+        "institutions.jsonl",
+        record_index=2,
+        field_name="supersedes",
+        value=["test-neis:B10:SEMWATER-ES"],
     )
 
     with pytest.raises(SnapshotIntegrityError, match="lineage cycle"):
