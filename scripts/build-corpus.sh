@@ -23,8 +23,7 @@ docker run --rm --network none --read-only --cap-drop ALL \
   -v "$SEN_QA_SOURCE_ROOT:/sen-qa/source:ro" \
   -v "$RELEASE_ROOT:/sen-qa/artifacts:rw" \
   "$SEN_QA_INGESTION_IMAGE" verify-sources \
-  --manifest /work/data/manifests/sen_qa_sources.json \
-  --source-root /sen-qa/source
+  --manifest /work/data/manifests/sen_qa_sources.json
 
 docker run --rm --network none --read-only --cap-drop ALL \
   --user "$(id -u):$(id -g)" \

@@ -236,6 +236,7 @@ def test_corpus_script_stages_review_registry_before_stopping() -> None:
 
     assert "stage-review-corpus" in script
     assert "--input-root /sen-qa/artifacts/raw-pages" in script
+    assert "--source-root" not in script
     assert "stage=review_pending failed=0" in script
     assert "candidate_review_bridge_required" not in script
 
