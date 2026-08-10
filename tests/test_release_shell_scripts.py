@@ -240,6 +240,55 @@ def test_corpus_script_stages_review_registry_before_stopping() -> None:
     assert "candidate_review_bridge_required" not in script
 
 
+def test_corpus_build_runs_every_container_as_the_release_operator(
+    tmp_path: Path,
+) -> None:
+    """Catches mounted release directories being unwritable to the image UID."""
+    environment = _release_environment(tmp_path)
+    environment.update(
+        {
+            "SEN_QA_INGESTION_IMAGE": "sen-qa-ingestion:v1@sha256:" + "a" * 64,
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "sha256:" + "a" * 64,
+            "SEN_QA_TEST_IDENTITY": f"{os.getuid()}:{os.getgid()}",
+        }
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        """#!/usr/bin/env bash
+set -eu
+test "$1" = run
+shift
+found=0
+while test "$#" -gt 0; do
+  if test "$1" = --user && test "${2:-}" = "$SEN_QA_TEST_IDENTITY"; then
+    found=1
+    break
+  fi
+  shift
+done
+test "$found" = 1
+""",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    completed = subprocess.run(
+        ["bash", "scripts/build-corpus.sh"],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "stage=review_pending failed=0" in completed.stdout
+
+
 def test_finalize_script_requires_external_review_and_runtime_pins() -> None:
     script = Path("scripts/finalize-corpus.sh").read_text(encoding="utf-8")
 

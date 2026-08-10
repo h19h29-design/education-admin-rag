@@ -17,6 +17,7 @@ fi
 install -d -m 0700 "$RELEASE_ROOT/raw-pages/native" "$RELEASE_ROOT/reports"
 
 docker run --rm --network none --read-only --cap-drop ALL \
+  --user "$(id -u):$(id -g)" \
   --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=512m \
   -e SEN_QA_SOURCE_ROOT=/sen-qa/source \
   -v "$SEN_QA_SOURCE_ROOT:/sen-qa/source:ro" \
@@ -26,6 +27,7 @@ docker run --rm --network none --read-only --cap-drop ALL \
   --source-root /sen-qa/source
 
 docker run --rm --network none --read-only --cap-drop ALL \
+  --user "$(id -u):$(id -g)" \
   --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=512m \
   -e SEN_QA_SOURCE_ROOT=/sen-qa/source \
   -v "$SEN_QA_SOURCE_ROOT:/sen-qa/source:ro" \
@@ -39,6 +41,7 @@ for spec in 2023:168 2024:324 2025:314; do
   pages="${spec##*:}"
   install -d -m 0700 "$RELEASE_ROOT/raw-pages/ocr-$year"
   docker run --rm --network none --read-only --cap-drop ALL \
+    --user "$(id -u):$(id -g)" \
     --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=2g \
     -e SEN_QA_SOURCE_ROOT=/sen-qa/source \
     -e SEN_QA_INGESTION_IMAGE_DIGEST="$SEN_QA_INGESTION_IMAGE_DIGEST" \
@@ -49,6 +52,7 @@ for spec in 2023:168 2024:324 2025:314; do
 done
 
 docker run --rm --network none --read-only --cap-drop ALL \
+  --user "$(id -u):$(id -g)" \
   --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=512m \
   -e SEN_QA_INGESTION_IMAGE_DIGEST="$SEN_QA_INGESTION_IMAGE_DIGEST" \
   -v "$RELEASE_ROOT:/sen-qa/artifacts:rw" \
