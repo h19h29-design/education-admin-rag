@@ -128,6 +128,14 @@ class InstitutionStore:
             raise ValueError("limit must be an integer from 1 to 50")
         if type(query) is not str:
             raise TypeError("query must be a string")
+        for filter_name, filter_value in (
+            ("institution_type", institution_type),
+            ("foundation_type", foundation_type),
+            ("education_office", education_office),
+            ("district", district),
+        ):
+            if filter_value is not None and type(filter_value) is not str:
+                raise TypeError(f"{filter_name} must be a string or None")
         normalized_query = _normalize(query)
         use_initial_index = bool(normalized_query) and all(
             character in _KOREAN_INITIAL_SET for character in normalized_query
@@ -157,6 +165,8 @@ class InstitutionStore:
         return tuple(match[3] for match in matches[:limit])
 
     def require_site(self, site_id: str) -> InstitutionSite:
+        if type(site_id) is not str:
+            raise TypeError("site_id must be a string")
         site = self._active_sites.get(site_id)
         if site is None:
             raise UnknownSiteError(site_id)

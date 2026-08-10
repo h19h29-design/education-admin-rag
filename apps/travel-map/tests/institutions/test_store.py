@@ -62,12 +62,12 @@ def test_search_returns_each_physical_site_with_its_site_name() -> None:
 @pytest.mark.parametrize(
     "site_id",
     [
-        "neis:B10:CLOSED:main",
-        "neis:B10:MISSING:main",
-        "neis:B10:TEMP-PARENT:main",
-        "neis:B10:REVIEW-PARENT:main",
-        "neis:B10:NONACTIVE-SITES:temporary",
-        "neis:B10:NONACTIVE-SITES:review",
+        "test-neis:B10:CLOSED:main",
+        "test-neis:B10:MISSING:main",
+        "test-neis:B10:TEMP-PARENT:main",
+        "test-neis:B10:REVIEW-PARENT:main",
+        "test-neis:B10:NONACTIVE-SITES:temporary",
+        "test-neis:B10:NONACTIVE-SITES:review",
         "unknown:site",
     ],
 )
@@ -217,6 +217,36 @@ def test_search_rejects_limit_outside_strict_integer_range(limit: Any) -> None:
 
     with pytest.raises(ValueError, match="limit must be an integer from 1 to 50"):
         store.search(query="", limit=limit)
+
+
+# Production break caught: silently treating a bool/int/list filter as an ordinary
+# unmatched value instead of rejecting a malformed request.
+@pytest.mark.parametrize(
+    "filter_name",
+    ["institution_type", "foundation_type", "education_office", "district"],
+)
+@pytest.mark.parametrize("invalid_value", [True, 1, ["강남구"]])
+def test_search_rejects_non_string_filter(
+    filter_name: str,
+    invalid_value: Any,
+) -> None:
+    store = InstitutionStore.load(SNAPSHOT_ROOT)
+
+    with pytest.raises(
+        TypeError,
+        match=f"{filter_name} must be a string or None",
+    ):
+        store.search(query="", **{filter_name: invalid_value})
+
+
+# Production break caught: leaking a raw unhashable-dict-key error from require_site
+# for malformed request input.
+@pytest.mark.parametrize("site_id", [None, True, 1, ["site"]])
+def test_require_site_rejects_non_string_input(site_id: Any) -> None:
+    store = InstitutionStore.load(SNAPSHOT_ROOT)
+
+    with pytest.raises(TypeError, match="site_id must be a string"):
+        store.require_site(site_id)
 
 
 # Production break caught: require_site returning a reconstructed or user-supplied site.

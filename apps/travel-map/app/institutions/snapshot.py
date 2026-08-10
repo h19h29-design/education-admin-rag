@@ -1,9 +1,10 @@
 import hashlib
 import json
 import re
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import TypeVar
 
@@ -51,6 +52,41 @@ _DIFF_FIELDS = {
     "missingCount",
     "closedCandidateCount",
 }
+_INSTITUTION_FIELDS = {
+    "institutionId",
+    "officialName",
+    "institutionType",
+    "foundationType",
+    "educationOffice",
+    "status",
+    "statusSource",
+    "effectiveFrom",
+    "effectiveTo",
+    "lastSeenSnapshot",
+    "aliases",
+    "supersedes",
+    "mergedInto",
+    "source",
+    "sourceRegionCode",
+    "sourceAsOf",
+}
+_SITE_FIELDS = {
+    "siteId",
+    "institutionId",
+    "siteName",
+    "roadAddress",
+    "district",
+    "latitude",
+    "longitude",
+    "coordinateQuality",
+    "routingAnchorLatitude",
+    "routingAnchorLongitude",
+    "isDefault",
+    "status",
+    "effectiveFrom",
+    "effectiveTo",
+}
+_SAFE_SITE_SUFFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _Model = TypeVar("_Model", bound=BaseModel)
 
 
@@ -172,7 +208,9 @@ def _resolve_file(candidate: Path, parent: Path, label: str) -> Path:
 
 def _read_json_object(path: Path, label: str) -> dict[str, object]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = _strict_json_loads(path.read_text(encoding="utf-8"))
+    except SnapshotIntegrityError:
+        raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SnapshotIntegrityError(f"{label} must be valid UTF-8 JSON") from exc
     if type(value) is not dict:
@@ -183,7 +221,7 @@ def _read_json_object(path: Path, label: str) -> dict[str, object]:
 def _read_manifest(path: Path) -> SnapshotManifest:
     try:
         data = path.read_bytes()
-        decoded = json.loads(data)
+        decoded = _strict_json_loads(data)
         _verify_manifest_fields(decoded)
         return SnapshotManifest.model_validate_json(data)
     except SnapshotIntegrityError:
@@ -244,7 +282,9 @@ def _parse_jsonl(
         if not line.strip():
             raise SnapshotIntegrityError(f"{label} line {line_number} is blank")
         try:
-            decoded = json.loads(line)
+            decoded = _strict_json_loads(line)
+        except SnapshotIntegrityError:
+            raise
         except json.JSONDecodeError as exc:
             raise SnapshotIntegrityError(
                 f"{label} line {line_number} is malformed JSON"
@@ -253,6 +293,14 @@ def _parse_jsonl(
             raise SnapshotIntegrityError(
                 f"{label} line {line_number} must contain a JSON object"
             )
+        expected_fields = (
+            _INSTITUTION_FIELDS if model is Institution else _SITE_FIELDS
+        )
+        if set(decoded) != expected_fields:
+            raise SnapshotIntegrityError(
+                f"{label} line {line_number} fields must exactly match "
+                "schema version 1"
+            )
         try:
             records.append(model.model_validate_json(line))
         except ValidationError as exc:
@@ -260,6 +308,29 @@ def _parse_jsonl(
                 f"{label} line {line_number} contains invalid model data: {exc}"
             ) from exc
     return tuple(records)
+
+
+def _strict_json_loads(data: str | bytes) -> object:
+    return json.loads(
+        data,
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_nonstandard_constant,
+    )
+
+
+def _reject_duplicate_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise SnapshotIntegrityError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_nonstandard_constant(value: str) -> object:
+    raise SnapshotIntegrityError(f"nonstandard JSON constant: {value}")
 
 
 def _verify_records(
@@ -280,16 +351,44 @@ def _verify_records(
         "institutionId",
     )
     _unique_ids((item.site_id for item in sites), "siteId")
+    _verify_lineage(institutions, institution_ids)
     for institution in institutions:
         if institution.last_seen_snapshot != snapshot_id:
             raise SnapshotIntegrityError(
                 f"institution {institution.institution_id} lastSeenSnapshot mismatch"
+            )
+        if institution.status.value == "ACTIVE" and not _is_effective_on(
+            institution.effective_from,
+            institution.effective_to,
+            manifest.snapshot_as_of,
+        ):
+            raise SnapshotIntegrityError(
+                f"ACTIVE institution {institution.institution_id} is not effective "
+                "on snapshotAsOf"
             )
     for site in sites:
         if site.institution_id not in institution_ids:
             raise SnapshotIntegrityError(
                 f"site {site.site_id} references unknown institutionId "
                 f"{site.institution_id}"
+            )
+        site_prefix = f"{site.institution_id}:"
+        site_suffix = site.site_id.removeprefix(site_prefix)
+        if (
+            not site.site_id.startswith(site_prefix)
+            or _SAFE_SITE_SUFFIX.fullmatch(site_suffix) is None
+        ):
+            raise SnapshotIntegrityError(
+                f"site {site.site_id} siteId must begin with parent institutionId "
+                "and a safe suffix"
+            )
+        if site.status.value == "ACTIVE" and not _is_effective_on(
+            site.effective_from,
+            site.effective_to,
+            manifest.snapshot_as_of,
+        ):
+            raise SnapshotIntegrityError(
+                f"ACTIVE site {site.site_id} is not effective on snapshotAsOf"
             )
 
     _verify_count_map(
@@ -324,6 +423,54 @@ def _unique_ids(values: Iterable[str], label: str) -> set[str]:
     return seen
 
 
+def _verify_lineage(
+    institutions: tuple[Institution, ...],
+    institution_ids: set[str],
+) -> None:
+    graph: dict[str, set[str]] = {}
+    for institution in institutions:
+        targets = list(institution.supersedes)
+        if institution.merged_into is not None:
+            targets.append(institution.merged_into)
+        if len(targets) != len(set(targets)):
+            raise SnapshotIntegrityError(
+                f"institution {institution.institution_id} has a duplicate "
+                "lineage reference"
+            )
+        for target in targets:
+            if target == institution.institution_id:
+                raise SnapshotIntegrityError(
+                    f"institution {institution.institution_id} has a self "
+                    "lineage reference"
+                )
+            if target not in institution_ids:
+                raise SnapshotIntegrityError(
+                    f"institution {institution.institution_id} has unknown "
+                    f"lineage target {target}"
+                )
+        graph[institution.institution_id] = set(targets)
+
+    incoming = dict.fromkeys(institution_ids, 0)
+    for outgoing_targets in graph.values():
+        for target in outgoing_targets:
+            incoming[target] += 1
+    ready = deque(
+        institution_id
+        for institution_id, count in incoming.items()
+        if count == 0
+    )
+    visited = 0
+    while ready:
+        institution_id = ready.popleft()
+        visited += 1
+        for target in graph[institution_id]:
+            incoming[target] -= 1
+            if incoming[target] == 0:
+                ready.append(target)
+    if visited != len(institution_ids):
+        raise SnapshotIntegrityError("institution lineage cycle detected")
+
+
 def _verify_count_map(
     declared: dict[str, int],
     actual: Counter[str],
@@ -352,7 +499,27 @@ def _verify_source_counts(
             raise SnapshotIntegrityError(
                 f"source {source_name} rowCount does not match institution records"
             )
+    source_dates = {
+        source.source: source.source_as_of for source in manifest.sources
+    }
+    for institution in institutions:
+        if institution.source_as_of != source_dates[institution.source]:
+            raise SnapshotIntegrityError(
+                f"institution {institution.institution_id} sourceAsOf does not "
+                f"match manifest source {institution.source}"
+            )
     if sum(declared.values()) != len(institutions):
         raise SnapshotIntegrityError(
             "source rowCount sum does not match institutionCount"
         )
+
+
+def _is_effective_on(
+    effective_from: str,
+    effective_to: str | None,
+    on_date: str,
+) -> bool:
+    selected = date.fromisoformat(on_date)
+    return date.fromisoformat(effective_from) <= selected and (
+        effective_to is None or selected <= date.fromisoformat(effective_to)
+    )
