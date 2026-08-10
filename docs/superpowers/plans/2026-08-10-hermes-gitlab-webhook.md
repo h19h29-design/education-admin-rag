@@ -41,9 +41,9 @@
 ## Task 4: 증적·공개 저장소·미러
 
 - [x] Notion 프로젝트 페이지에 RAG code-ready와 release 미완료를 구분해 기록한다.
-- [ ] 전체 pytest, Ruff, strict mypy, public policy와 current-tree secret scan을 실행한다.
-- [ ] 명시 파일만 커밋하고 GitLab main에 push한다.
-- [ ] GitHub mirror main이 같은 SHA인지 확인한다.
+- [x] 전체 pytest, Ruff, strict mypy, public policy와 current-tree secret scan을 실행한다.
+- [x] 명시 파일만 커밋하고 GitLab main에 push한다.
+- [x] GitHub mirror main이 같은 SHA인지 확인한다.
 
 ## 완료 조건
 

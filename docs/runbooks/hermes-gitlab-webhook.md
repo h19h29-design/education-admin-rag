@@ -157,7 +157,7 @@ Standard Webhooks signing token은 receiver 지원을 추가한 뒤 별도 전�
 
 ## 점검
 
-1. GitLab test delivery가 HTTPS 200인지 확인한다.
+1. GitLab Note delivery가 HTTPS `202 accepted`인지 확인한다.
 2. 허용하지 않은 댓글은 `ignored`이고 agent 실행이 없어야 한다.
 3. `/hermes status`는 Telegram에 공개 metadata 요약만 보내야 한다.
 4. `/hermes review`는 MR에서만 동작해야 한다.
