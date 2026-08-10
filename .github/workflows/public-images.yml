@@ -2,6 +2,16 @@ name: public-images
 
 on:
   workflow_dispatch:
+    inputs:
+      image:
+        description: Public image set to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - ingestion
+          - indexer
 
 permissions:
   contents: read
@@ -13,6 +23,7 @@ concurrency:
 
 jobs:
   ingestion:
+    if: ${{ github.event.inputs.image == 'all' || github.event.inputs.image == 'ingestion' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -37,6 +48,7 @@ jobs:
             .
 
   indexer:
+    if: ${{ github.event.inputs.image == 'all' || github.event.inputs.image == 'indexer' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:

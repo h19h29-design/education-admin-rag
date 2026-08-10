@@ -250,7 +250,10 @@ def test_ingestion_runtime_is_nonroot_and_uses_locked_local_model_paths() -> Non
         "PADDLE_HOME=/opt/models" in line or "PADDLE_PDX_CACHE_HOME=/opt/models" in line
         for line in instructions
     )
-    assert instructions[-1] == 'CMD ["/opt/venv/bin/python", "-m", "src.cli"]'
+    assert instructions[-2:] == [
+        'ENTRYPOINT ["/opt/venv/bin/python", "-m", "src.cli"]',
+        'CMD ["--help"]',
+    ]
 
 
 def test_ingestion_runtime_installs_trixie_elf_dependencies_from_frozen_snapshot() -> (
@@ -386,3 +389,11 @@ def test_ingestion_docker_context_has_no_broad_reinclude() -> None:
     )
 
     assert exceptions == _DOCKER_CONTEXT_EXCEPTIONS
+
+
+def test_ingestion_image_accepts_cli_subcommands_from_release_scripts() -> None:
+    """Catches Docker treating `verify-sources` as an executable name."""
+    instructions = Path("docker/ingestion.Dockerfile").read_text(encoding="utf-8")
+
+    assert 'ENTRYPOINT ["/opt/venv/bin/python", "-m", "src.cli"]' in instructions
+    assert 'CMD ["--help"]' in instructions

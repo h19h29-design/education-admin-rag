@@ -72,6 +72,9 @@ def test_public_image_build_is_manual_digest_pinned_and_source_only() -> None:
     )
 
     assert set(workflow["on"]) == {"workflow_dispatch"}
+    image_input = workflow["on"]["workflow_dispatch"]["inputs"]["image"]
+    assert image_input["type"] == "choice"
+    assert image_input["options"] == ["all", "ingestion", "indexer"]
     assert workflow["permissions"] == {"contents": "read", "packages": "write"}
     assert set(workflow["jobs"]) == {"ingestion", "indexer"}
 
@@ -81,6 +84,7 @@ def test_public_image_build_is_manual_digest_pinned_and_source_only() -> None:
     }
     for job_name, dockerfile in expected.items():
         job = workflow["jobs"][job_name]
+        assert f"github.event.inputs.image == '{job_name}'" in job["if"]
         assert job["runs-on"] == "ubuntu-24.04"
         commands = "\n".join(
             step.get("run", "") for step in job["steps"] if "run" in step
