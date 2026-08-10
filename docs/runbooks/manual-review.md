@@ -7,8 +7,9 @@
 
 > **PRODUCTION RELEASE BLOCKED**
 >
-> root 소유의 제한형 review broker와 `SO_PEERCRED` 검증, 고정 이미지·mount
-> allowlist, 두 실제 NAS 계정 동시성 시험이 구현·통과되기 전에는 검수 CLI를
+> root 소유의 제한형 review broker는 코드에 포함되어 있다. `SO_PEERCRED` 검증,
+> 고정 이미지·mount allowlist, 두 실제 NAS 계정 동시성 시험이 운영 NAS에서
+> 통과되기 전에는 검수 CLI를
 > NAS 운영 DB에 직접 연결하거나 `assert-ready` 결과로 release하면 안 된다.
 > 현재 SQLite trigger는 애플리케이션 실수를 막는 defense-in-depth일 뿐,
 > DB 파일 writer에 대한 변조 방지 경계가 아니다.
@@ -40,6 +41,7 @@ export SEN_QA_SERVICE_GROUP='senqa-review-service'
 export SEN_QA_SERVICE_USER='<review-service-account>'
 export SEN_QA_REVIEWER_PROBE_USER='<reviewer-account>'
 export SEN_QA_BROKER_CONTAINER='<root-managed-review-broker-container>'
+export SEN_QA_BROKER_IMAGE='<public-image>@sha256:<64-lowercase-hex>'
 export SEN_QA_DOCKER='/var/packages/ContainerManager/target/usr/bin/docker'
 
 test "$(id -u)" -eq 0
@@ -116,7 +118,7 @@ install -d -o "$SEN_QA_SERVICE_USER" -g "$SEN_QA_SERVICE_GROUP" -m 0700 \
   "$SEN_QA_REVIEW_STATE_DIR"
 install -d -o "$SEN_QA_SERVICE_USER" -g "$SEN_QA_REVIEW_GROUP" -m 2770 \
   "$SEN_QA_QUEUE_DIR" "$SEN_QA_CORRECTION_DIR"
-install -d -o "$SEN_QA_SERVICE_USER" -g "$SEN_QA_REVIEW_GROUP" -m 0750 \
+install -d -o "$SEN_QA_SERVICE_USER" -g "$SEN_QA_REVIEW_GROUP" -m 2750 \
   "$SEN_QA_BROKER_DIR"
 
 setfacl -m "u::rwx,g::rwx,o::---,m::rwx" \
@@ -162,6 +164,46 @@ root 전용 broker는 image digest, command, mount source/destination, network m
 service UID/GID를 하드코딩한다. reviewer에게 Docker socket, Docker group,
 Container Manager 관리자 권한 또는 포괄적 sudo wrapper를 주면 root 권한과 같은
 우회가 가능하므로 금지한다.
+
+다음은 root가 실행하는 고정 launch 계약이다. registry SHA-256은 배포 증적에서
+복사하며 reviewer 요청에서 받지 않는다. broker 디렉터리의 setgid 때문에 socket은
+reviewer group을 상속하고 broker가 `0660`으로 제한한다. service process에는 Docker
+socket을 mount하지 않는다.
+
+```sh
+SEN_QA_BROKER_DIGEST="${SEN_QA_BROKER_IMAGE##*@sha256:}"
+test "$SEN_QA_BROKER_IMAGE" != "$SEN_QA_BROKER_DIGEST"
+printf '%s\n' "$SEN_QA_BROKER_DIGEST" | grep -Eq '^[0-9a-f]{64}$' || {
+  echo 'broker_image_digest_invalid' >&2; exit 2;
+}
+test -n "${SEN_QA_REVIEW_REGISTRY_SHA256:?}"
+printf '%s\n' "$SEN_QA_REVIEW_REGISTRY_SHA256" | grep -Eq '^[0-9a-f]{64}$' || {
+  echo 'registry_digest_invalid' >&2; exit 2;
+}
+
+export SEN_QA_SERVICE_UID="$(id -u "$SEN_QA_SERVICE_USER")"
+export SEN_QA_SERVICE_GID="$(getent group "$SEN_QA_SERVICE_GROUP" | cut -d: -f3)"
+export SEN_QA_REVIEW_GID="$(getent group "$SEN_QA_REVIEW_GROUP" | cut -d: -f3)"
+
+"$SEN_QA_DOCKER" run -d --name "$SEN_QA_BROKER_CONTAINER" \
+  --restart unless-stopped --network none --read-only --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --user "$SEN_QA_SERVICE_UID:$SEN_QA_SERVICE_GID" \
+  --group-add "$SEN_QA_REVIEW_GID" \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+  -v "$SEN_QA_SOURCE_DIR:/data/source:ro" \
+  -v "$SEN_QA_RAW_DIR:/data/raw:ro" \
+  -v "$SEN_QA_CANONICAL_DIR:/data/canonical:ro" \
+  -v "$SEN_QA_REVIEW_STATE_DIR:/data/review-state:rw" \
+  -v "$SEN_QA_BROKER_DIR:/run/sen-qa:rw" \
+  --entrypoint /opt/venv/bin/python \
+  "$SEN_QA_BROKER_IMAGE" -m src.ingestion.review_broker \
+  --socket /run/sen-qa/review.sock \
+  --database /data/review-state/review.sqlite3 \
+  --registry /data/canonical/review-registry.json \
+  --registry-sha256 "$SEN_QA_REVIEW_REGISTRY_SHA256" \
+  --manifest-root /data/canonical/manifests
+```
 
 ## 5. 운영 전 검증 명령
 
@@ -238,6 +280,6 @@ canonical 발급기와 review registry는 중앙 `src/corpus/ids.py` validator�
 전화·주민번호·계좌 후보처럼 긴 숫자와 알려진 provider token 형태의 raw `case_no`는
 안정적인 `opaque-<hash>` component로 바뀌며 거부 오류에도 입력값을 노출하지 않는다.
 
-남은 production blocker는 root 소유 broker와 실제 NAS 계정 통합 시험이다. 이를
+남은 production blocker는 root 소유 broker의 실제 NAS 계정 통합 시험이다. 이를
 닫힌 뒤에만 broker를 통해 `assert-ready`를 실행하고 release 증적에 registry hash,
 이미지 digest, blocker count, 두 OS actor UID를 값 최소화 형태로 남긴다.
