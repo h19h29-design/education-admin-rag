@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "snapshotId": "fixture-001",
+  "createdAt": "2026-08-01T00:00:00Z",
+  "snapshotAsOf": "2026-08-01",
+  "approved": true,
+  "approvedAt": "2026-08-02T00:00:00Z",
+  "approvedByRole": "TEST_FIXTURE_REVIEWER",
+  "sources": [
+    {
+      "source": "TEST_NEIS",
+      "endpoint": "https://example.invalid/test-only-neis-fixture",
+      "licenseName": "TEST_ONLY_SYNTHETIC_DATA",
+      "attribution": "Synthetic test fixture; not production institution data",
+      "fetchedAt": "2026-08-01T00:00:00Z",
+      "sourceAsOf": "2026-08-01",
+      "rawSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "pageCount": 1,
+      "rowCount": 10
+    }
+  ],
+  "institutionsSha256": "fc8b64f16517b3a257f34a6541839b363a385158b105548e9718ffb1c257beb6",
+  "sitesSha256": "b04e3865bb2b6c555cb7245f8f1cc5c70157c98e97eca56d940d557c1da96918",
+  "institutionCount": 10,
+  "siteCount": 12,
+  "quarantinedCount": 0,
+  "possibleMatchCount": 0,
+  "countsByType": {"ELEMENTARY_SCHOOL": 9, "KINDERGARTEN": 1},
+  "countsByFoundation": {"PUBLIC": 10},
+  "countsByStatus": {"ACTIVE": 6, "CLOSED": 1, "MISSING_FROM_SOURCE": 1, "REVIEW_REQUIRED": 1, "TEMPORARILY_CLOSED": 1},
+  "coordinateQualityCounts": {"ENTRANCE": 10, "ROOFTOP": 2},
+  "diff": {
+    "previousSnapshotId": null,
+    "addedCount": 10,
+    "changedCount": 0,
+    "missingCount": 1,
+    "closedCandidateCount": 1
+  }
+}
