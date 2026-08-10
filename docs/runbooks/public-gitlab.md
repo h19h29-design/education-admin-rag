@@ -90,6 +90,21 @@ GitLab Runner가 준비될 때까지 공개 GitHub 미러의 `.github/workflows/
 - 원본 PDF, OCR output, canonical/review DB, Qdrant snapshot은 업로드하지 않는다.
 - hosted workflow 성공은 공개 테스트 부하가 NAS에서 분리됐다는 증거일 뿐, 민감 운영 계산이나 Docker/SBOM 배포가 이전됐다는 뜻은 아니다.
 
+### GitHub-hosted public image build
+
+`.github/workflows/public-images.yml`은 운영자가 수동으로 실행할 때만 ingestion과
+indexer 이미지를 Linux/amd64로 빌드한다. 입력은 deny-by-default Docker context를
+통과한 공개 코드, 공개 manifest, 공개 모델 lock뿐이다. 원본 PDF, OCR 결과,
+canonical/review DB, 평가 label, NAS 경로와 운영 secret은 workflow나 image에 넣지
+않는다.
+
+두 이미지는 `latest`가 아니라 Git commit SHA tag로 GHCR에 push하며 OCI provenance와
+SBOM을 함께 생성한다. workflow 권한은 `contents: read`, `packages: write`로 한정하고
+GitHub가 그 실행에 발급한 token만 사용한다. 첫 push 뒤 package visibility가 public인지
+read-back하고, NAS는 tag가 아니라 관찰된 `@sha256:...` digest로 pull한다. 이렇게 하면
+공개 모델 download와 image build CPU를 hosted runner가 부담하고 NAS는 실제 6권의
+network-disabled extraction/indexing만 수행한다.
+
 ## NAS pull-only
 
 NAS는 검토된 tag를 pull하고 commit과 release checksum을 검증한다. GitLab에는 NAS write credential을 제공하지 않는다. GitLab webhook도 NAS 쓰기 권한을 갖지 않는다.

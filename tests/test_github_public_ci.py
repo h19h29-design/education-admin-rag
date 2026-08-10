@@ -8,6 +8,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "public-safe.yml"
+IMAGE_WORKFLOW = ROOT / ".github" / "workflows" / "public-images.yml"
 
 
 def _workflow() -> dict[str, object]:
@@ -62,3 +63,36 @@ def test_public_ci_declares_its_test_runtime_dependencies() -> None:
     dev_dependencies = set(project["dependency-groups"]["dev"])
 
     assert {"pyyaml", "qdrant-client"} <= dev_dependencies
+
+
+def test_public_image_build_is_manual_digest_pinned_and_source_only() -> None:
+    assert IMAGE_WORKFLOW.is_file(), "public image build workflow is missing"
+    workflow = yaml.load(
+        IMAGE_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
+    )
+
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    assert workflow["permissions"] == {"contents": "read", "packages": "write"}
+    assert set(workflow["jobs"]) == {"ingestion", "indexer"}
+
+    expected = {
+        "ingestion": "docker/ingestion.Dockerfile",
+        "indexer": "docker/indexer.Dockerfile",
+    }
+    for job_name, dockerfile in expected.items():
+        job = workflow["jobs"][job_name]
+        assert job["runs-on"] == "ubuntu-24.04"
+        commands = "\n".join(
+            step.get("run", "") for step in job["steps"] if "run" in step
+        )
+        assert "${{ secrets." not in commands
+        assert "${{ github.token }}" in repr(job)
+        assert f"-f {dockerfile}" in commands
+        assert "--platform linux/amd64" in commands
+        assert "--provenance=mode=max" in commands
+        assert "--sbom=true" in commands
+        assert "--push" in commands
+        assert ":${GITHUB_SHA}" in commands
+        assert ":latest" not in commands
+        assert "artifacts" not in commands.lower()
+        assert "SEN_QA_" not in commands
