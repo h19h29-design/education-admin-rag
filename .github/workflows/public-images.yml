@@ -12,6 +12,7 @@ on:
           - all
           - ingestion
           - indexer
+          - backup
 
 permissions:
   contents: read
@@ -69,5 +70,30 @@ jobs:
             --sbom=true \
             --push \
             -f docker/indexer.Dockerfile \
+            -t "$image" \
+            .
+
+  backup:
+    if: ${{ github.event.inputs.image == 'all' || github.event.inputs.image == 'backup' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Build and publish backup image
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/education-admin-rag-backup:${GITHUB_SHA}"
+          docker buildx create --use --driver docker-container
+          docker buildx build \
+            --platform linux/amd64 \
+            --network default \
+            --provenance=mode=max \
+            --sbom=true \
+            --push \
+            -f docker/backup.Dockerfile \
             -t "$image" \
             .

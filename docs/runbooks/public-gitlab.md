@@ -92,13 +92,13 @@ GitLab Runner가 준비될 때까지 공개 GitHub 미러의 `.github/workflows/
 
 ### GitHub-hosted public image build
 
-`.github/workflows/public-images.yml`은 운영자가 수동으로 실행할 때만 ingestion과
-indexer 이미지를 Linux/amd64로 빌드한다. 입력은 deny-by-default Docker context를
+`.github/workflows/public-images.yml`은 운영자가 수동으로 실행할 때만 ingestion,
+indexer, backup 이미지를 Linux/amd64로 빌드한다. 입력은 deny-by-default Docker context를
 통과한 공개 코드, 공개 manifest, 공개 모델 lock뿐이다. 원본 PDF, OCR 결과,
 canonical/review DB, 평가 label, NAS 경로와 운영 secret은 workflow나 image에 넣지
 않는다.
 
-두 이미지는 `latest`가 아니라 Git commit SHA tag로 GHCR에 push하며 OCI provenance와
+세 이미지는 `latest`가 아니라 Git commit SHA tag로 GHCR에 push하며 OCI provenance와
 SBOM을 함께 생성한다. workflow 권한은 `contents: read`, `packages: write`로 한정하고
 GitHub가 그 실행에 발급한 token만 사용한다. 첫 push 뒤 package visibility가 public인지
 read-back하고, NAS는 tag가 아니라 관찰된 `@sha256:...` digest로 pull한다. 이렇게 하면

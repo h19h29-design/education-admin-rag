@@ -74,13 +74,14 @@ def test_public_image_build_is_manual_digest_pinned_and_source_only() -> None:
     assert set(workflow["on"]) == {"workflow_dispatch"}
     image_input = workflow["on"]["workflow_dispatch"]["inputs"]["image"]
     assert image_input["type"] == "choice"
-    assert image_input["options"] == ["all", "ingestion", "indexer"]
+    assert image_input["options"] == ["all", "ingestion", "indexer", "backup"]
     assert workflow["permissions"] == {"contents": "read", "packages": "write"}
-    assert set(workflow["jobs"]) == {"ingestion", "indexer"}
+    assert set(workflow["jobs"]) == {"ingestion", "indexer", "backup"}
 
     expected = {
         "ingestion": "docker/ingestion.Dockerfile",
         "indexer": "docker/indexer.Dockerfile",
+        "backup": "docker/backup.Dockerfile",
     }
     for job_name, dockerfile in expected.items():
         job = workflow["jobs"][job_name]
