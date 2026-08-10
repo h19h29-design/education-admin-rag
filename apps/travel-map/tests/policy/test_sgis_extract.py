@@ -1,4 +1,6 @@
+import hashlib
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -8,9 +10,12 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import pytest
 import shapefile
 from pyproj import CRS, Transformer
-from shapely.geometry import Point
+from shapely.geometry import Point, shape
 
 SCRIPT = Path("apps/travel-map/scripts/extract-sgis-seoul.py")
+PRODUCTION_SOURCE = Path(
+    "apps/travel-map/resources/geodata/source/seoul-boundary.geojson"
+)
 SOURCE_WKT = (
     'PROJCS["Korea_2000_Korea_Unified_Coordinate_System",'
     'GEOGCS["GCS_Korea_2000",DATUM["D_Korea_2000",'
@@ -61,6 +66,63 @@ def test_official_extractor_rejects_structurally_valid_wrong_hash_archive(
     assert completed.returncode != 0
     assert "archive SHA-256 does not match the pinned official SGIS file" in completed.stderr
     assert not output.exists()
+
+
+# Production break caught: leaving the successful public extraction path
+# unverified across its hash gate, official payload assembly, and file write.
+def test_public_extractor_writes_deterministic_official_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    production_source_before = PRODUCTION_SOURCE.read_bytes()
+    archive = make_sgis_archive(tmp_path)
+    archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
+    extractor = load_extractor_module()
+    monkeypatch.setattr(extractor, "OFFICIAL_ARCHIVE_SHA256", archive_sha256)
+    first_output = tmp_path / "first.geojson"
+    second_output = tmp_path / "second.geojson"
+
+    extractor.extract_seoul(
+        archive_path=archive,
+        output_path=first_output,
+        collected_at="2026-08-10T08:00:00Z",
+    )
+    extractor.extract_seoul(
+        archive_path=archive,
+        output_path=second_output,
+        collected_at="2026-08-10T08:00:00Z",
+    )
+
+    assert first_output.read_bytes() == second_output.read_bytes()
+    payload = json.loads(first_output.read_text(encoding="utf-8"))
+    assert payload["_provenance"] == {
+        "pageUrl": "https://www.data.go.kr/data/15129688/fileData.do",
+        "datasetName": "국가데이터처_SGIS 행정구역 통계 및 경계_20250630",
+        "referencePeriod": "2025 Q2",
+        "fileIdentifier": "FILE_000000003681593",
+        "detailNumber": 1,
+        "archiveSha256": archive_sha256,
+        "sourceLayer": "bnd_sido_00_2025_2Q",
+        "sourceLayerCrs": {
+            "authority": "ESRI:102080",
+            "name": "Korea_2000_Korea_Unified_Coordinate_System",
+        },
+        "sourceLayerFeatureCount": 2,
+        "collectedAt": "2026-08-10T08:00:00Z",
+    }
+    assert payload["crs"] == {
+        "type": "name",
+        "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"},
+    }
+    assert payload["features"][0]["properties"] == {
+        "BASE_DATE": "20250630",
+        "SIDO_CD": "11",
+        "SIDO_NM": "서울특별시",
+    }
+    geometry = shape(payload["features"][0]["geometry"])
+    assert geometry.covers(Point(126.9780, 37.5665))
+    assert not geometry.covers(Point(129.05, 35.15))
+    assert PRODUCTION_SOURCE.read_bytes() == production_source_before
 
 
 # Production break caught: silently transforming an unverified shapefile CRS.

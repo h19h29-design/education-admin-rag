@@ -1,6 +1,6 @@
 import json
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -237,6 +237,37 @@ def test_rule_loader_rejects_unknown_payload_fields(tmp_path: Path) -> None:
         match="rule payload must contain exactly the supported keys",
     ):
         RuleRepository.from_directory(tmp_path)
+
+
+# Production break caught: accepting datetime or string effective values during
+# direct construction and failing later inside for_date comparisons.
+@pytest.mark.parametrize(
+    "invalid_effective_from",
+    [datetime(2026, 7, 1, tzinfo=UTC), "2026-07-01"],
+)
+def test_repository_rejects_non_date_effective_from_immediately(
+    invalid_effective_from: object,
+) -> None:
+    invalid = replace(
+        make_rule("invalid", date(2026, 7, 1)),
+        effective_from=invalid_effective_from,
+    )
+
+    with pytest.raises(TypeError, match="effective_from must be a date"):
+        RuleRepository((invalid,))
+
+
+# Production break caught: retaining a mutable list of source references that can
+# leak through a later PolicyResult after repository construction.
+def test_repository_rejects_mutable_source_reference_collection() -> None:
+    mutable_source_refs = [REGULATION_URL]
+    invalid = replace(
+        make_rule("invalid", date(2026, 7, 1)),
+        source_refs=mutable_source_refs,
+    )
+
+    with pytest.raises(TypeError, match="source_refs must be a tuple"):
+        RuleRepository((invalid,))
 
 
 def make_rule(

@@ -25,10 +25,12 @@ SOURCE_PAGE_URL = "https://www.data.go.kr/data/15129688/fileData.do"
 DATASET_NAME = "국가데이터처_SGIS 행정구역 통계 및 경계_20250630"
 REFERENCE_PERIOD = "2025 Q2"
 FILE_IDENTIFIER = "FILE_000000003681593"
+DETAIL_NUMBER = 1
 OFFICIAL_ARCHIVE_SHA256 = (
     "f1cf0f9de453ac7eaacb273f39cee52851183372b9ddfda428a967c3a670b2c6"
 )
 SOURCE_LAYER = "bnd_sido_00_2025_2Q"
+SOURCE_LAYER_FEATURE_COUNT = 17
 SOURCE_LAYER_CRS = {
     "authority": "ESRI:102080",
     "name": "Korea_2000_Korea_Unified_Coordinate_System",
@@ -245,7 +247,6 @@ def read_provenance(payload: dict[str, Any]) -> dict[str, Any]:
         "datasetName": DATASET_NAME,
         "referencePeriod": REFERENCE_PERIOD,
         "fileIdentifier": FILE_IDENTIFIER,
-        "detailNumber": 1,
         "archiveSha256": OFFICIAL_ARCHIVE_SHA256,
         "sourceLayer": SOURCE_LAYER,
         "sourceLayerCrs": SOURCE_LAYER_CRS,
@@ -253,8 +254,17 @@ def read_provenance(payload: dict[str, Any]) -> dict[str, Any]:
     for key, expected in expected_values.items():
         if provenance.get(key) != expected:
             raise ValueError(f"unexpected source provenance {key}")
-    if not isinstance(provenance.get("sourceLayerFeatureCount"), int):
-        raise TypeError("source provenance feature count must be an integer")
+    detail_number = provenance.get("detailNumber")
+    if type(detail_number) is not int or detail_number != DETAIL_NUMBER:
+        raise ValueError("source provenance detailNumber must be integer 1")
+    source_layer_feature_count = provenance.get("sourceLayerFeatureCount")
+    if (
+        type(source_layer_feature_count) is not int
+        or source_layer_feature_count != SOURCE_LAYER_FEATURE_COUNT
+    ):
+        raise ValueError(
+            "source provenance sourceLayerFeatureCount must be integer 17"
+        )
     validated = dict(provenance)
     validated["collectedAt"] = normalize_provenance_collected_at(
         provenance.get("collectedAt")

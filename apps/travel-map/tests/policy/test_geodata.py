@@ -207,6 +207,48 @@ def test_builder_rejects_unpinned_official_archive_hash(tmp_path: Path) -> None:
     assert not output.exists()
 
 
+# Production break caught: treating bool or another integer as the pinned
+# detail number because Python equality considers True equal to 1.
+@pytest.mark.parametrize("invalid_detail_number", [True, False, 0, -1, 2, "1"])
+def test_builder_requires_exact_integer_source_detail_number(
+    tmp_path: Path,
+    invalid_detail_number: object,
+) -> None:
+    completed, output = run_builder_with_provenance_override(
+        tmp_path,
+        field_name="detailNumber",
+        value=invalid_detail_number,
+    )
+
+    assert completed.returncode != 0
+    assert "source provenance detailNumber must be integer 1" in completed.stderr
+    assert not output.exists()
+
+
+# Production break caught: accepting bool, nonpositive, or a different count as
+# the observed 17-feature official province layer.
+@pytest.mark.parametrize(
+    "invalid_feature_count",
+    [True, False, 0, -1, 16, 18, "17"],
+)
+def test_builder_requires_exact_integer_source_layer_feature_count(
+    tmp_path: Path,
+    invalid_feature_count: object,
+) -> None:
+    completed, output = run_builder_with_provenance_override(
+        tmp_path,
+        field_name="sourceLayerFeatureCount",
+        value=invalid_feature_count,
+    )
+
+    assert completed.returncode != 0
+    assert (
+        "source provenance sourceLayerFeatureCount must be integer 17"
+        in completed.stderr
+    )
+    assert not output.exists()
+
+
 def run_builder(source: Path, output: Path) -> None:
     subprocess.run(
         builder_command(source, output),
@@ -214,6 +256,26 @@ def run_builder(source: Path, output: Path) -> None:
         capture_output=True,
         text=True,
     )
+
+
+def run_builder_with_provenance_override(
+    root: Path,
+    *,
+    field_name: str,
+    value: object,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    source = root / "source.geojson"
+    payload = json.loads(PRODUCTION_SOURCE.read_text(encoding="utf-8"))
+    payload["_provenance"][field_name] = value
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    output = root / "geodata"
+    completed = subprocess.run(
+        builder_command(source, output),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed, output
 
 
 def builder_command(source: Path, output: Path) -> list[str]:

@@ -95,6 +95,8 @@ class RuleRepository:
     def _validate_rule(rule: RuleSet) -> None:
         if type(rule.rule_set_id) is not str or not rule.rule_set_id.strip():
             raise ValueError("rule_set_id must be a non-blank string")
+        if type(rule.effective_from) is not date:
+            raise TypeError("effective_from must be a date")
         positive_fields = (
             "local_round_trip_exclusive_meters",
             "actual_expense_inclusive_meters",
@@ -131,6 +133,8 @@ class RuleRepository:
                 "official_vehicle_deduction_krw must not exceed "
                 "under_four_hours_krw"
             )
+        if type(rule.source_refs) is not tuple:
+            raise TypeError("source_refs must be a tuple")
         if not rule.source_refs:
             raise ValueError("source_refs must not be empty")
         for source_ref in rule.source_refs:
