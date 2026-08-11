@@ -33,6 +33,7 @@ class _TupleNormalizingSettingsSource(PydanticBaseSettingsSource):
     def __call__(self) -> dict[str, Any]:
         values = self._source()
         for name in (
+            "kakao_javascript_key",
             "kakao_rest_api_key",
             "seoul_transit_service_key",
             "opinet_cert_key",
@@ -60,6 +61,7 @@ class Settings(BaseSettings):
     )
 
     environment: Literal["development", "test", "production"] = "development"
+    kakao_javascript_key: SecretStr | None = None
     kakao_rest_api_key: SecretStr | None = None
     seoul_transit_service_key: SecretStr | None = None
     opinet_cert_key: SecretStr | None = None
@@ -95,6 +97,7 @@ class Settings(BaseSettings):
         return value
 
     @field_validator(
+        "kakao_javascript_key",
         "kakao_rest_api_key",
         "seoul_transit_service_key",
         "opinet_cert_key",
