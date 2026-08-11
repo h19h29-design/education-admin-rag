@@ -63,9 +63,24 @@ SENQA_PREVIEW_SEARCH_CONFIG
 1. 별도 test 질문을 공개 웹에서 한 번 제출한다.
 2. GitLab에 confidential issue와 정확한 ask note가 생성됐는지 확인한다.
 3. Webhook delivery가 2xx이고 같은 request ID의 answer note가 한 개뿐인지 확인한다.
-4. 웹 poll이 complete로 바뀌고 `unreviewed_incomplete_preview`,
-   `production_eligible=false`, case ID·연도·PDF 쪽을 표시하는지 확인한다.
-5. GitLab UI에서 issue가 public으로 보이지 않는지 비로그인 세션으로 확인한다.
+4. 웹 poll이 완료되면 AI 답변, 관련 사례 질의·답변, 사례 ID·연도·PDF 쪽만
+   표시하는지 확인한다. GitLab, Webhook, Hermes, RAG, project, bot, model이나
+   내부 상태 코드·필드명은 화면과 답변에 표시하면 안 된다.
+5. 근거 사례가 없을 때는 AI 호출 없이 다음 문구만 표시하고 관련 사례와 근거 영역을
+   숨기는지 확인한다.
+
+   ```text
+   등록된 사례집에서 이 질문과 관련된 내용을 찾지 못했습니다. 다른 표현이나 핵심어로 다시 검색해 주세요.
+   ```
+
+6. 근거 사례는 있지만 AI 답변을 안전하게 검증하지 못했을 때는 사례 목록을 보존하고
+   다음 문구를 표시하는지 확인한다.
+
+   ```text
+   답변을 정리하지 못했습니다. 관련 사례는 아래 목록에서 직접 확인해 주세요.
+   ```
+
+7. GitLab UI에서 issue가 public으로 보이지 않는지 비로그인 세션으로 확인한다.
 
 실패 시 기존 status/review route나 운영 alias를 변경하지 않는다. 새 QA path route와
 Worker route만 비활성화하고 confidential test issue를 보존해 감사한다.
