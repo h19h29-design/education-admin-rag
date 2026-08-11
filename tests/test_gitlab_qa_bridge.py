@@ -22,6 +22,12 @@ from src.integrations.gitlab_qa_bridge import (
     run_answer_job,
     validate_and_transform,
 )
+from src.integrations.gitlab_qa_public import (
+    CASES_ONLY_TEXT,
+    NO_EVIDENCE_TEXT,
+    PublicAnswer,
+    public_cases_from_evidence,
+)
 
 REQUEST_ID = "senqa-0123456789abcdef0123456789abcdef"
 
@@ -54,7 +60,7 @@ def _request() -> GitLabQaRequest:
                     "facts": "사실",
                     "part": "계약 업무",
                     "pdf_pages": [4],
-                    "question": "질문",
+                    "question": "수의계약 질문",
                     "review_status": "machine_extracted",
                     "subtopic": None,
                     "title": "근거 제목",
@@ -90,14 +96,26 @@ def test_silent_and_malformed_filter_output_are_not_jobs() -> None:
 
 
 def test_prompt_treats_question_as_data_and_requires_grounded_preview_answer() -> None:
-    prompt = build_hermes_prompt(_request())
+    request = _request()
+    cases = public_cases_from_evidence(request.question, request.evidence)
+    prompt = build_hermes_prompt(request, cases)
 
     assert "도구를 호출하지 마세요" in prompt
-    assert "근거 JSON에 없는 사실을 추가하지 마세요" in prompt
-    assert "unreviewed_incomplete_preview" in prompt
+    assert "제공된 사례에 없는 사실을 추가하지 마세요" in prompt
     assert '"case_id":"senqa-2022-case-a"' in prompt
     assert '"question":"수의계약이 가능한 경우를 알려줘"' in prompt
-    assert "production_eligible=false" in prompt
+    assert "PDF 4쪽" in prompt
+    for forbidden in (
+        "gitlab",
+        "webhook",
+        "hermes",
+        "rag",
+        "production_eligible",
+        "warning_code",
+        "complete_corpus",
+        "review_status",
+    ):
+        assert forbidden not in prompt.casefold()
 
 
 def test_hermes_command_pins_profile_and_zero_tool_allowlist(tmp_path: Path) -> None:
@@ -213,12 +231,17 @@ def test_answer_job_runs_hermes_without_tools_then_delivers() -> None:
 
     def hermes_runner(command: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
         captured["command"] = command
-        return subprocess.CompletedProcess(command, 0, "근거 답변\n".encode(), b"")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "수의계약 기준입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]\n".encode(),
+            b"",
+        )
 
     def deliver(
-        *, issue_iid: object, request_id: object, content: object, token: object
+        *, issue_iid: object, request_id: object, answer: object, token: object
     ) -> str:
-        captured["delivery"] = (issue_iid, request_id, content, token)
+        captured["delivery"] = (issue_iid, request_id, answer, token)
         return "91"
 
     note_id = run_answer_job(
@@ -232,13 +255,76 @@ def test_answer_job_runs_hermes_without_tools_then_delivers() -> None:
     command = captured["command"]
     assert command[0:4] == ("/opt/hermes", "-p", "hermes2", "-z")
     assert command[-3:] == ("-t", "context_engine", "--ignore-rules")
-    assert captured["delivery"] == (
-        73,
-        REQUEST_ID,
-        "근거 답변",
-        "response-token",
+    delivered = captured["delivery"]
+    assert delivered[0:2] == (73, REQUEST_ID)
+    assert delivered[3] == "response-token"
+    assert delivered[2] == PublicAnswer(
+        answer="수의계약 기준입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]",
+        answer_kind="grounded",
+        cases=public_cases_from_evidence(_request().question, _request().evidence),
     )
     assert note_id == "91"
+
+
+def test_answer_job_skips_ai_when_no_case_is_relevant() -> None:
+    request = _request()
+    unrelated = GitLabQaRequest(
+        issue_iid=request.issue_iid,
+        request_id=request.request_id,
+        question="학교폭력 조치",
+        evidence=request.evidence,
+    )
+    calls = 0
+    delivered: list[PublicAnswer] = []
+
+    def hermes_runner(_command: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("AI runner must not be called")
+
+    def deliver(**values: object) -> str:
+        delivered.append(values["answer"])
+        return "92"
+
+    assert (
+        run_answer_job(
+            unrelated,
+            hermes_path=Path("/opt/hermes"),
+            delivery_token="response-token",
+            hermes_runner=hermes_runner,
+            deliver=deliver,
+        )
+        == "92"
+    )
+    assert calls == 0
+    assert delivered == [
+        PublicAnswer(answer=NO_EVIDENCE_TEXT, answer_kind="no_evidence", cases=())
+    ]
+
+
+def test_invalid_ai_answer_keeps_related_cases() -> None:
+    delivered: list[PublicAnswer] = []
+
+    def hermes_runner(command: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(command, 0, b"unsupported claim", b"")
+
+    def deliver(**values: object) -> str:
+        delivered.append(values["answer"])
+        return "93"
+
+    assert (
+        run_answer_job(
+            _request(),
+            hermes_path=Path("/opt/hermes"),
+            delivery_token="response-token",
+            hermes_runner=hermes_runner,
+            deliver=deliver,
+        )
+        == "93"
+    )
+    assert delivered[0].answer == CASES_ONLY_TEXT
+    assert delivered[0].answer_kind == "cases_only"
+    assert len(delivered[0].cases) == 1
 
 
 def test_config_is_exact_local_only_and_does_not_embed_tokens(

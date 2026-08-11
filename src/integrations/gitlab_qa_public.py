@@ -32,6 +32,26 @@ _STOPWORDS = frozenset(
         "하는",
     }
 )
+_KOREAN_SUFFIXES = (
+    "으로",
+    "에서",
+    "에게",
+    "까지",
+    "부터",
+    "처럼",
+    "보다",
+    "의",
+    "이",
+    "가",
+    "은",
+    "는",
+    "을",
+    "를",
+    "와",
+    "과",
+    "도",
+    "만",
+)
 _FORBIDDEN_PUBLIC_TERMS = (
     "gitlab",
     "webhook",
@@ -142,11 +162,18 @@ class PublicAnswer:
 
 
 def _meaningful_tokens(question: str) -> tuple[str, ...]:
+    def normalize(token: str) -> str:
+        for suffix in _KOREAN_SUFFIXES:
+            if token.endswith(suffix) and len(token) - len(suffix) >= 2:
+                return token[: -len(suffix)]
+        return token
+
     return tuple(
         dict.fromkeys(
-            token
+            normalized
             for token in _TOKEN_RE.findall(question.casefold())
-            if len(token) >= 2 and token not in _STOPWORDS
+            if (normalized := normalize(token))
+            if len(normalized) >= 2 and normalized not in _STOPWORDS
         )
     )
 
