@@ -1,0 +1,32 @@
+{
+  "items": [
+    {
+      "institutionId": "test-neis:B10:SEMWATER-ES",
+      "siteId": "test-neis:B10:SEMWATER-ES:main",
+      "siteName": "샘물공립초등학교",
+      "officialName": "샘물공립초등학교",
+      "institutionType": "초등학교",
+      "foundationType": "공립",
+      "educationOffice": "중부교육지원청",
+      "roadAddress": "서울특별시 중구 샘물로 12",
+      "district": "중구",
+      "coordinateQuality": "ROOFTOP",
+      "snapshotId": "fixture-001",
+      "snapshotAsOf": "2026-08-10"
+    },
+    {
+      "institutionId": "test-neis:B10:SEMWATER-HS",
+      "siteId": "test-neis:B10:SEMWATER-HS:main",
+      "siteName": "샘물사립고등학교",
+      "officialName": "샘물사립고등학교",
+      "institutionType": "고등학교",
+      "foundationType": "사립",
+      "educationOffice": "강남서초교육지원청",
+      "roadAddress": "서울특별시 강남구 샘물대로 48",
+      "district": "강남구",
+      "coordinateQuality": "ROOFTOP",
+      "snapshotId": "fixture-001",
+      "snapshotAsOf": "2026-08-10"
+    }
+  ]
+}

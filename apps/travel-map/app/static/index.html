@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="서울교육기관 출장 경로와 여비를 미리 확인합니다." />
+    <title>서울교육 출장 경로·여비 계산</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <button class="menu-button" type="button" aria-label="메뉴 열기">☰</button>
+      <a class="brand" href="/" aria-label="서울교육 출장 경로·여비 계산 홈">서울교육 출장 경로·여비 계산</a>
+      <nav class="utility-nav" aria-label="도움말 및 설정">
+        <a href="#notice">ⓘ 사용 안내</a>
+        <a href="#policy-profile">▧ 관련 규정</a>
+        <a href="#results">◷ 계산 이력</a>
+        <button type="button" class="utility-button">⚙ 설정</button>
+      </nav>
+    </header>
+
+    <main class="app-shell">
+      <aside class="rail" aria-label="출장 조건 및 결과">
+        <ol class="steps" aria-label="계산 단계">
+          <li class="is-active"><span>1</span> 조건 입력</li>
+          <li><span>2</span> 경로 확인</li>
+          <li><span>3</span> 여비 확인</li>
+        </ol>
+
+        <section class="input-section" aria-labelledby="conditions-title">
+          <h1 id="conditions-title">출장 조건 입력</h1>
+          <form id="trip-form" novalidate>
+            <div class="field-search">
+              <div class="field-label-row">
+                <label for="origin-search">출발 기관</label>
+                <button id="institution-filters-toggle" class="filter-toggle" type="button" aria-controls="institution-filters" aria-expanded="false">기관 검색 필터 열기</button>
+              </div>
+              <input id="origin-search" name="origin" type="search" role="combobox" autocomplete="off" aria-autocomplete="list" aria-controls="origin-results" aria-expanded="false" placeholder="기관명을 입력하세요" />
+              <ul id="origin-results" class="suggestions" role="listbox" aria-label="기관 검색 결과" hidden></ul>
+              <p id="origin-selection" class="field-note" aria-live="polite">기관명으로 검색해 선택하세요.</p>
+            </div>
+
+            <div id="institution-filters" class="search-filter-grid" aria-label="기관 검색 필터" hidden>
+              <label>기관유형
+                <select id="institution-type" name="institutionType">
+                  <option value="">전체</option>
+                  <option value="유치원">유치원</option>
+                  <option value="초등학교">초등학교</option>
+                  <option value="중학교">중학교</option>
+                  <option value="고등학교">고등학교</option>
+                </select>
+              </label>
+              <label>설립구분
+                <select id="foundation-type" name="foundationType">
+                  <option value="">전체</option>
+                  <option value="공립">공립</option>
+                  <option value="사립">사립</option>
+                </select>
+              </label>
+              <label>교육지원청
+                <select id="education-office" name="educationOffice">
+                  <option value="">전체</option>
+                  <option value="중부교육지원청">중부교육지원청</option>
+                </select>
+              </label>
+              <label>자치구
+                <select id="district" name="district">
+                  <option value="">전체</option>
+                  <option value="중구">중구</option>
+                  <option value="강남구">강남구</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="field-search">
+              <label for="destination-search">출장지</label>
+              <input id="destination-search" name="destination" type="search" role="combobox" autocomplete="off" aria-autocomplete="list" aria-controls="destination-results" aria-expanded="false" placeholder="목적지명 또는 주소를 입력하세요" />
+              <ul id="destination-results" class="suggestions" role="listbox" aria-label="목적지 검색 결과" hidden></ul>
+              <p id="destination-selection" class="field-note" aria-live="polite">지도에서 위치를 선택한 뒤 주소를 확인할 수도 있습니다.</p>
+            </div>
+
+            <div class="date-time-grid">
+              <label for="starts-date">출발 일시
+                <span class="inline-controls"><input id="starts-date" type="date" required /><input id="starts-time" type="time" value="09:00" required /></span>
+              </label>
+              <label for="returns-date">복귀 일시
+                <span class="inline-controls"><input id="returns-date" type="date" required /><input id="returns-time" type="time" value="13:00" required /></span>
+              </label>
+            </div>
+
+            <label class="select-field" for="policy-profile">적용 규정
+              <select id="policy-profile" required>
+                <option value="">선택하세요</option>
+                <option value="SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED">서울시교육청 공무원 신분 확인</option>
+                <option value="NATIONAL_PUBLIC_OFFICIAL_CONFIRMED">국가공무원 여비 규정 적용 확인</option>
+                <option value="INTERNAL_RULE_ADOPTION_CONFIRMED_BY_USER">기관 내부 규정 준용 확인</option>
+                <option value="NONPUBLIC_OR_UNKNOWN">사립 또는 신분·규정 미확인</option>
+              </select>
+            </label>
+
+            <fieldset class="vehicle-assumptions">
+              <legend>자동차 이용 가정 <span>(선택)</span></legend>
+              <div class="vehicle-grid">
+                <label for="vehicle-use">차량 구분
+                  <select id="vehicle-use">
+                    <option value="NONE">이용 안 함</option>
+                    <option value="PRIVATE">자가용</option>
+                    <option value="OFFICIAL_OR_RENTED">관용·임차 차량</option>
+                    <option value="ASSIGNED_OFFICIAL">배정 관용차</option>
+                  </select>
+                </label>
+                <label for="fuel-type">유종
+                  <select id="fuel-type">
+                    <option value="GASOLINE">휘발유</option>
+                    <option value="DIESEL">경유</option>
+                    <option value="LPG">LPG</option>
+                  </select>
+                </label>
+                <label for="efficiency">연비(km/L)
+                  <input id="efficiency" type="number" min="3" max="30" step="0.1" value="10.0" inputmode="decimal" />
+                </label>
+                <label for="parking-cost">예상 주차비(원)
+                  <input id="parking-cost" type="number" min="0" max="100000" step="100" value="0" inputmode="numeric" />
+                </label>
+              </div>
+            </fieldset>
+
+            <label class="check-line" for="other-trips"><input id="other-trips" type="checkbox" /> 오늘 다른 관내출장이 있습니다</label>
+            <p id="form-error" class="form-error" role="alert" hidden></p>
+            <button id="calculate-button" class="primary-button" type="submit">▣ 경로 계산</button>
+          </form>
+        </section>
+
+        <section id="results" class="results-panel" aria-labelledby="results-title" hidden>
+          <div class="section-heading">
+            <h2 id="results-title">분류 및 요약</h2>
+            <span id="coverage-status" class="coverage-status">확인 중</span>
+          </div>
+          <div class="summary-grid">
+            <article class="summary-card"><h3>지역 분류</h3><p id="classification-result">—</p><small id="classification-distance"></small></article>
+            <article class="summary-card"><h3>예상 이동비</h3><p id="mobility-cost">—</p><small id="mobility-status"></small></article>
+            <article class="summary-card"><h3>관내출장 예상 지급액</h3><p id="allowance-amount">—</p><small id="allowance-status"></small></article>
+          </div>
+          <section class="route-section" aria-labelledby="routes-title">
+            <div class="route-heading"><h2 id="routes-title">추천 경로</h2><span id="route-count"></span></div>
+            <div class="sort-tabs" role="tablist" aria-label="경로 정렬">
+              <button type="button" role="tab" aria-selected="true" data-sort="time">시간순</button>
+              <button type="button" role="tab" aria-selected="false" data-sort="distance">거리순</button>
+              <button type="button" role="tab" aria-selected="false" data-sort="cost">비용순</button>
+            </div>
+            <div id="route-list" class="route-list" aria-live="polite"></div>
+          </section>
+        </section>
+      </aside>
+
+      <section class="map-stage" aria-label="경로 지도">
+        <div class="map-toolbar" aria-label="지도 표시 설정">
+          <strong>지도 표시</strong>
+          <label><input id="seoul-layer" type="checkbox" /> 서울 경계</label>
+          <label><input id="support-layer" type="checkbox" /> 12km 지원영역</label>
+          <p>경로를 선택하면 해당 선을 강조합니다.</p>
+        </div>
+        <div id="map" class="map-canvas" aria-label="서울 출장 경로 지도" data-active-route="">
+          <div class="map-placeholder" aria-hidden="true"><span>서울 지도</span><small>경로 계산 후 지도에 표시합니다</small></div>
+          <p id="map-status" class="map-status" role="status">지도를 준비하고 있습니다.</p>
+        </div>
+        <button id="map-collapse" class="map-collapse" type="button" aria-expanded="false" aria-controls="map">지도 펼치기</button>
+      </section>
+    </main>
+
+    <footer id="notice" class="legal-notice">
+      <p>⚠ 기관 위치는 경로 기준일 뿐 적용 법규를 정하지 않습니다</p>
+      <p>예상액이며 지급 확정액이 아닙니다</p>
+      <small>입력한 검색어와 계산 조건은 이 화면을 벗어나 저장하지 않습니다.</small>
+    </footer>
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>

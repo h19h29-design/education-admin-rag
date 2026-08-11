@@ -1,0 +1,101 @@
+{
+  "coverage": {
+    "status": "SEOUL"
+  },
+  "origin": {
+    "siteId": "test-neis:B10:SEMWATER-ES:main",
+    "name": "샘물공립초등학교",
+    "address": "서울특별시 중구 샘물로 12",
+    "coordinate": {
+      "latitude": 37.5585,
+      "longitude": 126.9752
+    }
+  },
+  "institutionSnapshotId": "fixture-001",
+  "policyScope": "SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED",
+  "classification": "LOCAL",
+  "classificationDistanceMeters": 12800,
+  "classificationPath": {
+    "id": "classification-outbound+classification-return",
+    "distanceMeters": 12800,
+    "geometry": [
+      { "latitude": 37.5585, "longitude": 126.9752 },
+      { "latitude": 37.5663, "longitude": 126.9779 },
+      { "latitude": 37.5585, "longitude": 126.9752 }
+    ],
+    "source": "KAKAO_MOBILITY+KAKAO_MOBILITY",
+    "queriedAt": "2026-08-10T09:00:00+09:00"
+  },
+  "routes": [
+    {
+      "id": "transit-1",
+      "mode": "TRANSIT",
+      "durationSeconds": 1650,
+      "distanceMeters": 7900,
+      "mobilityCostKrw": 1400,
+      "costStatus": "KNOWN",
+      "costBreakdown": { "fareKrw": 1400, "fuelKrw": null, "tollKrw": null, "parkingKrw": null },
+      "geometry": [
+        { "latitude": 37.5585, "longitude": 126.9752 },
+        { "latitude": 37.5612, "longitude": 126.9814 },
+        { "latitude": 37.5663, "longitude": 126.9779 }
+      ],
+      "source": "SEOUL_TRANSIT",
+      "sourceAsOf": "2026-08-10T09:00:00+09:00",
+      "warnings": []
+    },
+    {
+      "id": "car-1",
+      "mode": "CAR",
+      "durationSeconds": 1200,
+      "distanceMeters": 10100,
+      "mobilityCostKrw": 6500,
+      "costStatus": "ESTIMATED",
+      "costBreakdown": { "fareKrw": null, "fuelKrw": 5500, "tollKrw": 0, "parkingKrw": 1000 },
+      "geometry": [
+        { "latitude": 37.5585, "longitude": 126.9752 },
+        { "latitude": 37.5531, "longitude": 126.9654 },
+        { "latitude": 37.5663, "longitude": 126.9779 }
+      ],
+      "source": "KAKAO_MOBILITY",
+      "sourceAsOf": "2026-08-10T09:00:00+09:00",
+      "warnings": ["PARKING_COST_ESTIMATED"]
+    },
+    {
+      "id": "walk-1",
+      "mode": "WALK",
+      "durationSeconds": 2100,
+      "distanceMeters": 2900,
+      "mobilityCostKrw": 0,
+      "costStatus": "KNOWN",
+      "costBreakdown": { "fareKrw": 0, "fuelKrw": null, "tollKrw": null, "parkingKrw": null },
+      "geometry": [
+        { "latitude": 37.5585, "longitude": 126.9752 },
+        { "latitude": 37.5625, "longitude": 126.9728 },
+        { "latitude": 37.5663, "longitude": 126.9779 }
+      ],
+      "source": "KAKAO_LOCAL",
+      "sourceAsOf": "2026-08-10T09:00:00+09:00",
+      "warnings": []
+    }
+  ],
+  "best": {
+    "fastestRouteId": "car-1",
+    "shortestRouteId": "walk-1",
+    "cheapestRouteId": "walk-1"
+  },
+  "mobilityCost": {
+    "status": "ESTIMATED",
+    "amountKrw": 6500,
+    "warnings": ["PARKING_COST_ESTIMATED"]
+  },
+  "allowance": {
+    "status": "PAYABLE",
+    "amountKrw": 20000,
+    "warnings": []
+  },
+  "ruleSetId": "local-travel-2026-07-01",
+  "effectiveFrom": "2026-07-01",
+  "sourceRefs": ["서울특별시교육청 공무원 여비 규정"],
+  "warnings": []
+}

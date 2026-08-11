@@ -225,6 +225,15 @@ def create_app(
         StaticFiles(directory=Path(__file__).with_name("static"), check_dir=False),
         name="static",
     )
+    app.mount(
+        "/",
+        StaticFiles(
+            directory=Path(__file__).with_name("static"),
+            html=True,
+            check_dir=False,
+        ),
+        name="travel-map-ui",
+    )
     return app
 
 
