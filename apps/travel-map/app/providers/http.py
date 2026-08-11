@@ -12,6 +12,7 @@ from app.routing.models import ProviderWarning
 
 _T = TypeVar("_T")
 _UNSET = object()
+_MAX_SCHEMA_DEPTH = 64
 
 
 class ProviderRequestError(RuntimeError):
@@ -89,22 +90,13 @@ class BoundedHttpClient:
             params=params,
             accepted_content_types=accepted_content_types,
         )
-        credential_kind, credential_name, credential = _extract_credential(
+        return self._run_json(
+            url=url,
+            params=params,
+            accepted_content_types=accepted_content_types,
             header_secret=header_secret,
             query_secret=query_secret,
         )
-        task = asyncio.create_task(
-            self._json_worker(
-                url=url,
-                params=params,
-                accepted_content_types=accepted_content_types,
-                credential_kind=credential_kind,
-                credential_name=credential_name,
-                credential=credential,
-            )
-        )
-        credential = ""
-        return cast("Coroutine[Any, Any, dict[str, Any]]", self._await_task(task))
 
     def get_xml(
         self,
@@ -123,12 +115,39 @@ class BoundedHttpClient:
             params=params,
             accepted_content_types=accepted_content_types,
         )
-        credential_kind, credential_name, credential = _extract_credential(
-            header_secret=None,
+        return self._run_xml(
+            url=url,
+            params=params,
+            accepted_content_types=accepted_content_types,
             query_secret=query_secret,
         )
-        task = asyncio.create_task(
-            self._request_worker(
+
+    async def _run_json(
+        self,
+        *,
+        url: str,
+        params: Mapping[str, str],
+        accepted_content_types: frozenset[str],
+        header_secret: SecretStr | None,
+        query_secret: tuple[str, SecretStr | None] | None,
+    ) -> dict[str, Any]:
+        credential = ""
+        worker: Coroutine[Any, Any, dict[str, Any]] | None = None
+        task: asyncio.Task[dict[str, Any]] | None = None
+        try:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                raise ProviderRequestError(
+                    "UPSTREAM_ERROR", "Provider request could not be scheduled"
+                ) from None
+            credential_kind, credential_name, credential = _extract_credential(
+                header_secret=header_secret,
+                query_secret=query_secret,
+            )
+            header_secret = None
+            query_secret = None
+            worker = self._json_worker(
                 url=url,
                 params=params,
                 accepted_content_types=accepted_content_types,
@@ -136,9 +155,79 @@ class BoundedHttpClient:
                 credential_name=credential_name,
                 credential=credential,
             )
-        )
+            credential = ""
+            try:
+                task = asyncio.create_task(worker)
+            except Exception:  # noqa: BLE001
+                worker.close()
+                worker = None
+                raise ProviderRequestError(
+                    "UPSTREAM_ERROR", "Provider request could not be scheduled"
+                ) from None
+            worker = None
+            try:
+                result = await self._await_task(task)
+            finally:
+                task = None
+            return result
+        finally:
+            credential = ""
+            header_secret = None
+            query_secret = None
+            if worker is not None:
+                worker.close()
+
+    async def _run_xml(
+        self,
+        *,
+        url: str,
+        params: Mapping[str, str],
+        accepted_content_types: frozenset[str],
+        query_secret: tuple[str, SecretStr | None],
+    ) -> bytes:
         credential = ""
-        return self._await_task(task)
+        worker: Coroutine[Any, Any, bytes] | None = None
+        task: asyncio.Task[bytes] | None = None
+        try:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                raise ProviderRequestError(
+                    "UPSTREAM_ERROR", "Provider request could not be scheduled"
+                ) from None
+            credential_kind, credential_name, credential = _extract_credential(
+                header_secret=None,
+                query_secret=query_secret,
+            )
+            query_secret = ("", None)
+            worker = self._request_worker(
+                url=url,
+                params=params,
+                accepted_content_types=accepted_content_types,
+                credential_kind=credential_kind,
+                credential_name=credential_name,
+                credential=credential,
+            )
+            credential = ""
+            try:
+                task = asyncio.create_task(worker)
+            except Exception:  # noqa: BLE001
+                worker.close()
+                worker = None
+                raise ProviderRequestError(
+                    "UPSTREAM_ERROR", "Provider request could not be scheduled"
+                ) from None
+            worker = None
+            try:
+                result = await self._await_task(task)
+            finally:
+                task = None
+            return result
+        finally:
+            credential = ""
+            query_secret = ("", None)
+            if worker is not None:
+                worker.close()
 
     async def _json_worker(
         self,
@@ -161,6 +250,7 @@ class BoundedHttpClient:
         credential = ""
         failure = False
         value: object | None = None
+        schema_fingerprint: str | None = None
         try:
             value = json.loads(
                 raw,
@@ -169,7 +259,9 @@ class BoundedHttpClient:
             )
             if type(value) is not dict:
                 failure = True
-        except (UnicodeDecodeError, ValueError):
+            else:
+                schema_fingerprint = _schema_fingerprint(value)
+        except (RecursionError, UnicodeDecodeError, ValueError):
             failure = True
         finally:
             raw = b""
@@ -179,7 +271,7 @@ class BoundedHttpClient:
                 "SCHEMA_MISMATCH",
                 "Provider response did not match the documented JSON schema",
             ) from None
-        self.last_schema_fingerprint = _schema_fingerprint(value)
+        self.last_schema_fingerprint = schema_fingerprint
         return value
 
     async def _await_task(self, task: asyncio.Task[_T]) -> _T:
@@ -420,17 +512,19 @@ def _schema_fingerprint(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _schema_shape(value: object) -> object:
+def _schema_shape(value: object, *, depth: int = 0) -> object:
+    if depth > _MAX_SCHEMA_DEPTH:
+        raise ValueError("provider schema nesting exceeded the inspection limit")
     if type(value) is dict:
         return {
-            key: _schema_shape(item)
+            key: _schema_shape(item, depth=depth + 1)
             for key, item in sorted(value.items())
             if type(key) is str
         }
     if type(value) is list:
         item_shapes = {
             json.dumps(
-                _schema_shape(item),
+                _schema_shape(item, depth=depth + 1),
                 ensure_ascii=True,
                 sort_keys=True,
                 separators=(",", ":"),

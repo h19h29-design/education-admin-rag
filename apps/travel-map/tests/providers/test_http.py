@@ -1,4 +1,6 @@
 import asyncio
+import gc
+import warnings
 from collections.abc import Mapping
 from types import TracebackType
 
@@ -62,6 +64,135 @@ def _assert_provider_traceback_is_credential_free(
                 secret,
             ), filename
         current = current.tb_next
+
+
+# Break caught: calling the request factory outside an event loop creates a task and
+# leaks an unawaited credential-bearing worker coroutine when scheduling fails.
+@pytest.mark.parametrize("response_kind", ["json", "xml"])
+def test_request_factory_is_lazy_outside_running_loop_without_warnings(
+    response_kind: str,
+) -> None:
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(500))
+    )
+    boundary = BoundedHttpClient(
+        http=http,
+        timeout_seconds=5.0,
+        max_response_bytes=1_000,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        if response_kind == "json":
+            awaitable = boundary.get_json(
+                url="https://example.invalid/data",
+                params={},
+                header_secret=SecretStr("factory-secret"),
+            )
+        else:
+            awaitable = boundary.get_xml(
+                url="https://example.invalid/data",
+                params={},
+                query_secret=("key", SecretStr("factory-secret")),
+            )
+        awaitable.close()
+        del awaitable
+        gc.collect()
+
+    asyncio.run(http.aclose())
+    assert not [item for item in caught if issubclass(item.category, RuntimeWarning)]
+
+
+# Break caught: manually advancing the returned awaitable without a running loop
+# extracts the credential before discovering that scheduling is impossible.
+@pytest.mark.parametrize("response_kind", ["json", "xml"])
+def test_request_awaitable_checks_running_loop_before_secret_extraction(
+    response_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "no-loop-extraction-material"
+    extracted = False
+
+    def fail_if_extracted(_secret: SecretStr) -> str:
+        nonlocal extracted
+        extracted = True
+        raise AssertionError("credential extraction ran without an event loop")
+
+    monkeypatch.setattr(SecretStr, "get_secret_value", fail_if_extracted)
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(500))
+    )
+    boundary = BoundedHttpClient(
+        http=http,
+        timeout_seconds=5.0,
+        max_response_bytes=1_000,
+    )
+    if response_kind == "json":
+        awaitable = boundary.get_json(
+            url="https://example.invalid/data",
+            params={},
+            header_secret=SecretStr(secret),
+        )
+    else:
+        awaitable = boundary.get_xml(
+            url="https://example.invalid/data",
+            params={},
+            query_secret=("key", SecretStr(secret)),
+        )
+
+    with pytest.raises(ProviderRequestError) as raised:
+        awaitable.send(None)
+
+    asyncio.run(http.aclose())
+    assert raised.value.code == "UPSTREAM_ERROR"
+    assert extracted is False
+    _assert_provider_traceback_is_credential_free(raised.tb, secret)
+
+
+# Break caught: task scheduling failure exposes SecretStr/raw credential locals and
+# leaves the worker coroutine unawaited.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_kind", ["json", "xml"])
+async def test_scheduling_failure_is_sanitized_without_unawaited_worker(
+    response_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "schedule-failure-material"
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(500))
+    )
+    boundary = BoundedHttpClient(
+        http=http,
+        timeout_seconds=5.0,
+        max_response_bytes=1_000,
+    )
+
+    def fail_schedule(_coroutine: object) -> None:
+        raise RuntimeError("scheduler unavailable")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with monkeypatch.context() as scoped:
+            scoped.setattr(asyncio, "create_task", fail_schedule)
+            with pytest.raises(ProviderRequestError) as raised:
+                if response_kind == "json":
+                    await boundary.get_json(
+                        url="https://example.invalid/data",
+                        params={},
+                        header_secret=SecretStr(secret),
+                    )
+                else:
+                    await boundary.get_xml(
+                        url="https://example.invalid/data",
+                        params={},
+                        query_secret=("key", SecretStr(secret)),
+                    )
+        gc.collect()
+
+    await http.aclose()
+    assert raised.value.code == "UPSTREAM_ERROR"
+    _assert_provider_traceback_is_credential_free(raised.tb, secret)
+    assert not [item for item in caught if issubclass(item.category, RuntimeWarning)]
 
 
 @pytest.mark.asyncio
@@ -176,6 +307,38 @@ async def test_schema_fingerprint_tracks_nested_upstream_shape_without_values() 
     assert type(second) is str and len(second) == 64
     assert first != second
     assert "10" not in first and "99" not in second
+
+
+# Break caught: recursively inspecting a deeply nested JSON schema escapes as a
+# RecursionError or succeeds without enforcing an inspection depth bound.
+@pytest.mark.asyncio
+async def test_json_schema_fingerprint_depth_fails_closed() -> None:
+    nested = "{}"
+    for _ in range(80):
+        nested = '{"child":' + nested + "}"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            content=nested.encode(),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        boundary = BoundedHttpClient(
+            http=http,
+            timeout_seconds=5.0,
+            max_response_bytes=10_000,
+        )
+        with pytest.raises(ProviderRequestError) as raised:
+            await boundary.get_json(
+                url="https://example.invalid/data",
+                params={},
+                header_secret=SecretStr("secret"),
+            )
+
+    assert raised.value.code == "SCHEMA_MISMATCH"
+    assert boundary.last_schema_fingerprint is None
 
 
 @pytest.mark.asyncio

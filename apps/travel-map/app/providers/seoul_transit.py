@@ -22,6 +22,8 @@ from app.routing.models import (
 from app.settings import Settings
 
 _PATH_URL = "http://ws.bus.go.kr/api/rest/pathinfo/getPathInfoByBusNSub"
+_MAX_SCHEMA_DEPTH = 64
+_MAX_XML_ELEMENTS = 50_000
 
 
 class _LimitExceeded(ValueError):
@@ -92,9 +94,11 @@ class SeoulTransitProvider:
                 },
                 query_secret=("serviceKey", self._service_key),
             )
+            root = _parse_document(raw)
+            self._last_schema_fingerprint = _xml_schema_fingerprint(root)
             source_time = self._source_time()
-            routes, self._last_schema_fingerprint = _parse_routes(
-                raw,
+            routes = _parse_routes(
+                root,
                 query=query,
                 source_time=source_time,
                 max_routes=self._max_routes,
@@ -118,6 +122,7 @@ class SeoulTransitProvider:
         except (
             DefusedXmlException,
             ParseError,
+            RecursionError,
             TypeError,
             ValueError,
             OverflowError,
@@ -177,20 +182,14 @@ class SeoulTransitProvider:
 
 
 def _parse_routes(
-    raw: bytes,
+    root: Element,
     *,
     query: RouteQuery,
     source_time: datetime,
     max_routes: int,
     max_path_items: int,
-) -> tuple[tuple[RouteOption, ...], str]:
-    root = ElementTree.fromstring(
-        raw,
-        forbid_dtd=True,
-        forbid_entities=True,
-        forbid_external=True,
-    )
-    if root.tag != "ServiceResult" or sum(1 for _ in root.iter()) > 50_000:
+) -> tuple[RouteOption, ...]:
+    if root.tag != "ServiceResult":
         raise ValueError
     header = root.find("msgHeader")
     body = root.find("msgBody")
@@ -240,12 +239,22 @@ def _parse_routes(
                 warnings=("GEOMETRY_MISSING", "FARE_MISSING"),
             )
         )
-    return tuple(routes), _xml_schema_fingerprint(root)
+    return tuple(routes)
+
+
+def _parse_document(raw: bytes) -> Element:
+    return ElementTree.fromstring(
+        raw,
+        forbid_dtd=True,
+        forbid_entities=True,
+        forbid_external=True,
+    )
 
 
 def _xml_schema_fingerprint(root: Element) -> str:
+    element_count = [0]
     encoded = json.dumps(
-        _xml_schema_shape(root),
+        _xml_schema_shape(root, depth=0, element_count=element_count),
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
@@ -253,10 +262,24 @@ def _xml_schema_fingerprint(root: Element) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _xml_schema_shape(element: Element) -> dict[str, object]:
+def _xml_schema_shape(
+    element: Element,
+    *,
+    depth: int,
+    element_count: list[int],
+) -> dict[str, object]:
+    if depth > _MAX_SCHEMA_DEPTH:
+        raise ValueError("provider XML schema nesting exceeded the inspection limit")
+    element_count[0] += 1
+    if element_count[0] > _MAX_XML_ELEMENTS:
+        raise ValueError("provider XML schema exceeded the element inspection limit")
     child_shapes = {
         json.dumps(
-            _xml_schema_shape(child),
+            _xml_schema_shape(
+                child,
+                depth=depth + 1,
+                element_count=element_count,
+            ),
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),

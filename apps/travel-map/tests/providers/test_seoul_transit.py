@@ -134,13 +134,15 @@ async def test_seoul_transit_rejects_dtd_and_entity_after_large_prefix() -> None
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        result = await SeoulTransitProvider(
+        provider = SeoulTransitProvider(
             http=http,
             service_key=SecretStr("key"),
-        ).get_routes(route_query(TravelMode.TRANSIT))
+        )
+        result = await provider.get_routes(route_query(TravelMode.TRANSIT))
 
     assert result.routes == ()
     assert [warning.code for warning in result.warnings] == ["SCHEMA_MISMATCH"]
+    assert provider.last_schema_fingerprint is None
 
 
 # Break caught: a byte-pattern scan cannot see DTD/entity tokens encoded as UTF-16.
@@ -204,9 +206,40 @@ async def test_seoul_transit_validates_documented_path_coordinates() -> None:
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        result = await SeoulTransitProvider(
+        provider = SeoulTransitProvider(
             http=http,
             service_key=SecretStr("key"),
-        ).get_routes(route_query(TravelMode.TRANSIT))
+        )
+        result = await provider.get_routes(route_query(TravelMode.TRANSIT))
 
     assert [warning.code for warning in result.warnings] == ["SCHEMA_MISMATCH"]
+    assert type(provider.last_schema_fingerprint) is str
+    assert len(provider.last_schema_fingerprint) == 64
+
+
+# Break caught: recursive XML schema inspection has no strict nesting-depth bound.
+@pytest.mark.asyncio
+async def test_seoul_transit_schema_fingerprint_depth_fails_closed() -> None:
+    fixture = (FIXTURES / "seoul-transit.xml").read_text(encoding="utf-8")
+    nested = "value"
+    for _ in range(80):
+        nested = f"<child>{nested}</child>"
+    raw = fixture.replace("</ServiceResult>", f"{nested}</ServiceResult>").encode()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/xml"},
+            content=raw,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        provider = SeoulTransitProvider(
+            http=http,
+            service_key=SecretStr("key"),
+        )
+        result = await provider.get_routes(route_query(TravelMode.TRANSIT))
+
+    assert result.routes == ()
+    assert [warning.code for warning in result.warnings] == ["SCHEMA_MISMATCH"]
+    assert provider.last_schema_fingerprint is None
