@@ -1,6 +1,9 @@
 """Golden layout contracts for the 2023 OCR parser."""
 
+import pytest
+
 from src.ingestion.parse_common import (
+    ParserPage,
     parse_pages,
     parser_page_from_raw_page,
 )
@@ -9,6 +12,137 @@ from tests.ingestion.test_page_continuation import (
     assert_golden_year,
     load_golden,
 )
+
+
+def _strong_marker_page(
+    marker_bbox: tuple[float, float, float, float],
+    *,
+    include_header: bool = True,
+    include_answer: bool = True,
+    header_precedes_marker: bool = False,
+) -> ParserPage:
+    """Build one synthetic 2023 body page without production document values."""
+    marker_y0 = marker_bbox[1]
+    lines: list[dict[str, object]] = [
+        {"text": "대분류: 합성 업무", "bbox": [80.0, 25.0, 300.0, 45.0]},
+        {"text": "편: 합성 운영", "bbox": [250.0, 65.0, 500.0, 85.0]},
+        {"text": "1", "bbox": list(marker_bbox)},
+    ]
+    if include_header:
+        header_bbox = (
+            [195.0, marker_y0 - 14.0, 525.0, marker_y0 - 1.0]
+            if header_precedes_marker
+            else [195.0, marker_y0, 525.0, marker_y0 + 16.0]
+        )
+        lines.append({"text": "제목: 합성 카드 제목", "bbox": header_bbox})
+    lines.append({"text": "합성 질문?", "bbox": [195.0, 230.0, 525.0, 250.0]})
+    if include_answer:
+        lines.append({"text": "답변: 합성 답변", "bbox": [80.0, 285.0, 525.0, 310.0]})
+    raw_page = _raw_page(
+        doc_id="synthetic-2023-strong-marker",
+        year=2023,
+        source="ocr",
+        page={
+            "pdf_page_index": 1,
+            "page_label": "1",
+            "lines": lines,
+        },
+    )
+    return parser_page_from_raw_page(
+        raw_page,
+        normalized_text=None,
+        page_role_hint="body",
+        source_sha256="a" * 64,
+        upstream_review_status="needs_review",
+        critical_review_policy="all-fields-human-verification",
+    )
+
+
+@pytest.mark.parametrize(
+    "marker_bbox",
+    [
+        (84.0, 144.0, 99.0, 160.0),
+        (114.0, 144.0, 129.0, 160.0),
+        (90.0, 112.0, 105.0, 128.0),
+        (90.0, 176.0, 105.0, 192.0),
+        (90.0, 144.0, 105.0, 153.6),
+        (90.0, 144.0, 105.0, 164.0),
+    ],
+)
+def test_2023_strong_marker_geometry_includes_exact_boundaries(
+    marker_bbox: tuple[float, float, float, float],
+) -> None:
+    """Catches strict comparisons dropping reviewed boundary coordinates."""
+    result = parse_pages((_strong_marker_page(marker_bbox),), edition_year=2023)
+
+    assert [case.case_no for case in result.cases] == ["1"]
+    assert result.quarantines == ()
+
+
+@pytest.mark.parametrize(
+    "marker_bbox",
+    [
+        (83.9, 144.0, 98.9, 160.0),
+        (114.1, 144.0, 129.1, 160.0),
+        (90.0, 111.9, 105.0, 127.9),
+        (90.0, 176.1, 105.0, 192.1),
+        (90.0, 144.0, 105.0, 153.5),
+        (90.0, 144.0, 105.0, 164.1),
+    ],
+)
+def test_2023_strong_marker_geometry_rejects_each_outside_near_miss(
+    marker_bbox: tuple[float, float, float, float],
+) -> None:
+    """Catches broad geometry promoting an adjacent numeric value to a case."""
+    result = parse_pages((_strong_marker_page(marker_bbox),), edition_year=2023)
+
+    assert result.cases == ()
+    assert result.quarantines == ()
+
+
+def test_2023_strong_marker_requires_a_header_within_the_next_three_lines() -> None:
+    """Catches geometry alone inventing a case boundary."""
+    page = _strong_marker_page((90.0, 144.0, 105.0, 160.0), include_header=False)
+
+    result = parse_pages((page,), edition_year=2023)
+
+    assert result.cases == ()
+    assert result.quarantines == ()
+
+
+def test_2023_strong_marker_sorts_before_a_visually_higher_header() -> None:
+    """Catches source ordering hiding a reviewed marker behind its card header."""
+    page = _strong_marker_page((90.0, 144.0, 105.0, 160.0), header_precedes_marker=True)
+
+    result = parse_pages((page,), edition_year=2023)
+
+    assert len(result.cases) == 1
+    assert result.quarantines == ()
+    assert result.cases[0].title == "합성 카드 제목"
+    assert result.cases[0].question == "합성 질문?"
+    assert result.cases[0].answer == "합성 답변"
+
+
+def test_2023_strong_marker_with_missing_answer_is_quarantined() -> None:
+    """Catches incomplete OCR cards becoming answer-eligible candidates."""
+    page = _strong_marker_page((90.0, 144.0, 105.0, 160.0), include_answer=False)
+
+    result = parse_pages((page,), edition_year=2023)
+
+    assert result.cases == ()
+    assert len(result.quarantines) == 1
+    assert result.quarantines[0].reason_code == "ambiguous_boundary"
+    assert result.quarantines[0].page_ids == (1,)
+
+
+def test_2023_reviewed_legacy_marker_geometry_remains_supported() -> None:
+    """Catches the one retained taller 2023 marker losing its boundary."""
+    page = _strong_marker_page((72.0, 212.0, 105.0, 247.0))
+
+    result = parse_pages((page,), edition_year=2023)
+
+    assert [case.case_no for case in result.cases] == ["1"]
+    assert result.quarantines == ()
 
 
 def test_2023_golden_layouts() -> None:
@@ -52,9 +186,9 @@ def test_2023_actual_unlabeled_card_uses_geometry_and_preserves_split_rows() -> 
     )
     card_lines = [
         {"text": "1편 합성 운영", "bbox": [350.0, 65.0, 545.0, 95.0]},
-        {"text": "합성 카드", "bbox": [195.0, 205.0, 305.0, 230.0]},
-        {"text": "둘째 조각", "bbox": [315.0, 205.0, 525.0, 230.0]},
-        {"text": "1", "bbox": [72.0, 212.0, 105.0, 247.0]},
+        {"text": "합성 카드", "bbox": [195.0, 135.0, 305.0, 150.0]},
+        {"text": "둘째 조각", "bbox": [315.0, 135.0, 525.0, 150.0]},
+        {"text": "1", "bbox": [90.0, 148.0, 105.0, 164.0]},
         {"text": "합성", "bbox": [195.0, 238.0, 275.0, 258.0]},
         {"text": "질문", "bbox": [285.0, 238.0, 360.0, 258.0]},
         {"text": "문장", "bbox": [195.0, 262.0, 275.0, 282.0]},
@@ -68,7 +202,7 @@ def test_2023_actual_unlabeled_card_uses_geometry_and_preserves_split_rows() -> 
             "text": "참고자료: 합성 카드 밖 참고입니다.",
             "bbox": [80.0, 550.0, 525.0, 580.0],
         },
-        {"text": "합성 반복 탐색", "bbox": [572.0, 120.0, 592.0, 700.0]},
+        {"text": "합성 반복 탐색", "bbox": [572.0, 100.0, 592.0, 700.0]},
     ]
     card_raw = _raw_page(
         **common,
@@ -117,7 +251,7 @@ def test_2023_actual_unlabeled_card_uses_geometry_and_preserves_split_rows() -> 
     header_locations = {
         (line.bbox, line.raw_text_sha256)
         for line in pages[1].lines
-        if 195.0 <= line.bbox[0] and 200.0 <= line.bbox[1] < 290.0
+        if 195.0 <= line.bbox[0] and 130.0 <= line.bbox[1] < 290.0
     }
     assert header_locations.issubset(
         {(span.bbox, span.text_sha256) for span in candidate.source_spans}

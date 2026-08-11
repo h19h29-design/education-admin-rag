@@ -75,6 +75,26 @@ def _registry() -> VerifiedCanonicalReviewRegistry:
     return _verified_registry(_unsigned_registry())
 
 
+def _restricted_registry() -> VerifiedCanonicalReviewRegistry:
+    return _verified_registry(
+        CanonicalReviewRegistry.create(
+            cases=[
+                ReviewReference(
+                    case_id=CASE_1,
+                    content_sha256=CONTENT_A,
+                    source_locations=(
+                        ReviewSourceLocation(
+                            page_id=13,
+                            bbox=(10.0, 20.0, 100.0, 200.0),
+                            reason_code="restricted-pii",
+                        ),
+                    ),
+                )
+            ]
+        )
+    )
+
+
 @pytest.fixture
 def review_store(tmp_path: Path) -> Iterator[ReviewStore]:
     current = datetime(2026, 8, 8, 1, 2, 3, tzinfo=UTC)
@@ -82,6 +102,15 @@ def review_store(tmp_path: Path) -> Iterator[ReviewStore]:
         tmp_path / "review.sqlite3",
         canonical_registry=_registry(),
         clock=lambda: current,
+    ) as store:
+        yield store
+
+
+@pytest.fixture
+def restricted_review_store(tmp_path: Path) -> Iterator[ReviewStore]:
+    with ReviewStore(
+        tmp_path / "restricted-review.sqlite3",
+        canonical_registry=_restricted_registry(),
     ) as store:
         yield store
 
@@ -115,6 +144,24 @@ def _search_approve(
         reviewed_content_sha256=content_hash,
         reason="search_checked",
     )
+
+
+def _force_legacy_search_approval(store: ReviewStore) -> None:
+    """Represent a restricted row approved by a broker predating the boundary guard."""
+    store._write_authorized = True
+    try:
+        store._connection.execute(
+            """
+            UPDATE review_cases
+            SET review_status='search_approved', critical_field_review='verified',
+                search_eligible=1, critical_reviewer_id='reviewer-a',
+                search_reviewer_id='reviewer-a'
+            WHERE case_id=?
+            """,
+            (CASE_1,),
+        )
+    finally:
+        store._write_authorized = False
 
 
 def test_quality_enqueue_is_first_state_transition_and_records_minimal_audit(
@@ -801,6 +848,121 @@ def test_answer_run_mode_requires_explicit_content_basis_and_privacy_checks(
         privacy_verified=True,
     )
     assert review_store.get(CASE_1).review_status == "approved"
+
+
+@pytest.mark.parametrize(
+    "approval_path",
+    ["approve_search", "critical_fields_mode", "approve_search_batch"],
+)
+def test_restricted_candidate_cannot_cross_any_search_approval_boundary(
+    restricted_review_store: ReviewStore,
+    approval_path: str,
+) -> None:
+    """Catches restricted provenance becoming searchable through any broker path."""
+    _enqueue(restricted_review_store)
+    if approval_path != "critical_fields_mode":
+        restricted_review_store.verify_critical_fields(
+            CASE_1,
+            reviewer_id="reviewer-a",
+            reviewed_content_sha256=CONTENT_A,
+            reason="fields_checked",
+        )
+
+    with pytest.raises(ReviewValidationError) as captured:
+        if approval_path == "approve_search":
+            restricted_review_store.approve_search(
+                CASE_1,
+                reviewer_id="reviewer-a",
+                reviewed_content_sha256=CONTENT_A,
+                reason="search_checked",
+            )
+        elif approval_path == "critical_fields_mode":
+            restricted_review_store.run_mode(
+                "critical-fields-all",
+                cases=[ReviewReference(case_id=CASE_1, content_sha256=CONTENT_A)],
+                reviewer_id="reviewer-a",
+                reason="critical_batch",
+            )
+        else:
+            manifest = SegmentManifest.create(
+                segment_id="restricted-segment",
+                cases=[ReviewReference(case_id=CASE_1, content_sha256=CONTENT_A)],
+            ).to_bytes()
+            restricted_review_store.approve_search_batch(
+                manifest,
+                manifest_sha256=hashlib.sha256(manifest).hexdigest(),
+                reviewer_id="reviewer-a",
+                reason="segment_checked",
+            )
+
+    assert str(captured.value) == "restricted candidate cannot be approved"
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    reviewed = restricted_review_store.get(CASE_1)
+    assert reviewed.review_status == "needs_review"
+    assert not reviewed.search_eligible
+    assert not reviewed.answer_eligible
+    if approval_path == "critical_fields_mode":
+        assert reviewed.critical_field_review == "pending"
+        assert [event.action for event in restricted_review_store.events(CASE_1)] == [
+            "enqueue"
+        ]
+    else:
+        assert reviewed.critical_field_review == "verified"
+        assert [event.action for event in restricted_review_store.events(CASE_1)] == [
+            "enqueue",
+            "verify_fields",
+        ]
+    if approval_path == "approve_search_batch":
+        assert (
+            restricted_review_store._connection.execute(
+                "SELECT count(*) FROM review_batch_manifests"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.parametrize("approval_path", ["approve_answer", "answer_mode"])
+def test_legacy_restricted_search_candidate_cannot_cross_answer_boundary(
+    restricted_review_store: ReviewStore,
+    approval_path: str,
+) -> None:
+    """Catches a legacy restricted search approval being promoted to answers."""
+    _enqueue(restricted_review_store)
+    _force_legacy_search_approval(restricted_review_store)
+
+    with pytest.raises(ReviewValidationError) as captured:
+        if approval_path == "approve_answer":
+            restricted_review_store.approve_answer(
+                CASE_1,
+                reviewer_id="reviewer-b",
+                reviewed_content_sha256=CONTENT_A,
+                reason="answer_checked",
+                content_verified=True,
+                basis_verified=True,
+                privacy_verified=True,
+            )
+        else:
+            restricted_review_store.run_mode(
+                "answer-and-basis-all",
+                cases=[ReviewReference(case_id=CASE_1, content_sha256=CONTENT_A)],
+                reviewer_id="reviewer-b",
+                reason="answer_batch",
+                content_verified=True,
+                basis_verified=True,
+                privacy_verified=True,
+            )
+
+    assert str(captured.value) == "restricted candidate cannot be approved"
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    reviewed = restricted_review_store.get(CASE_1)
+    assert reviewed.review_status == "search_approved"
+    assert reviewed.search_eligible
+    assert not reviewed.answer_eligible
+    assert [event.action for event in restricted_review_store.events(CASE_1)] == [
+        "enqueue"
+    ]
 
 
 @pytest.mark.parametrize(

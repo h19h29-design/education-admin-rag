@@ -24,10 +24,13 @@ from src.ingestion.extract_native import (
     validate_native_page_record,
 )
 from src.ingestion.extract_ocr import (
+    ExtractedAppleVisionOcrPageRecord,
     ExtractedOcrPageRecord,
     OcrExtractionError,
-    OcrPageRecord,
+    ParsedOcrPageRecord,
+    QuarantinedAppleVisionOcrPageRecord,
     QuarantinedOcrPageRecord,
+    validate_apple_vision_ocr_page_record,
     validate_ocr_page_record,
 )
 from src.ingestion.manifest import SourceDocument
@@ -50,6 +53,7 @@ _FACTS_RE = re.compile(r"^(?:감사\s*사실|사실)\s*[:：]?\s*(?P<text>.+)$")
 _DOMAIN_RE = re.compile(r"^대분류(?:\s*탭)?\s*[:：]\s*(?P<text>.+)$")
 _PART_RE = re.compile(r"^편\s*[:：]\s*(?P<text>.+)$")
 _CENTERED_PART_RE = re.compile(r"^[0-9]+\s*편\s+(?P<text>.+)$")
+_MERGED_NUMBERED_HEADING_RE = re.compile(r"^[0-9]{1,2}[.)]?\s+(?P<text>\S.*)$")
 _SUBTOPIC_RE = re.compile(r"^소주제\s*[:：]\s*(?P<text>.+)$")
 _BULLET_RE = re.compile(r"^[•●▪∙]\s*(?P<text>.+)$")
 _BULLET_ONLY_RE = re.compile(r"^[•●▪∙]$")
@@ -367,6 +371,116 @@ class ParserPage(ParserModel):
         ):
             raise ValueError("body OCR page requires layout segment provenance")
         return self
+
+
+class VerifiedParserAnnotation(ParserModel):
+    """One value-free exact-span role selected by the sealed review workflow."""
+
+    role: Literal[
+        "domain",
+        "part",
+        "subtopic",
+        "case_start",
+        "case_no",
+        "title",
+        "question",
+        "answer",
+        "basis",
+        "facts",
+        "target",
+        "situation",
+        "case_end",
+    ]
+    pdf_page_index: int = Field(ge=1)
+    bbox: tuple[float, float, float, float]
+    text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def has_positive_geometry(self) -> Self:
+        x0, y0, x1, y1 = self.bbox
+        if not all(math.isfinite(value) for value in self.bbox) or x0 >= x1 or y0 >= y1:
+            raise ValueError("verified parser annotation geometry is invalid")
+        return self
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class VerifiedParserAnnotations:
+    """Init-disabled annotations bound to one exact validated page authority."""
+
+    annotations: tuple[VerifiedParserAnnotation, ...]
+    source_sha256: str
+    page_set_sha256: str
+
+    def __new__(cls) -> Self:
+        raise TypeError("verified parser annotations require verification")
+
+
+def _parser_page_set_sha256(pages: Sequence[ParserPage]) -> str:
+    payload = json.dumps(
+        [page.model_dump(mode="json") for page in pages],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(b"sen-qa-verified-parser-page-set-v1\0" + payload).hexdigest()
+
+
+def verify_parser_annotations(
+    pages: Sequence[ParserPage],
+    *,
+    annotations: tuple[VerifiedParserAnnotation, ...],
+    expected_source_sha256: str,
+) -> VerifiedParserAnnotations:
+    """Bind exact, revalidated hierarchy annotations to one external source SHA."""
+    try:
+        if (
+            type(annotations) is not tuple
+            or _SHA256_RE.fullmatch(expected_source_sha256) is None
+            or not pages
+        ):
+            raise ValueError
+        edition_year = pages[0].edition_year
+        _validate_pages(pages, edition_year)
+        if any(page.source_sha256 != expected_source_sha256 for page in pages):
+            raise ValueError
+        lines = {
+            (page.pdf_page_index, line.bbox, line.raw_text_sha256)
+            for page in pages
+            for line in page.lines
+        }
+        checked: list[VerifiedParserAnnotation] = []
+        for annotation in annotations:
+            if type(annotation) is not VerifiedParserAnnotation:
+                raise ValueError
+            rebuilt = VerifiedParserAnnotation.model_validate(
+                {
+                    name: getattr(annotation, name)
+                    for name in VerifiedParserAnnotation.model_fields
+                }
+            )
+            if (
+                rebuilt != annotation
+                or (
+                    annotation.pdf_page_index,
+                    annotation.bbox,
+                    annotation.text_sha256,
+                )
+                not in lines
+            ):
+                raise ValueError
+            checked.append(rebuilt)
+        keys = tuple(
+            (item.pdf_page_index, item.bbox, item.text_sha256) for item in checked
+        )
+        if not checked or len(set(keys)) != len(keys):
+            raise ValueError
+        wrapper = object.__new__(VerifiedParserAnnotations)
+        object.__setattr__(wrapper, "annotations", tuple(checked))
+        object.__setattr__(wrapper, "source_sha256", expected_source_sha256)
+        object.__setattr__(wrapper, "page_set_sha256", _parser_page_set_sha256(pages))
+        return wrapper
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise ValueError("verified_parser_annotations_invalid") from None
 
 
 class HierarchyState(ParserModel):
@@ -987,15 +1101,16 @@ def _inside_detected_card(page: ParserPage, line: ParserLine) -> bool:
     )
 
 
-def _actual_ocr_hierarchy(
+def _actual_ocr_hierarchy_scan(
     page: ParserPage, lines: Sequence[ParserLine]
 ) -> tuple[
     dict[str, tuple[ParserLine, str]],
     set[tuple[int, int, int]],
+    set[Literal["domain", "part"]],
 ]:
     """Infer only reviewed top-of-page OCR hierarchy geometry."""
     if page.page_width is None or page.page_height is None:
-        return {}, set()
+        return {}, set(), set()
     if page.edition_year in (2020, 2021, 2022):
         native_found: dict[str, tuple[ParserLine, str]] = {}
         native_consumed: set[tuple[int, int, int]] = set()
@@ -1146,7 +1261,7 @@ def _actual_ocr_hierarchy(
                         {_line_identity(ordinal), _line_identity(label)}
                     )
                     break
-        return native_found, native_consumed
+        return native_found, native_consumed, set()
     if page.edition_year == 2023:
         for line in lines:
             match = _CENTERED_PART_RE.match(line.normalized_text)
@@ -1160,20 +1275,21 @@ def _actual_ocr_hierarchy(
                 return (
                     {"part": (line, match.group("text").strip())},
                     {_line_identity(line)},
+                    set(),
                 )
-        return {}, set()
+        return {}, set(), set()
     if (
         page.edition_year not in (2024, 2025)
         or page.layout_evidence.status != "detected"
     ):
-        return {}, set()
+        return {}, set(), set()
     card_tops = [
         region.bbox.y0
         for region in page.layout_evidence.regions
         if region.region_type == "card" and region.evidence == "raster-border"
     ]
     if not card_tops:
-        return {}, set()
+        return {}, set(), set()
     first_card_top = min(card_tops)
     candidates = [
         line
@@ -1184,6 +1300,35 @@ def _actual_ocr_hierarchy(
     ]
     found: dict[str, tuple[ParserLine, str]] = {}
     consumed: set[tuple[int, int, int]] = set()
+    ambiguous_merged: set[Literal["domain", "part"]] = set()
+    if page.edition_year == 2024:
+        merged_domains = [
+            (line, match.group("text").strip())
+            for line in candidates
+            if (match := _ROMAN_DOMAIN_RE.fullmatch(line.normalized_text)) is not None
+            and line.bbox[0] / page.page_width >= 0.65
+            and (line.bbox[3] - line.bbox[1]) / page.page_height <= 0.04
+            and line.bbox[2] - line.bbox[0] > line.bbox[3] - line.bbox[1]
+        ]
+        merged_parts = [
+            (line, match.group("text").strip())
+            for line in candidates
+            if (match := _MERGED_NUMBERED_HEADING_RE.fullmatch(line.normalized_text))
+            is not None
+            and line.bbox[0] / page.page_width <= 0.20
+            and (line.bbox[3] - line.bbox[1]) / page.page_height <= 0.04
+            and line.bbox[2] - line.bbox[0] > line.bbox[3] - line.bbox[1]
+        ]
+        if len(merged_domains) == 1:
+            found["domain"] = merged_domains[0]
+            consumed.add(_line_identity(merged_domains[0][0]))
+        elif len(merged_domains) > 1:
+            ambiguous_merged.add("domain")
+        if len(merged_parts) == 1:
+            found["part"] = merged_parts[0]
+            consumed.add(_line_identity(merged_parts[0][0]))
+        elif len(merged_parts) > 1:
+            ambiguous_merged.add("part")
     if page.edition_year == 2025:
         for line in candidates:
             match = _CENTERED_PART_RE.match(line.normalized_text)
@@ -1191,7 +1336,7 @@ def _actual_ocr_hierarchy(
             if (
                 match is not None
                 and 0.35 <= center / page.page_width <= 0.70
-                and line.bbox[2] - line.bbox[0] >= page.page_width * 0.20
+                and line.bbox[2] - line.bbox[0] >= page.page_width * 0.15
             ):
                 found["part"] = (line, match.group("text").strip())
                 consumed.add(_line_identity(line))
@@ -1251,10 +1396,34 @@ def _actual_ocr_hierarchy(
                 role = "part"
         elif left_ratio <= 0.20 and ordinal_height >= page.page_height * 0.04:
             role = "subtopic"
-        if role is None or role in found:
+        if role is None:
+            continue
+        if role in found:
+            if found[role][1] != label.normalized_text:
+                if role == "domain":
+                    ambiguous_merged.add("domain")
+                elif role == "part":
+                    ambiguous_merged.add("part")
+            else:
+                consumed.update({_line_identity(ordinal), _line_identity(label)})
             continue
         found[role] = (label, label.normalized_text)
         consumed.update({_line_identity(ordinal), _line_identity(label)})
+    return (
+        found,
+        consumed,
+        ambiguous_merged,
+    )
+
+
+def _actual_ocr_hierarchy(
+    page: ParserPage, lines: Sequence[ParserLine]
+) -> tuple[
+    dict[str, tuple[ParserLine, str]],
+    set[tuple[int, int, int]],
+]:
+    """Retain the extractor-neutral hierarchy helper's two-value contract."""
+    found, consumed, _ = _actual_ocr_hierarchy_scan(page, lines)
     return found, consumed
 
 
@@ -1301,6 +1470,35 @@ def _native_qa_number_geometry(page: ParserPage, line: ParserLine) -> bool:
     return True
 
 
+def _is_2023_case_number_geometry(page: ParserPage, line: ParserLine) -> bool:
+    """Return whether a number matches a reviewed 2023 card marker shape."""
+    if page.edition_year != 2023 or page.page_width is None or page.page_height is None:
+        return False
+
+    def within(value: float, lower: float, upper: float) -> bool:
+        return bool(
+            (lower <= value or math.isclose(value, lower, abs_tol=1e-12))
+            and (value <= upper or math.isclose(value, upper, abs_tol=1e-12))
+        )
+
+    x0_ratio = line.bbox[0] / page.page_width
+    y0_ratio = line.bbox[1] / page.page_height
+    height_ratio = (line.bbox[3] - line.bbox[1]) / page.page_height
+    strong_marker = bool(
+        re.fullmatch(r"[0-9]{1,4}", line.normalized_text)
+        and within(x0_ratio, 0.14, 0.19)
+        and within(y0_ratio, 0.14, 0.22)
+        and within(height_ratio, 0.012, 0.025)
+    )
+    retained_legacy_marker = bool(
+        re.fullmatch(r"[0-9]{1,4}(?:-[0-9]+)?", line.normalized_text)
+        and x0_ratio <= 0.25
+        and within(y0_ratio, 0.10, 0.85)
+        and within(height_ratio, 0.03, 0.08)
+    )
+    return bool(strong_marker or retained_legacy_marker)
+
+
 def _case_number_at(
     page: ParserPage, lines: Sequence[ParserLine], index: int
 ) -> str | None:
@@ -1310,14 +1508,9 @@ def _case_number_at(
     if not re.fullmatch(r"[0-9]{1,4}(?:-[0-9]+)?", line.normalized_text):
         return None
     if page.edition_year == 2023:
-        if (
-            page.page_width is None
-            or page.page_height is None
-            or line.bbox[0] / page.page_width > 0.25
-            or not 0.10 <= line.bbox[1] / page.page_height <= 0.85
-            or not 0.03 <= (line.bbox[3] - line.bbox[1]) / page.page_height <= 0.08
-        ):
+        if not _is_2023_case_number_geometry(page, line):
             return None
+        assert page.page_height is not None
         nearby_header = any(
             candidate.bbox[0] > line.bbox[2]
             and abs(candidate.bbox[1] - line.bbox[1]) <= page.page_height * 0.04
@@ -1435,15 +1628,7 @@ def _card_body_order_key(
             line.source_span_index,
             line.raw_text_sha256,
         )
-    if (
-        page.edition_year == 2023
-        and page.page_width is not None
-        and page.page_height is not None
-        and re.fullmatch(r"[0-9]{1,4}", line.normalized_text)
-        and line.bbox[0] / page.page_width <= 0.25
-        and 0.10 <= line.bbox[1] / page.page_height <= 0.85
-        and 0.03 <= (line.bbox[3] - line.bbox[1]) / page.page_height <= 0.08
-    ):
+    if _is_2023_case_number_geometry(page, line) and page.page_height is not None:
         return (
             line.bbox[1] - page.page_height * 0.04,
             line.bbox[0],
@@ -1949,7 +2134,63 @@ def _is_revalidated_parser_page(value: object) -> bool:
 
 def parse_pages(pages: Sequence[ParserPage], *, edition_year: int) -> ParseResult:
     """Parse one complete, ordered document slice using annual fail-closed policy."""
+    return _parse_pages(pages, edition_year=edition_year, verified_annotations=None)
+
+
+def parse_pages_with_verified_annotations(
+    pages: Sequence[ParserPage],
+    *,
+    edition_year: int,
+    verified_annotations: VerifiedParserAnnotations,
+) -> ParseResult:
+    """Parse with exact hierarchy roles produced by the sealed review boundary."""
+    try:
+        if type(verified_annotations) is not VerifiedParserAnnotations:
+            raise ValueError
+        fields = (
+            verified_annotations.annotations,
+            verified_annotations.source_sha256,
+            verified_annotations.page_set_sha256,
+        )
+        if (
+            type(fields[0]) is not tuple
+            or type(fields[1]) is not str
+            or type(fields[2]) is not str
+            or fields[2] != _parser_page_set_sha256(pages)
+            or any(page.source_sha256 != fields[1] for page in pages)
+        ):
+            raise ValueError
+        rebound = verify_parser_annotations(
+            pages,
+            annotations=fields[0],
+            expected_source_sha256=fields[1],
+        )
+        if rebound.page_set_sha256 != fields[2]:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise ParserContractError("verified parser annotations are invalid") from None
+    return _parse_pages(
+        pages,
+        edition_year=edition_year,
+        verified_annotations=verified_annotations,
+    )
+
+
+def _parse_pages(
+    pages: Sequence[ParserPage],
+    *,
+    edition_year: int,
+    verified_annotations: VerifiedParserAnnotations | None,
+) -> ParseResult:
     _validate_pages(pages, edition_year)
+    annotation_by_location = (
+        {}
+        if verified_annotations is None
+        else {
+            (item.pdf_page_index, item.bbox, item.text_sha256): item.role
+            for item in verified_annotations.annotations
+        }
+    )
     domain: str | None = None
     part: str | None = None
     subtopic: str | None = None
@@ -2008,8 +2249,40 @@ def parse_pages(pages: Sequence[ParserPage], *, edition_year: int) -> ParseResul
                 )
             continue
 
-        actual_found, actual_metadata_lines = _actual_ocr_hierarchy(page, page.lines)
+        (
+            actual_found,
+            actual_metadata_lines,
+            ambiguous_hierarchy_roles,
+        ) = _actual_ocr_hierarchy_scan(page, page.lines)
         usable = [line for line in page.lines if not _is_right_navigation(page, line)]
+        reviewed_found: dict[str, tuple[ParserLine, str]] = {}
+        reviewed_lines: set[tuple[int, int, int]] = set()
+        for line in usable:
+            reviewed_role = annotation_by_location.get(
+                (page.pdf_page_index, line.bbox, line.raw_text_sha256)
+            )
+            if reviewed_role in {"domain", "part", "subtopic"}:
+                reviewed_found[reviewed_role] = (line, line.normalized_text)
+                reviewed_lines.add(_line_identity(line))
+        if reviewed_found:
+            ambiguous_hierarchy_roles = {
+                role for role in ambiguous_hierarchy_roles if role not in reviewed_found
+            }
+        if ambiguous_hierarchy_roles:
+            quarantine_pending_2022()
+            located = ([] if opened is None else opened.lines) + [
+                (page, line) for line in usable
+            ]
+            quarantines.append(_quarantine(located))
+            opened = None
+            if "domain" in ambiguous_hierarchy_roles:
+                domain = None
+                part = None
+                subtopic = None
+            elif "part" in ambiguous_hierarchy_roles:
+                part = None
+                subtopic = None
+            continue
         by_bbox: dict[tuple[float, float, float, float], str] = {}
         conflict = False
         for line in usable:
@@ -2032,6 +2305,8 @@ def parse_pages(pages: Sequence[ParserPage], *, edition_year: int) -> ParseResul
             if item:
                 found[item[0]] = (line, item[1])
                 metadata_lines.add(_line_identity(line))
+        found.update(reviewed_found)
+        metadata_lines.update(reviewed_lines)
         if edition_year == 2020 and "part" in found and "domain" not in found:
             found["domain"] = found["part"]
         new_part = found.get("part", (None, part))[1]
@@ -2068,6 +2343,17 @@ def parse_pages(pages: Sequence[ParserPage], *, edition_year: int) -> ParseResul
         index = 0
         while index < len(body):
             line = body[index]
+            reviewed_role = annotation_by_location.get(
+                (page.pdf_page_index, line.bbox, line.raw_text_sha256)
+            )
+            if reviewed_role == "case_end":
+                if opened is None:
+                    quarantines.append(_quarantine([(page, line)]))
+                else:
+                    opened.lines.append((page, line))
+                    close_open()
+                index += 1
+                continue
             if edition_year <= 2022 and _AUDIT_RUN_RE.fullmatch(line.normalized_text):
                 close_open()
                 quarantine_pending_2022()
@@ -2124,7 +2410,15 @@ def parse_pages(pages: Sequence[ParserPage], *, edition_year: int) -> ParseResul
                 )
                 index += 1
                 continue
-            case_no = _case_number_at(page, body, index)
+            case_no = (
+                line.normalized_text
+                if reviewed_role == "case_no"
+                else _case_number_at(page, body, index)
+            )
+            if reviewed_role == "case_start" and case_no is None:
+                quarantines.append(_quarantine([(page, line)]))
+                index += 1
+                continue
             if case_no is not None:
                 if opened is not None and any(
                     source_page.pdf_page_index == page.pdf_page_index
@@ -2190,7 +2484,25 @@ def parse_pages(pages: Sequence[ParserPage], *, edition_year: int) -> ParseResul
                 opened.lines.append((page, line))
                 index += 1
                 continue
-            parsed_role = _line_role(page, line, opened)
+            parsed_role = (
+                (
+                    reviewed_role,
+                    None,
+                    line.normalized_text,
+                    False,
+                )
+                if reviewed_role
+                in {
+                    "title",
+                    "question",
+                    "answer",
+                    "basis",
+                    "facts",
+                    "target",
+                    "situation",
+                }
+                else _line_role(page, line, opened)
+            )
             if parsed_role is None and opened.implicit_role is not None:
                 parsed_role = (
                     opened.implicit_role,
@@ -2266,9 +2578,21 @@ def _validated_native_record(record: object) -> NativePageRecord:
     raise ParserContractError("native page record is invalid")
 
 
-def _validated_ocr_record(record: object) -> OcrPageRecord:
+def _validated_ocr_record(record: object) -> ParsedOcrPageRecord:
+    checked: ParsedOcrPageRecord
     try:
-        checked = validate_ocr_page_record(record)
+        if type(record) in (
+            ExtractedOcrPageRecord,
+            QuarantinedOcrPageRecord,
+        ):
+            checked = validate_ocr_page_record(record)
+        elif type(record) in (
+            ExtractedAppleVisionOcrPageRecord,
+            QuarantinedAppleVisionOcrPageRecord,
+        ):
+            checked = validate_apple_vision_ocr_page_record(record)
+        else:
+            raise OcrExtractionError("OCR page record is invalid")
     except OcrExtractionError:
         pass
     else:
@@ -2277,7 +2601,7 @@ def _validated_ocr_record(record: object) -> OcrPageRecord:
 
 
 def _parser_layout_segment(
-    record: ExtractedOcrPageRecord,
+    record: ExtractedOcrPageRecord | ExtractedAppleVisionOcrPageRecord,
 ) -> LayoutSegmentProvenance | None:
     segment = record.layout_segment_provenance
     if segment is None:
@@ -2376,7 +2700,10 @@ def parser_page_from_ocr_record(
 ) -> ParserPage:
     """Adapt an OCR extractor record without inventing missing card evidence."""
     checked = _validated_ocr_record(record)
-    if isinstance(checked, QuarantinedOcrPageRecord):
+    if isinstance(
+        checked,
+        (QuarantinedOcrPageRecord, QuarantinedAppleVisionOcrPageRecord),
+    ):
         role = (
             _policy_role_for_envelope(
                 page_role_policy,
@@ -2416,7 +2743,10 @@ def parser_page_from_ocr_record(
             layout_evidence=LayoutEvidence(status="unavailable"),
             upstream_reason_code=checked.reason_code,
         )
-    if not isinstance(checked, ExtractedOcrPageRecord):
+    if not isinstance(
+        checked,
+        (ExtractedOcrPageRecord, ExtractedAppleVisionOcrPageRecord),
+    ):
         raise ParserContractError("OCR page record status is invalid")
     critical = tuple(
         f"{item.field_type}:{item.status}" for item in checked.critical_fields

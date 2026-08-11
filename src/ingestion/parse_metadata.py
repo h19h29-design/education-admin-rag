@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -23,16 +24,26 @@ from src.ingestion.extract_native import (
     validate_native_page_record,
 )
 from src.ingestion.extract_ocr import (
+    AppleVisionRuntimeProvenance,
+    ExtractedAppleVisionOcrPageRecord,
     ExtractedOcrPageRecord,
     OcrExtractionError,
     OcrPageRecord,
+    ParsedOcrPageRecord,
+    QuarantinedAppleVisionOcrPageRecord,
     QuarantinedOcrPageRecord,
-    validate_ocr_page_record,
+    parse_ocr_page_record,
 )
 from src.ingestion.manifest import (
     SourceDocument,
     SourceManifest,
     page_label,
+)
+from src.ingestion.ocr_authority import (
+    OcrAuthorityEntry,
+    OcrAuthorityLock,
+    OcrAuthorityLockError,
+    load_ocr_authority_lock,
 )
 from src.ingestion.parse_2020 import parse_document as parse_2020_document
 from src.ingestion.parse_2021_2022 import (
@@ -62,6 +73,7 @@ _JSONL_RECORD_MAX_BYTES = 8 * 1024 * 1024
 _FILE_READ_CHUNK_BYTES = 1024 * 1024
 
 ParseMetadataErrorCode = Literal[
+    "authority_invalid",
     "manifest_invalid",
     "selection_invalid",
     "input_invalid",
@@ -452,35 +464,24 @@ def _load_native_jsonl(raw: bytes) -> tuple[NativePageRecord, ...] | None:
     return tuple(record for record in records if record is not None)
 
 
-def _load_ocr_record(line: bytes) -> OcrPageRecord | None:
-    payload = _json_object(line)
-    if payload is None:
-        return None
-    model: type[ExtractedOcrPageRecord | QuarantinedOcrPageRecord]
-    if payload.get("status") == "extracted":
-        model = ExtractedOcrPageRecord
-    elif payload.get("status") == "quarantined":
-        model = QuarantinedOcrPageRecord
-    else:
-        return None
+def _load_ocr_record(line: bytes) -> ParsedOcrPageRecord | None:
     try:
-        parsed = model.model_validate_json(line)
-    except (RecursionError, OverflowError, TypeError, ValueError):
-        return None
-    try:
-        return validate_ocr_page_record(parsed)
-    except OcrExtractionError:
+        return parse_ocr_page_record(line)
+    except (OcrExtractionError, RecursionError, OverflowError, TypeError, ValueError):
         return None
 
 
-def _load_ocr_jsonl(raw: bytes) -> tuple[OcrPageRecord, ...] | None:
+def _load_ocr_jsonl(raw: bytes) -> tuple[ParsedOcrPageRecord, ...] | None:
     lines = _bounded_jsonl_lines(raw)
     if lines is None:
         return None
     records = tuple(_load_ocr_record(line) for line in lines)
     if any(record is None for record in records):
         return None
-    return tuple(record for record in records if record is not None)
+    checked = tuple(record for record in records if record is not None)
+    if len({record.schema_version for record in checked}) != 1:
+        return None
+    return checked
 
 
 def _expected_page_label(document: SourceDocument, index: int) -> str | None:
@@ -553,10 +554,9 @@ def _parse_page_selection(value: str, *, pdf_page_count: int) -> tuple[int, ...]
 
 
 def _ocr_records_match_document(
-    records: tuple[OcrPageRecord, ...],
+    records: tuple[ParsedOcrPageRecord, ...],
     document: SourceDocument,
     indexes: tuple[int, ...],
-    expected_image_digest: str,
 ) -> bool:
     return (
         document.extraction_method == "ocr"
@@ -568,12 +568,178 @@ def _ocr_records_match_document(
             and record.edition_year == document.edition_year
             and record.source_sha256 == document.sha256
             and record.render_dpi == document.render_dpi
-            and record.image_digest == expected_image_digest
             and record.page_label
             == _expected_page_label(document, record.pdf_page_index)
             for record in records
         )
     )
+
+
+def _legacy_v2_digest_matches(
+    records: tuple[ParsedOcrPageRecord, ...],
+    expected_image_digest: str,
+) -> bool:
+    for record in records:
+        if type(record) not in (ExtractedOcrPageRecord, QuarantinedOcrPageRecord):
+            return False
+        legacy_record = cast(OcrPageRecord, record)
+        if not hmac.compare_digest(
+            legacy_record.image_digest,
+            expected_image_digest,
+        ):
+            return False
+    return True
+
+
+def _load_authority_lock(
+    path: object,
+    expected_sha256: object,
+) -> OcrAuthorityLock | None:
+    lock: OcrAuthorityLock | None = None
+    try:
+        lock = load_ocr_authority_lock(
+            path,  # type: ignore[arg-type]
+            expected_sha256=expected_sha256,  # type: ignore[arg-type]
+        )
+    except (
+        OcrAuthorityLockError,
+        RecursionError,
+        OverflowError,
+        TypeError,
+        ValueError,
+    ):
+        lock = None
+    return lock if type(lock) is OcrAuthorityLock else None
+
+
+def _record_schema_and_engine(
+    records: tuple[ParsedOcrPageRecord, ...],
+) -> tuple[str, str] | None:
+    if not records:
+        return None
+    schema_version = records[0].schema_version
+    if schema_version == 2 and all(
+        type(record) in (ExtractedOcrPageRecord, QuarantinedOcrPageRecord)
+        for record in records
+    ):
+        return "sen-qa-ocr-page/v2", "paddleocr"
+    if schema_version == 3 and all(
+        type(record)
+        in (
+            ExtractedAppleVisionOcrPageRecord,
+            QuarantinedAppleVisionOcrPageRecord,
+        )
+        for record in records
+    ):
+        return "sen-qa-ocr-page/v3", "apple-vision"
+    return None
+
+
+def _authority_entry(
+    lock: OcrAuthorityLock,
+    *,
+    document: SourceDocument,
+    record_schema: str,
+    engine: str,
+) -> OcrAuthorityEntry | None:
+    if type(lock.entries) is not tuple:
+        return None
+    matches = tuple(
+        entry
+        for entry in lock.entries
+        if type(entry) is OcrAuthorityEntry
+        and type(entry.year) is int
+        and entry.year == document.edition_year
+    )
+    if len(matches) != 1:
+        return None
+    entry = matches[0]
+    expected = (
+        document.doc_id,
+        document.sha256,
+        record_schema,
+        engine,
+    )
+    actual = (
+        entry.doc_id,
+        entry.source_sha256,
+        entry.record_schema,
+        entry.engine,
+    )
+    if any(type(value) is not str for value in actual) or any(
+        not hmac.compare_digest(left, right)
+        for left, right in zip(actual, expected, strict=True)
+    ):
+        return None
+    return entry
+
+
+def _canonical_runtime_fingerprint(
+    runtime: AppleVisionRuntimeProvenance,
+) -> str | None:
+    rendered: bytes | None = None
+    try:
+        if type(runtime) is not AppleVisionRuntimeProvenance:
+            raise TypeError
+        rendered = (
+            json.dumps(
+                runtime.model_dump(mode="json"),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("ascii")
+    except (RecursionError, TypeError, ValueError, UnicodeError):
+        rendered = None
+    if rendered is None:
+        return None
+    return "sha256:" + hashlib.sha256(rendered).hexdigest()
+
+
+def _records_match_authority(
+    records: tuple[ParsedOcrPageRecord, ...],
+    *,
+    document: SourceDocument,
+    lock: OcrAuthorityLock,
+) -> bool:
+    selected = _record_schema_and_engine(records)
+    if selected is None:
+        return False
+    record_schema, engine = selected
+    entry = _authority_entry(
+        lock,
+        document=document,
+        record_schema=record_schema,
+        engine=engine,
+    )
+    if entry is None or type(entry.authority) is not str:
+        return False
+    if record_schema == "sen-qa-ocr-page/v2":
+        _, separator, container_digest = entry.authority.rpartition("@")
+        return (
+            separator == "@"
+            and _IMAGE_DIGEST_RE.fullmatch(container_digest) is not None
+            and _legacy_v2_digest_matches(records, container_digest)
+        )
+    for record in records:
+        if type(record) not in (
+            ExtractedAppleVisionOcrPageRecord,
+            QuarantinedAppleVisionOcrPageRecord,
+        ):
+            return False
+        vision_record = cast(
+            ExtractedAppleVisionOcrPageRecord | QuarantinedAppleVisionOcrPageRecord,
+            record,
+        )
+        fingerprint = _canonical_runtime_fingerprint(vision_record.runtime_provenance)
+        if fingerprint is None or not hmac.compare_digest(
+            fingerprint,
+            entry.authority,
+        ):
+            return False
+    return True
 
 
 def _page_role_policy(document: SourceDocument) -> VerifiedPageRolePolicy:
@@ -604,7 +770,7 @@ def _fixed_counts(names: tuple[str, ...], values: Counter[str]) -> dict[str, int
     return {name: values[name] for name in names}
 
 
-PageRecord = NativePageRecord | OcrPageRecord
+PageRecord = NativePageRecord | ParsedOcrPageRecord
 
 
 def _layout_diagnostics(
@@ -615,14 +781,27 @@ def _layout_diagnostics(
     region_count = 0
     bindings: list[dict[str, object]] = []
     for record in records:
-        if isinstance(record, (QuarantinedPageRecord, QuarantinedOcrPageRecord)):
+        if isinstance(
+            record,
+            (
+                QuarantinedPageRecord,
+                QuarantinedOcrPageRecord,
+                QuarantinedAppleVisionOcrPageRecord,
+            ),
+        ):
             evidence["no_evidence"] += 1
-            if isinstance(record, QuarantinedOcrPageRecord):
+            if isinstance(
+                record,
+                (QuarantinedOcrPageRecord, QuarantinedAppleVisionOcrPageRecord),
+            ):
                 sampling["no_segment"] += 1
             continue
         evidence[record.raw_page.layout_evidence.status] += 1
         region_count += len(record.raw_page.layout_evidence.regions)
-        if isinstance(record, ExtractedOcrPageRecord):
+        if isinstance(
+            record,
+            (ExtractedOcrPageRecord, ExtractedAppleVisionOcrPageRecord),
+        ):
             segment = record.layout_segment_provenance
             sampling[
                 segment.sampling_status if segment is not None else "no_segment"
@@ -687,7 +866,14 @@ def _metadata(
     record_reasons: Counter[str] = Counter(
         record.reason_code
         for record in records
-        if isinstance(record, (QuarantinedPageRecord, QuarantinedOcrPageRecord))
+        if isinstance(
+            record,
+            (
+                QuarantinedPageRecord,
+                QuarantinedOcrPageRecord,
+                QuarantinedAppleVisionOcrPageRecord,
+            ),
+        )
     )
     case_types = Counter(case.case_type for case in result.cases)
     parser_reasons: Counter[str] = Counter(
@@ -819,9 +1005,9 @@ def _metadata(
 
 
 def _contiguous_runs(
-    records: tuple[OcrPageRecord, ...],
-) -> tuple[tuple[OcrPageRecord, ...], ...]:
-    runs: list[list[OcrPageRecord]] = []
+    records: tuple[ParsedOcrPageRecord, ...],
+) -> tuple[tuple[ParsedOcrPageRecord, ...], ...]:
+    runs: list[list[ParsedOcrPageRecord]] = []
     for record in records:
         if not runs or record.pdf_page_index != runs[-1][-1].pdf_page_index + 1:
             runs.append([record])
@@ -831,7 +1017,7 @@ def _contiguous_runs(
 
 
 def _parse_ocr_document(
-    records: tuple[OcrPageRecord, ...],
+    records: tuple[ParsedOcrPageRecord, ...],
     *,
     document: SourceDocument,
 ) -> ParseResult:
@@ -839,12 +1025,17 @@ def _parse_ocr_document(
     results: list[ParseResult] = []
     for run in _contiguous_runs(records):
         if document.edition_year == 2023:
-            results.append(parse_2023_document(run, page_role_policy=policy))
+            results.append(
+                parse_2023_document(
+                    cast(tuple[OcrPageRecord, ...], run),
+                    page_role_policy=policy,
+                )
+            )
         else:
             year = cast(Literal[2024, 2025], document.edition_year)
             results.append(
                 parse_2024_2025_document(
-                    run,
+                    cast(tuple[OcrPageRecord, ...], run),
                     edition_year=year,
                     page_role_policy=policy,
                 )
@@ -863,6 +1054,8 @@ def build_parse_run(
     edition_year: int,
     pages: str,
     expected_image_digest: str | None = None,
+    ocr_authority_lock_path: Path | None = None,
+    expected_ocr_authority_lock_sha256: str | None = None,
 ) -> VerifiedParseRun:
     """Validate one extractor JSONL and retain its exact parser staging inputs."""
     if type(edition_year) is not int:
@@ -882,6 +1075,11 @@ def build_parse_run(
         _raise("input_invalid")
     records: tuple[PageRecord, ...]
     if document.extraction_method == "native":
+        if (
+            ocr_authority_lock_path is not None
+            or expected_ocr_authority_lock_sha256 is not None
+        ):
+            _raise("authority_invalid")
         if pages != "all":
             _raise("selection_invalid")
         native_records = _load_native_jsonl(input_bytes)
@@ -891,13 +1089,32 @@ def build_parse_run(
             _raise("policy_mismatch")
         records = native_records
     else:
+        authority_supplied = (
+            ocr_authority_lock_path is not None
+            or expected_ocr_authority_lock_sha256 is not None
+        )
+        if authority_supplied and expected_image_digest is not None:
+            _raise("authority_invalid")
         indexes = _parse_page_selection(
             pages,
             pdf_page_count=document.pdf_page_count,
         )
         if indexes is None or pages == "all":
             _raise("selection_invalid")
-        if (
+        authority_lock: OcrAuthorityLock | None = None
+        if authority_supplied:
+            if (
+                ocr_authority_lock_path is None
+                or expected_ocr_authority_lock_sha256 is None
+            ):
+                _raise("authority_invalid")
+            authority_lock = _load_authority_lock(
+                ocr_authority_lock_path,
+                expected_ocr_authority_lock_sha256,
+            )
+            if authority_lock is None:
+                _raise("authority_invalid")
+        elif (
             type(expected_image_digest) is not str
             or _IMAGE_DIGEST_RE.fullmatch(expected_image_digest) is None
         ):
@@ -909,9 +1126,23 @@ def build_parse_run(
             ocr_records,
             document,
             indexes,
-            expected_image_digest,
         ):
             _raise("policy_mismatch")
+        if authority_lock is not None:
+            if not _records_match_authority(
+                ocr_records,
+                document=document,
+                lock=authority_lock,
+            ):
+                _raise("policy_mismatch")
+        else:
+            if ocr_records[0].schema_version != 2:
+                _raise("image_digest_invalid")
+            if not _legacy_v2_digest_matches(
+                ocr_records,
+                cast(str, expected_image_digest),
+            ):
+                _raise("policy_mismatch")
         records = ocr_records
     parse_failed = False
     try:
@@ -932,7 +1163,7 @@ def build_parse_run(
                 )
         else:
             result = _parse_ocr_document(
-                cast(tuple[OcrPageRecord, ...], records),
+                cast(tuple[ParsedOcrPageRecord, ...], records),
                 document=document,
             )
     except (RecursionError, OverflowError, ParserContractError, TypeError, ValueError):
@@ -956,7 +1187,7 @@ def build_parse_run(
                     record,
                     page_role_policy=role_policy,
                 )
-                for record in cast(tuple[OcrPageRecord, ...], records)
+                for record in cast(tuple[ParsedOcrPageRecord, ...], records)
             )
     except (RecursionError, OverflowError, ParserContractError, TypeError, ValueError):
         _raise("parse_failed")
@@ -977,6 +1208,8 @@ def build_parse_metadata(
     edition_year: int,
     pages: str,
     expected_image_digest: str | None = None,
+    ocr_authority_lock_path: Path | None = None,
+    expected_ocr_authority_lock_sha256: str | None = None,
 ) -> ParseMetadata:
     """Validate one extractor JSONL and return only aggregate parser diagnostics."""
     run = build_parse_run(
@@ -985,6 +1218,8 @@ def build_parse_metadata(
         edition_year=edition_year,
         pages=pages,
         expected_image_digest=expected_image_digest,
+        ocr_authority_lock_path=ocr_authority_lock_path,
+        expected_ocr_authority_lock_sha256=expected_ocr_authority_lock_sha256,
     )
     metadata: ParseMetadata | None = None
     try:

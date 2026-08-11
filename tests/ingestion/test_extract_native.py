@@ -148,6 +148,15 @@ def _document(path: Path, *, year: int = 2020, pages: int = 1) -> SourceDocument
                 "body_end_pdf_page": pages,
                 "offset": 0,
             },
+            "native_review_layout_segments": (
+                {
+                    "segment_id": f"native-layout-fixture-{year}-body-v1",
+                    "start_pdf_page": 1,
+                    "end_pdf_page": pages,
+                    "sampling_policy": "native-layout-sample",
+                    "policy_version": "native-review-layout-segment-v1",
+                },
+            ),
             "official_public_url": None,
             "official_url_status": "unverified",
             "redistribution_status": "unverified",
@@ -176,6 +185,7 @@ def _write_full_manifest(tmp_path: Path, *, native_2020: bool = True) -> Path:
             payload["extraction_method"] = "ocr"
             payload["source_dpi"] = 96
             payload["render_dpi"] = 300
+            payload["native_review_layout_segments"] = []
         documents.append(payload)
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"documents": documents}), encoding="utf-8")
@@ -607,6 +617,15 @@ def test_native_writer_accepts_exact_front_and_body_page_labels(
         "body_end_pdf_page": 3,
         "offset": -1,
     }
+    payload["native_review_layout_segments"] = (
+        {
+            "segment_id": "native-layout-fixture-2020-body-v1",
+            "start_pdf_page": 2,
+            "end_pdf_page": 3,
+            "sampling_policy": "native-layout-sample",
+            "policy_version": "native-review-layout-segment-v1",
+        },
+    )
     document = SourceDocument.model_validate(payload)
     records = extract_document(source, document)
 
@@ -634,6 +653,15 @@ def test_native_writer_rejects_self_consistent_wrong_page_label(
         "body_end_pdf_page": 3,
         "offset": -1,
     }
+    payload["native_review_layout_segments"] = (
+        {
+            "segment_id": "native-layout-fixture-2020-body-v1",
+            "start_pdf_page": 2,
+            "end_pdf_page": 3,
+            "sampling_policy": "native-layout-sample",
+            "policy_version": "native-review-layout-segment-v1",
+        },
+    )
     document = SourceDocument.model_validate(payload)
     records = list(extract_document(source, document))
 

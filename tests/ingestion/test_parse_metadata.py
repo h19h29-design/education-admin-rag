@@ -78,6 +78,17 @@ def _manifest_payload() -> dict[str, object]:
                     "body_end_pdf_page": 2,
                     "offset": -1,
                 },
+                "native_review_layout_segments": [
+                    {
+                        "segment_id": f"native-layout-fixture-{year}-body-v1",
+                        "start_pdf_page": 2,
+                        "end_pdf_page": 2,
+                        "sampling_policy": "native-layout-sample",
+                        "policy_version": "native-review-layout-segment-v1",
+                    }
+                ]
+                if is_native
+                else [],
                 "official_public_url": None,
                 "official_url_status": "unverified",
                 "redistribution_status": "unverified",

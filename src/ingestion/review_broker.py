@@ -3,19 +3,33 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
+import hmac
 import json
 import os
 import pwd
 import re
+import secrets
 import socket
 import sqlite3
 import stat
 import struct
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn, cast
+from typing import Any, Literal, NoReturn, cast
 
+from pydantic import ValidationError
+
+from src.ingestion import quarantine_review as quarantine_review_module
+from src.ingestion.quarantine_review import (
+    QuarantineResolutionError,
+    ResolutionAnnotation,
+    VerifiedQuarantineResolutionAuthority,
+    append_resolution_event,
+)
 from src.ingestion.review import (
     CanonicalReviewRegistry,
     ReviewError,
@@ -26,9 +40,11 @@ from src.ingestion.review import (
 
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_AUTHORITY_BYTES = 16 * 1024 * 1024
+_MAX_ANNOTATION_MANIFEST_BYTES = 1024 * 1024
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _ACTOR_RE = re.compile(r"^uid:[0-9]{1,10}:[A-Za-z0-9_.-]{1,64}$")
 _MANIFEST_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,160}$")
+_ANNOTATION_MANIFEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,154}\.json$")
 _PEERCRED_SIZE = struct.calcsize("3i")
 
 
@@ -45,6 +61,36 @@ def _raise(code: str) -> NoReturn:
 
 
 @dataclass(frozen=True, slots=True)
+class QuarantineBrokerConfig:
+    """Root-fixed authority and allowlists for parser-quarantine decisions."""
+
+    sidecar: Path
+    annotation_manifest_root: Path
+    reviewer_uids: tuple[int, ...]
+    annotation_owner_uids: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.sidecar, Path)
+            or self.sidecar.anchor != os.sep
+            or not isinstance(self.annotation_manifest_root, Path)
+            or self.annotation_manifest_root.anchor != os.sep
+            or type(self.reviewer_uids) is not tuple
+            or not self.reviewer_uids
+            or type(self.annotation_owner_uids) is not tuple
+            or not self.annotation_owner_uids
+            or any(type(uid) is not int or uid <= 0 for uid in self.reviewer_uids)
+            or any(
+                type(uid) is not int or uid < 0 for uid in self.annotation_owner_uids
+            )
+            or self.reviewer_uids != tuple(sorted(set(self.reviewer_uids)))
+            or self.annotation_owner_uids
+            != tuple(sorted(set(self.annotation_owner_uids)))
+        ):
+            _raise("configuration_invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class BrokerConfig:
     """Immutable paths and external registry authority fixed by root."""
 
@@ -52,12 +98,17 @@ class BrokerConfig:
     registry: Path
     expected_registry_sha256: str
     manifest_root: Path
+    quarantine: QuarantineBrokerConfig | None = None
 
     def __post_init__(self) -> None:
         if (
             not isinstance(self.database, Path)
             or not isinstance(self.registry, Path)
             or not isinstance(self.manifest_root, Path)
+            or (
+                self.quarantine is not None
+                and type(self.quarantine) is not QuarantineBrokerConfig
+            )
             or type(self.expected_registry_sha256) is not str
             or _HASH_RE.fullmatch(self.expected_registry_sha256) is None
         ):
@@ -131,6 +182,550 @@ def read_request(peer: socket.socket) -> dict[str, object]:
     if failed or type(parsed) is not dict:
         _raise("request_invalid")
     return cast(dict[str, object], parsed)
+
+
+class _DuplicateManifestKey(ValueError):
+    pass
+
+
+def _unique_manifest_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    rendered: dict[str, object] = {}
+    for key, value in pairs:
+        if key in rendered:
+            raise _DuplicateManifestKey
+        rendered[key] = value
+    return rendered
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+@contextmanager
+def _held_absolute_parent(path: Path, *, error_code: str) -> Iterator[tuple[int, str]]:
+    descriptors: list[int] = []
+    failed = False
+    leaf = ""
+    try:
+        parts = path.parts
+        if (
+            path.anchor != os.sep
+            or not parts
+            or parts[0] != os.sep
+            or len(parts) < 2
+            or any(part in {"", ".", ".."} for part in parts[1:])
+        ):
+            failed = True
+        else:
+            leaf = parts[-1]
+            directory_flags = os.O_RDONLY | os.O_CLOEXEC
+            directory_flags |= getattr(os, "O_DIRECTORY", 0)
+            directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(os.sep, directory_flags)
+            descriptors.append(descriptor)
+            for component in parts[1:-1]:
+                descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=descriptors[-1],
+                )
+                details = os.fstat(descriptor)
+                if not stat.S_ISDIR(details.st_mode):
+                    os.close(descriptor)
+                    failed = True
+                    break
+                descriptors.append(descriptor)
+    except OSError:
+        failed = True
+    if failed or not descriptors or not leaf:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        _raise(error_code)
+    try:
+        yield descriptors[-1], leaf
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _read_stable_regular_at(
+    parent_descriptor: int,
+    leaf: str,
+    *,
+    max_bytes: int,
+    required_mode: int | None = None,
+    allowed_owner_uids: tuple[int, ...] | None = None,
+    forbid_group_other_write: bool = False,
+    error_code: str,
+) -> bytes:
+    descriptor: int | None = None
+    rendered: bytes | None = None
+    failed = False
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(leaf, flags, dir_fd=parent_descriptor)
+        before = os.fstat(descriptor)
+        mode = stat.S_IMODE(before.st_mode)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > max_bytes
+            or (required_mode is not None and mode != required_mode)
+            or (
+                allowed_owner_uids is not None
+                and before.st_uid not in allowed_owner_uids
+            )
+            or (forbid_group_other_write and mode & 0o022 != 0)
+        ):
+            failed = True
+        else:
+            remaining = max_bytes + 1
+            chunks: list[bytes] = []
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            rendered = b"".join(chunks)
+            if (
+                len(rendered) > max_bytes
+                or len(rendered) != before.st_size
+                or (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                    before.st_uid,
+                    mode,
+                )
+                != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                    after.st_uid,
+                    stat.S_IMODE(after.st_mode),
+                )
+            ):
+                failed = True
+    except OSError:
+        failed = True
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                failed = True
+    if failed or rendered is None:
+        _raise(error_code)
+    return rendered
+
+
+@dataclass(frozen=True, slots=True)
+class _AnnotationDecision:
+    occurrence_id: str
+    disposition: Literal["confirmed_noncase", "corrected"]
+    annotations: tuple[ResolutionAnnotation, ...]
+    event_id: str
+    occurred_at: str
+
+
+def _parse_annotation_manifest(raw: bytes) -> _AnnotationDecision:
+    parsed: object | None = None
+    decision: _AnnotationDecision | None = None
+    try:
+        parsed = json.loads(
+            raw.decode("ascii"), object_pairs_hook=_unique_manifest_object
+        )
+        if type(parsed) is not dict or _canonical_json_bytes(parsed) != raw:
+            raise ValueError
+        payload = cast(dict[str, object], parsed)
+        if set(payload) != {
+            "annotations",
+            "disposition",
+            "event_id",
+            "occurred_at",
+            "occurrence_id",
+            "schema_version",
+        } or payload["schema_version"] != (
+            "sen-qa-parser-quarantine-annotation-manifest/v1"
+        ):
+            raise ValueError
+        raw_annotations = payload["annotations"]
+        if type(raw_annotations) is not list:
+            raise ValueError
+        annotations: list[ResolutionAnnotation] = []
+        for value in raw_annotations:
+            if type(value) is not dict or set(value) != {"role", "source_span"}:
+                raise ValueError
+            source_span = value["source_span"]
+            if type(source_span) is not dict or set(source_span) != {
+                "bbox",
+                "page_label",
+                "pdf_page_index",
+                "text_sha256",
+            }:
+                raise ValueError
+            bbox = source_span["bbox"]
+            if type(bbox) is not list:
+                raise ValueError
+            annotations.append(
+                ResolutionAnnotation.model_validate(
+                    {
+                        "role": value["role"],
+                        "source_span": {**source_span, "bbox": tuple(bbox)},
+                    }
+                )
+            )
+        disposition = payload["disposition"]
+        occurrence_id = payload["occurrence_id"]
+        event_id = payload["event_id"]
+        occurred_at = payload["occurred_at"]
+        if (
+            disposition not in {"confirmed_noncase", "corrected"}
+            or type(occurrence_id) is not str
+            or type(event_id) is not str
+            or type(occurred_at) is not str
+        ):
+            raise ValueError
+        decision = _AnnotationDecision(
+            occurrence_id=occurrence_id,
+            disposition=disposition,
+            annotations=tuple(annotations),
+            event_id=event_id,
+            occurred_at=occurred_at,
+        )
+    except (
+        _DuplicateManifestKey,
+        KeyError,
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValidationError,
+        ValueError,
+    ):
+        decision = None
+    if decision is None:
+        _raise("annotation_manifest_invalid")
+    return decision
+
+
+def _annotation_decision(
+    config: QuarantineBrokerConfig,
+    *,
+    manifest_id: object,
+    expected_sha256: object,
+) -> _AnnotationDecision:
+    if (
+        type(manifest_id) is not str
+        or _ANNOTATION_MANIFEST_ID_RE.fullmatch(manifest_id) is None
+        or type(expected_sha256) is not str
+        or _HASH_RE.fullmatch(expected_sha256) is None
+    ):
+        _raise("annotation_manifest_invalid")
+    with _held_absolute_parent(
+        config.annotation_manifest_root / manifest_id,
+        error_code="annotation_manifest_invalid",
+    ) as (parent_descriptor, leaf):
+        raw = _read_stable_regular_at(
+            parent_descriptor,
+            leaf,
+            max_bytes=_MAX_ANNOTATION_MANIFEST_BYTES,
+            allowed_owner_uids=config.annotation_owner_uids,
+            forbid_group_other_write=True,
+            error_code="annotation_manifest_invalid",
+        )
+    if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), expected_sha256):
+        _raise("annotation_manifest_invalid")
+    return _parse_annotation_manifest(raw)
+
+
+def _sidecar_bytes(parent_descriptor: int, leaf: str) -> bytes:
+    return _read_stable_regular_at(
+        parent_descriptor,
+        leaf,
+        max_bytes=_MAX_AUTHORITY_BYTES,
+        required_mode=0o600,
+        allowed_owner_uids=(os.geteuid(),),
+        error_code="resolution_authority_invalid",
+    )
+
+
+@contextmanager
+def _exclusive_sidecar_lock(
+    parent_descriptor: int, sidecar_leaf: str
+) -> Iterator[None]:
+    lock_leaf = sidecar_leaf + ".lock"
+    descriptor: int | None = None
+    failed = False
+    try:
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NONBLOCK
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        for attempt in range(16):
+            try:
+                descriptor = os.open(
+                    lock_leaf,
+                    flags,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+            except FileNotFoundError:
+                if attempt == 15:
+                    raise
+                continue
+            break
+        if descriptor is None:
+            raise OSError
+        os.fchmod(descriptor, 0o600)
+        details = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or stat.S_IMODE(details.st_mode) != 0o600
+            or details.st_uid != os.geteuid()
+        ):
+            failed = True
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except OSError:
+        failed = True
+    if failed or descriptor is None:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        _raise("resolution_lock_invalid")
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _atomic_replace_sidecar(
+    parent_descriptor: int,
+    sidecar_leaf: str,
+    rendered: bytes,
+    *,
+    expected_current_sha256: str,
+) -> None:
+    descriptor: int | None = None
+    temporary_leaf: str | None = None
+    failed = False
+    try:
+        temporary_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        temporary_flags |= getattr(os, "O_NOFOLLOW", 0)
+        for _attempt in range(16):
+            candidate = f".senqa-quarantine-{secrets.token_hex(16)}.tmp"
+            try:
+                descriptor = os.open(
+                    candidate,
+                    temporary_flags,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+            except FileExistsError:
+                continue
+            temporary_leaf = candidate
+            break
+        if descriptor is None or temporary_leaf is None:
+            raise OSError
+        os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(rendered):
+            written = os.write(descriptor, rendered[offset:])
+            if written <= 0:
+                raise OSError
+            offset += written
+        os.fsync(descriptor)
+        details = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or stat.S_IMODE(details.st_mode) != 0o600
+            or details.st_uid != os.geteuid()
+            or details.st_size != len(rendered)
+        ):
+            raise OSError
+        os.close(descriptor)
+        descriptor = None
+        current = _sidecar_bytes(parent_descriptor, sidecar_leaf)
+        if not hmac.compare_digest(
+            hashlib.sha256(current).hexdigest(), expected_current_sha256
+        ):
+            _raise("resolution_head_stale")
+        os.replace(
+            temporary_leaf,
+            sidecar_leaf,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        temporary_leaf = None
+        os.fsync(parent_descriptor)
+    except BrokerError:
+        raise
+    except OSError:
+        failed = True
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary_leaf is not None:
+            try:
+                os.unlink(temporary_leaf, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+    if failed:
+        _raise("resolution_write_failed")
+
+
+def _resolution_authority_from_bytes(
+    raw: bytes, *, expected_sha256: str
+) -> VerifiedQuarantineResolutionAuthority:
+    authority: VerifiedQuarantineResolutionAuthority | None = None
+    try:
+        if _HASH_RE.fullmatch(expected_sha256) is None or not hmac.compare_digest(
+            hashlib.sha256(raw).hexdigest(), expected_sha256
+        ):
+            raise ValueError
+        quarantine_review_module._load_json(raw)
+        candidate = (
+            quarantine_review_module._QuarantineResolutionAuthority.model_validate_json(
+                raw
+            )
+        )
+        if candidate.to_bytes() != raw:
+            raise ValueError
+        authority = quarantine_review_module._verified_authority(
+            candidate, expected_sha256
+        )
+    except (
+        KeyError,
+        OverflowError,
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ):
+        authority = None
+    if authority is None:
+        _raise("resolution_authority_invalid")
+    return authority
+
+
+def _actor_uid(actor: str) -> int:
+    uid: int | None = None
+    try:
+        uid = int(actor.split(":", maxsplit=2)[1])
+    except (IndexError, TypeError, ValueError):
+        uid = None
+    if uid is None:
+        _raise("peer_not_authorized")
+    return uid
+
+
+def _dispatch_quarantine_resolution(
+    config: BrokerConfig,
+    request: dict[str, object],
+    *,
+    actor: str,
+) -> dict[str, object]:
+    quarantine = config.quarantine
+    if quarantine is None:
+        _raise("configuration_invalid")
+    _require_fields(
+        request,
+        {
+            "operation",
+            "expected_head_sha256",
+            "annotation_manifest_id",
+            "annotation_manifest_sha256",
+        },
+    )
+    expected_head = request["expected_head_sha256"]
+    if type(expected_head) is not str or _HASH_RE.fullmatch(expected_head) is None:
+        _raise("request_invalid")
+    uid = _actor_uid(actor)
+    if uid == 0 or uid not in quarantine.reviewer_uids:
+        _raise("peer_not_authorized")
+    with (
+        _held_absolute_parent(
+            quarantine.sidecar, error_code="resolution_lock_invalid"
+        ) as (sidecar_parent_descriptor, sidecar_leaf),
+        _exclusive_sidecar_lock(sidecar_parent_descriptor, sidecar_leaf),
+    ):
+        current_raw = _sidecar_bytes(sidecar_parent_descriptor, sidecar_leaf)
+        current_sha256 = hashlib.sha256(current_raw).hexdigest()
+        if not hmac.compare_digest(current_sha256, expected_head):
+            _raise("resolution_head_stale")
+        decision = _annotation_decision(
+            quarantine,
+            manifest_id=request["annotation_manifest_id"],
+            expected_sha256=request["annotation_manifest_sha256"],
+        )
+        authority = _resolution_authority_from_bytes(
+            current_raw, expected_sha256=current_sha256
+        )
+        if any(event.event_id == decision.event_id for event in authority.events):
+            _raise("resolution_replay")
+        updated: bytes | None = None
+        try:
+            updated = append_resolution_event(
+                authority,
+                occurrence_id=decision.occurrence_id,
+                disposition=decision.disposition,
+                annotations=decision.annotations,
+                actor_id=actor,
+                event_id=decision.event_id,
+                occurred_at=decision.occurred_at,
+            )
+        except QuarantineResolutionError:
+            updated = None
+        if updated is None:
+            _raise("resolution_decision_invalid")
+        updated_sha256 = hashlib.sha256(updated).hexdigest()
+        _atomic_replace_sidecar(
+            sidecar_parent_descriptor,
+            sidecar_leaf,
+            updated,
+            expected_current_sha256=current_sha256,
+        )
+        persisted = _sidecar_bytes(sidecar_parent_descriptor, sidecar_leaf)
+        if not hmac.compare_digest(
+            hashlib.sha256(persisted).hexdigest(), updated_sha256
+        ):
+            _raise("resolution_write_failed")
+    return {
+        "failed": 0,
+        "head_sha256": updated_sha256,
+        "status": "resolution_appended",
+        "updated": 1,
+    }
 
 
 def _read_regular(path: Path, *, error_code: str) -> bytes:
@@ -240,6 +835,8 @@ def dispatch_request(
     operation = request.get("operation")
     if type(operation) is not str:
         _raise("request_invalid")
+    if operation == "resolve-quarantine":
+        return _dispatch_quarantine_resolution(config, request, actor=actor)
     verified = _verified_registry(config)
     if not config.database.is_file() or config.database.is_symlink():
         _raise("database_invalid")
@@ -484,12 +1081,35 @@ def main() -> None:
     parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--registry-sha256", required=True)
     parser.add_argument("--manifest-root", type=Path, required=True)
+    parser.add_argument("--quarantine-sidecar", type=Path)
+    parser.add_argument("--annotation-manifest-root", type=Path)
+    parser.add_argument(
+        "--quarantine-reviewer-uid", type=int, action="append", default=[]
+    )
+    parser.add_argument("--annotation-owner-uid", type=int, action="append", default=[])
     arguments = parser.parse_args()
+    quarantine_values = (
+        arguments.quarantine_sidecar,
+        arguments.annotation_manifest_root,
+        arguments.quarantine_reviewer_uid,
+        arguments.annotation_owner_uid,
+    )
+    if any(quarantine_values) and not all(quarantine_values):
+        _raise("configuration_invalid")
+    quarantine = None
+    if all(quarantine_values):
+        quarantine = QuarantineBrokerConfig(
+            sidecar=arguments.quarantine_sidecar,
+            annotation_manifest_root=arguments.annotation_manifest_root,
+            reviewer_uids=tuple(sorted(set(arguments.quarantine_reviewer_uid))),
+            annotation_owner_uids=tuple(sorted(set(arguments.annotation_owner_uid))),
+        )
     config = BrokerConfig(
         database=arguments.database,
         registry=arguments.registry,
         expected_registry_sha256=arguments.registry_sha256,
         manifest_root=arguments.manifest_root,
+        quarantine=quarantine,
     )
     serve(arguments.socket, config)
 

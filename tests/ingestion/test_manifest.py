@@ -17,6 +17,7 @@ from src.cli import app
 from src.ingestion.extract_common import revalidate_source_document
 from src.ingestion.manifest import (
     ManifestError,
+    NativeReviewLayoutSegment,
     PageNumberingPolicy,
     SourceDocument,
     SourceManifest,
@@ -28,7 +29,9 @@ from src.ingestion.manifest import (
 
 MANIFEST_PATH = Path("data/manifests/sen_qa_sources.json")
 EXPECTED_EDITION_YEARS = (2020, 2021, 2022, 2023, 2024, 2025)
-SAFE_MANIFEST_ERROR = "manifest must contain exactly editions 2020 through 2025 in order"
+SAFE_MANIFEST_ERROR = (
+    "manifest must contain exactly editions 2020 through 2025 in order"
+)
 SENSITIVE_SENTINEL = "PRIVATE CASE CONTENT"
 
 
@@ -54,12 +57,31 @@ def _expected_document(path: Path, **updates: object) -> SourceDocument:
         "sha256": digest,
         "pdf_page_count": 1,
         "page_size_profiles": (
-            {"start_pdf_page": 1, "end_pdf_page": 1, "width_pt": 612.0, "height_pt": 792.0},
+            {
+                "start_pdf_page": 1,
+                "end_pdf_page": 1,
+                "width_pt": 612.0,
+                "height_pt": 792.0,
+            },
         ),
         "extraction_method": "native",
         "source_dpi": None,
         "render_dpi": None,
-        "page_numbering": {"mode": "offset", "body_start_pdf_page": 1, "body_end_pdf_page": 1, "offset": 0},
+        "page_numbering": {
+            "mode": "offset",
+            "body_start_pdf_page": 1,
+            "body_end_pdf_page": 1,
+            "offset": 0,
+        },
+        "native_review_layout_segments": (
+            {
+                "segment_id": "native-layout-fixture-body-v1",
+                "start_pdf_page": 1,
+                "end_pdf_page": 1,
+                "sampling_policy": "native-layout-sample",
+                "policy_version": "native-review-layout-segment-v1",
+            },
+        ),
         "official_public_url": None,
         "official_url_status": "unverified",
         "redistribution_status": "unverified",
@@ -86,6 +108,15 @@ def _document_payload_with_page_count(path: Path, page_count: int) -> dict[str, 
         "body_end_pdf_page": page_count,
         "offset": 0,
     }
+    payload["native_review_layout_segments"] = (
+        {
+            "segment_id": "native-layout-fixture-body-v1",
+            "start_pdf_page": 1,
+            "end_pdf_page": page_count,
+            "sampling_policy": "native-layout-sample",
+            "policy_version": "native-review-layout-segment-v1",
+        },
+    )
     return payload
 
 
@@ -126,7 +157,9 @@ def _assert_safe_cli_failure(result: Result, expected_summary: str) -> None:
     assert SENSITIVE_SENTINEL not in output
 
 
-def _write_fixture_corpus(tmp_path: Path, corrupt_year: int | None = None) -> tuple[Path, Path]:
+def _write_fixture_corpus(
+    tmp_path: Path, corrupt_year: int | None = None
+) -> tuple[Path, Path]:
     source_root = tmp_path / "sources"
     source_root.mkdir()
     documents: list[dict[str, object]] = []
@@ -137,9 +170,9 @@ def _write_fixture_corpus(tmp_path: Path, corrupt_year: int | None = None) -> tu
         else:
             _write_pdf(source)
         documents.append(
-            _expected_document(source, doc_id=f"fixture-{year}", edition_year=year).model_dump(
-                mode="json"
-            )
+            _expected_document(
+                source, doc_id=f"fixture-{year}", edition_year=year
+            ).model_dump(mode="json")
         )
     manifest = tmp_path / "manifest.json"
     _write_manifest(manifest, {"documents": documents})
@@ -151,6 +184,94 @@ def test_manifest_contains_exactly_2020_through_2025() -> None:
     docs = load_manifest(MANIFEST_PATH)
     assert [doc.edition_year for doc in docs] == [2020, 2021, 2022, 2023, 2024, 2025]
     assert [doc.pdf_page_count for doc in docs] == [302, 383, 386, 168, 324, 314]
+
+
+def test_native_review_segments_cover_each_native_body_exactly_once() -> None:
+    """Catches implicit, gapped, or overlapping native sample strata."""
+    documents = load_manifest(MANIFEST_PATH)
+
+    for document in documents[:3]:
+        assert document.native_review_layout_segments == (
+            NativeReviewLayoutSegment(
+                segment_id=f"native-layout-{document.edition_year}-body-v1",
+                start_pdf_page=document.page_numbering.body_start_pdf_page,
+                end_pdf_page=document.page_numbering.body_end_pdf_page,
+                sampling_policy="native-layout-sample",
+                policy_version="native-review-layout-segment-v1",
+            ),
+        )
+    assert all(not item.native_review_layout_segments for item in documents[3:])
+
+
+@pytest.mark.parametrize("mutation", ["missing", "gap", "overlap", "ocr"])
+def test_manifest_rejects_non_authoritative_native_review_segments(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Catches native ranges that do not form one exact manifest partition."""
+    payload = _manifest_payload()
+    documents = payload["documents"]
+    assert isinstance(documents, list)
+    native = documents[0]
+    assert isinstance(native, dict)
+    body = native["page_numbering"]
+    assert isinstance(body, dict)
+    start = body["body_start_pdf_page"]
+    end = body["body_end_pdf_page"]
+    assert isinstance(start, int)
+    assert isinstance(end, int)
+    if mutation == "missing":
+        native["native_review_layout_segments"] = []
+    elif mutation == "gap":
+        native["native_review_layout_segments"] = [
+            {
+                "segment_id": "native-layout-a",
+                "start_pdf_page": start,
+                "end_pdf_page": start,
+                "sampling_policy": "native-layout-sample",
+                "policy_version": "native-review-layout-segment-v1",
+            },
+            {
+                "segment_id": "native-layout-b",
+                "start_pdf_page": start + 2,
+                "end_pdf_page": end,
+                "sampling_policy": "native-layout-sample",
+                "policy_version": "native-review-layout-segment-v1",
+            },
+        ]
+    elif mutation == "overlap":
+        native["native_review_layout_segments"] = [
+            {
+                "segment_id": "native-layout-a",
+                "start_pdf_page": start,
+                "end_pdf_page": start + 1,
+                "sampling_policy": "native-layout-sample",
+                "policy_version": "native-review-layout-segment-v1",
+            },
+            {
+                "segment_id": "native-layout-b",
+                "start_pdf_page": start + 1,
+                "end_pdf_page": end,
+                "sampling_policy": "native-layout-sample",
+                "policy_version": "native-review-layout-segment-v1",
+            },
+        ]
+    else:
+        ocr = documents[3]
+        assert isinstance(ocr, dict)
+        ocr["native_review_layout_segments"] = [
+            {
+                "segment_id": "native-layout-ocr",
+                "start_pdf_page": 7,
+                "end_pdf_page": 167,
+                "sampling_policy": "native-layout-sample",
+                "policy_version": "native-review-layout-segment-v1",
+            }
+        ]
+    manifest = tmp_path / "manifest.json"
+    _write_manifest(manifest, payload)
+
+    with pytest.raises(ManifestError, match="manifest validation failed"):
+        load_manifest(manifest)
 
 
 def test_source_document_accepts_the_supported_page_count_ceiling(
@@ -325,7 +446,9 @@ def test_source_filename_mismatch_is_fatal(tmp_path: Path) -> None:
     """Catches accepting an approved hash under an unexpected filename."""
     source = tmp_path / "renamed.pdf"
     _write_pdf(source)
-    expected_doc = _expected_document(source).model_copy(update={"source_filename": "approved.pdf"})
+    expected_doc = _expected_document(source).model_copy(
+        update={"source_filename": "approved.pdf"}
+    )
 
     with pytest.raises(ManifestError, match="filename mismatch"):
         verify_source(source, expected_doc)
@@ -339,7 +462,12 @@ def test_source_page_count_mismatch_is_fatal(tmp_path: Path) -> None:
         source,
         pdf_page_count=2,
         page_size_profiles=(
-            {"start_pdf_page": 1, "end_pdf_page": 2, "width_pt": 612.0, "height_pt": 792.0},
+            {
+                "start_pdf_page": 1,
+                "end_pdf_page": 2,
+                "width_pt": 612.0,
+                "height_pt": 792.0,
+            },
         ),
     )
 
@@ -378,7 +506,9 @@ def test_source_read_error_is_translated_without_leaking_content(
     assert SENSITIVE_SENTINEL not in str(captured.value)
 
 
-def test_disappeared_source_is_translated_without_leaking_path_content(tmp_path: Path) -> None:
+def test_disappeared_source_is_translated_without_leaking_path_content(
+    tmp_path: Path,
+) -> None:
     """Catches a source removed after resolution escaping as FileNotFoundError."""
     source = tmp_path / "book.pdf"
     _write_pdf(source)
@@ -443,7 +573,9 @@ def test_source_symlink_cannot_escape_root(tmp_path: Path) -> None:
     outside = tmp_path / "outside.pdf"
     _write_pdf(outside)
     (source_root / "book.pdf").symlink_to(outside)
-    expected_doc = _expected_document(outside, source_filename="book.pdf", source_relpath="book.pdf")
+    expected_doc = _expected_document(
+        outside, source_filename="book.pdf", source_relpath="book.pdf"
+    )
 
     with pytest.raises(ManifestError, match="source root"):
         resolve_source(source_root, expected_doc)
@@ -477,7 +609,9 @@ def test_manifest_rejects_noncontiguous_page_profiles(tmp_path: Path) -> None:
 
 def test_page_label_returns_none_outside_body_and_never_negative() -> None:
     """Catches cover/TOC labels and negative labels leaking into citations."""
-    policy = PageNumberingPolicy(mode="offset", body_start_pdf_page=7, body_end_pdf_page=12, offset=-6)
+    policy = PageNumberingPolicy(
+        mode="offset", body_start_pdf_page=7, body_end_pdf_page=12, offset=-6
+    )
 
     assert page_label(policy, 1) is None
     assert page_label(policy, 7) == 1
@@ -490,7 +624,9 @@ def test_verify_sources_requires_source_root(monkeypatch: pytest.MonkeyPatch) ->
     """Catches an intake run that defaults to an arbitrary local directory."""
     monkeypatch.delenv("SEN_QA_SOURCE_ROOT", raising=False)
 
-    result = CliRunner().invoke(app, ["verify-sources", "--manifest", str(MANIFEST_PATH)])
+    result = CliRunner().invoke(
+        app, ["verify-sources", "--manifest", str(MANIFEST_PATH)]
+    )
 
     assert result.exit_code != 0
     assert "SEN_QA_SOURCE_ROOT" in result.stdout
@@ -563,7 +699,10 @@ def test_verify_sources_continues_after_source_symlink_loop(
     result = CliRunner().invoke(app, ["verify-sources", "--manifest", str(manifest)])
 
     _assert_safe_cli_failure(result, "verified=5 changed=0 failed=1")
-    assert "failed document=fixture-2022 reason=cannot resolve source path" in result.output
+    assert (
+        "failed document=fixture-2022 reason=cannot resolve source path"
+        in result.output
+    )
     assert "Symlink loop" not in result.output
 
 
@@ -597,16 +736,23 @@ def test_verify_sources_sanitizes_source_path_permission_errors(
     result = CliRunner().invoke(app, ["verify-sources", "--manifest", str(manifest)])
 
     _assert_safe_cli_failure(result, "verified=5 changed=0 failed=1")
-    assert "failed document=fixture-2022 reason=cannot resolve source path" in result.output
+    assert (
+        "failed document=fixture-2022 reason=cannot resolve source path"
+        in result.output
+    )
 
 
-def test_verify_sources_reports_mismatch_without_content(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_verify_sources_reports_mismatch_without_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Catches a failed intake being reported as success or exposing PDF text."""
     source_root = tmp_path / "sources"
     source_root.mkdir()
     monkeypatch.setenv("SEN_QA_SOURCE_ROOT", str(source_root))
 
-    result = CliRunner().invoke(app, ["verify-sources", "--manifest", str(MANIFEST_PATH)])
+    result = CliRunner().invoke(
+        app, ["verify-sources", "--manifest", str(MANIFEST_PATH)]
+    )
 
     assert result.exit_code != 0
     assert "verified=0" in result.stdout

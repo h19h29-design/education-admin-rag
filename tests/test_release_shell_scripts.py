@@ -8,6 +8,7 @@ import pytest
 
 SCRIPTS = (
     "build-corpus.sh",
+    "stage-review-corpus.sh",
     "finalize-corpus.sh",
     "build-indexes.sh",
     "evaluate-release.sh",
@@ -231,20 +232,18 @@ def test_index_script_builds_dense_candidate_and_index_attestation() -> None:
     assert "dense_index_driver_required" not in script
 
 
-def test_corpus_script_stages_review_registry_before_stopping() -> None:
+def test_legacy_corpus_builder_is_explicitly_blocked_before_extraction() -> None:
     script = Path("scripts/build-corpus.sh").read_text(encoding="utf-8")
 
-    assert "stage-review-corpus" in script
-    assert "--input-root /sen-qa/artifacts/raw-pages" in script
-    assert "--source-root" not in script
-    assert "stage=review_pending failed=0" in script
-    assert "candidate_review_bridge_required" not in script
+    assert "legacy_ocr_build_blocked" in script
+    assert "extract-ocr" not in script
+    assert "docker run" not in script
 
 
-def test_corpus_build_runs_every_container_as_the_release_operator(
+def test_legacy_corpus_builder_stops_before_any_container_or_release_write(
     tmp_path: Path,
 ) -> None:
-    """Catches mounted release directories being unwritable to the image UID."""
+    """Catches the obsolete all-Paddle path fabricating mixed OCR provenance."""
     environment = _release_environment(tmp_path)
     environment.update(
         {
@@ -256,21 +255,9 @@ def test_corpus_build_runs_every_container_as_the_release_operator(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_docker = fake_bin / "docker"
+    called = tmp_path / "docker-called"
     fake_docker.write_text(
-        """#!/usr/bin/env bash
-set -eu
-test "$1" = run
-shift
-found=0
-while test "$#" -gt 0; do
-  if test "$1" = --user && test "${2:-}" = "$SEN_QA_TEST_IDENTITY"; then
-    found=1
-    break
-  fi
-  shift
-done
-test "$found" = 1
-""",
+        f"#!/usr/bin/env bash\nprintf called > {called!s}\nexit 99\n",
         encoding="utf-8",
     )
     fake_docker.chmod(0o755)
@@ -286,8 +273,11 @@ test "$found" = 1
         timeout=10,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    assert "stage=review_pending failed=0" in completed.stdout
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "failed=1 error_code=legacy_ocr_build_blocked\n"
+    assert not called.exists()
+    assert not (tmp_path / "artifacts" / "releases" / RELEASE_ID).exists()
 
 
 def test_finalize_script_requires_external_review_and_runtime_pins() -> None:

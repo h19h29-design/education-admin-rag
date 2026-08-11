@@ -35,3 +35,8 @@ allows harmless PDF floating-point serialization rounding while still detecting
 changed media-box geometry. Front cover, contents, and trailing non-body pages
 map to no citation label; callers must use the documented per-source body range
 and offset instead of inventing a label.
+
+After all six PDFs pass intake, use
+[`local-vision-ocr.md`](local-vision-ocr.md) for the offline, reproducible 2024
+and 2025 Apple Vision extraction and mixed OCR authority lock. The legacy
+all-Paddle `build-corpus.sh` path is intentionally blocked.
