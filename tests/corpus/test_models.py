@@ -194,7 +194,15 @@ def _case_eligibility_is_valid(
 
 @pytest.mark.parametrize(
     ("case_type", "review_status", "pii_class", "search_eligible", "answer_eligible"),
-    list(product(("qa", "credits"), _REVIEW_STATUSES, _PII_CLASSES, (False, True), (False, True))),
+    list(
+        product(
+            ("qa", "credits"),
+            _REVIEW_STATUSES,
+            _PII_CLASSES,
+            (False, True),
+            (False, True),
+        )
+    ),
 )
 def test_case_eligibility_truth_table(
     case_payload: dict[str, object],
@@ -222,12 +230,16 @@ def test_case_eligibility_truth_table(
             answer_eligible,
         )
     else:
-        with pytest.raises(ValidationError, match="eligibility|public_credit|restricted|credits"):
+        with pytest.raises(
+            ValidationError, match="eligibility|public_credit|restricted|credits"
+        ):
             Case.model_validate(case_payload)
 
 
 @pytest.mark.parametrize("field", ["unknown", "answer_eligible"])
-def test_case_forbids_unknown_fields(case_payload: dict[str, object], field: str) -> None:
+def test_case_forbids_unknown_fields(
+    case_payload: dict[str, object], field: str
+) -> None:
     """Catches unreviewed fields silently entering canonical case records."""
     if field == "answer_eligible":
         case_payload["unknown"] = True
@@ -277,7 +289,9 @@ def test_document_rejects_reversed_source_period() -> None:
 
 def test_chunk_requires_parent_case_eligibility_shape() -> None:
     """Catches an answer chunk that is eligible while its search entry is not."""
-    with pytest.raises(ValidationError, match="answer eligibility requires search eligibility"):
+    with pytest.raises(
+        ValidationError, match="answer eligibility requires search eligibility"
+    ):
         Chunk.model_validate(
             {
                 "chunk_id": "senqa-2025-contract-contract-general-1-answer-01",
@@ -327,7 +341,9 @@ def test_chunk_privacy_and_eligibility_truth_table(
         chunk = Chunk.model_validate(payload)
         assert chunk.pii_class == pii_class
     else:
-        with pytest.raises(ValidationError, match="eligibility|public_credit|restricted"):
+        with pytest.raises(
+            ValidationError, match="eligibility|public_credit|restricted"
+        ):
             Chunk.model_validate(payload)
 
 
@@ -448,8 +464,75 @@ def test_ingestion_run_rejects_non_utc_or_reversed_times() -> None:
         IngestionRun.model_validate(reversed_times)
 
 
+def test_ingestion_run_roundtrips_exact_ocr_authority_hashes() -> None:
+    """Catches canonical storage dropping the reviewed OCR authority chain."""
+    lock_sha256 = "1" * 64
+    self_sha256 = "2" * 64
+    run = IngestionRun.model_validate(
+        _ingestion_run_payload(
+            ocr_engine_version=f"authority-lock:{lock_sha256}",
+            ocr_model_version=f"authority-self:{self_sha256}",
+            ocr_authority_lock_sha256=lock_sha256,
+            ocr_authority_self_sha256=self_sha256,
+        )
+    )
+
+    restored = IngestionRun.model_validate_json(run.model_dump_json())
+
+    assert restored == run
+    assert restored.ocr_authority_lock_sha256 == lock_sha256
+    assert restored.ocr_authority_self_sha256 == self_sha256
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {
+            "ocr_engine_version": "authority-lock:" + "1" * 64,
+            "ocr_model_version": "authority-self:" + "2" * 64,
+            "ocr_authority_lock_sha256": "1" * 64,
+        },
+        {
+            "ocr_engine_version": "authority-lock:" + "1" * 64,
+            "ocr_model_version": "authority-self:" + "2" * 64,
+            "ocr_authority_self_sha256": "2" * 64,
+        },
+        {
+            "ocr_engine_version": "paddle-1",
+            "ocr_model_version": "authority-self:" + "2" * 64,
+            "ocr_authority_lock_sha256": "1" * 64,
+            "ocr_authority_self_sha256": "2" * 64,
+        },
+        {
+            "ocr_engine_version": "authority-lock:" + "1" * 64,
+            "ocr_model_version": "korean-v1",
+            "ocr_authority_lock_sha256": "1" * 64,
+            "ocr_authority_self_sha256": "2" * 64,
+        },
+        {
+            "ocr_engine_version": "authority-lock:" + "1" * 64,
+            "ocr_model_version": "authority-self:" + "2" * 64,
+            "ocr_authority_lock_sha256": "A" * 64,
+            "ocr_authority_self_sha256": "2" * 64,
+        },
+        {
+            "ocr_engine_version": "authority-lock:" + "1" * 64,
+            "ocr_model_version": "authority-self:" + "2" * 64,
+            "ocr_authority_lock_sha256": True,
+            "ocr_authority_self_sha256": "2" * 64,
+        },
+    ],
+)
+def test_ingestion_run_rejects_incomplete_forged_or_unbound_ocr_authority(
+    updates: dict[str, object],
+) -> None:
+    """Catches authority downgrade, type confusion, and detached hash metadata."""
+    with pytest.raises(ValidationError, match="ocr_authority|authority"):
+        IngestionRun.model_validate(_ingestion_run_payload(**updates))
+
+
 def test_canonical_models_reject_python_scalar_coercion(
-    case_payload: dict[str, object]
+    case_payload: dict[str, object],
 ) -> None:
     """Catches booleans, integers, or strings being coerced across canonical scalar types."""
     bool_page = _span()
@@ -483,7 +566,9 @@ def test_strict_models_accept_iso_dates_and_datetimes_in_json_mode() -> None:
             "source_period_end": "2025-06-30",
         }
     )
-    assert Document.model_validate_json(document_json).source_period_start == date(2024, 7, 1)
+    assert Document.model_validate_json(document_json).source_period_start == date(
+        2024, 7, 1
+    )
 
     ingestion_json = json.dumps(
         {
@@ -492,7 +577,9 @@ def test_strict_models_accept_iso_dates_and_datetimes_in_json_mode() -> None:
             "ended_at": "2025-08-08T12:01:00Z",
         }
     )
-    assert IngestionRun.model_validate_json(ingestion_json).started_at.tzinfo is not None
+    assert (
+        IngestionRun.model_validate_json(ingestion_json).started_at.tzinfo is not None
+    )
 
 
 def test_exported_schemas_are_deterministic_and_validate_payloads(
@@ -501,10 +588,18 @@ def test_exported_schemas_are_deterministic_and_validate_payloads(
     """Catches schema drift or a JSON-schema contract that differs from Pydantic."""
     output = tmp_path / "schemas"
     runner = CliRunner()
-    assert runner.invoke(app, ["export-schemas", "--output", str(output)]).exit_code == 0
-    first = {path.name: path.read_bytes() for path in sorted(output.glob("*.schema.json"))}
-    assert runner.invoke(app, ["export-schemas", "--output", str(output)]).exit_code == 0
-    assert {path.name: path.read_bytes() for path in sorted(output.glob("*.schema.json"))} == first
+    assert (
+        runner.invoke(app, ["export-schemas", "--output", str(output)]).exit_code == 0
+    )
+    first = {
+        path.name: path.read_bytes() for path in sorted(output.glob("*.schema.json"))
+    }
+    assert (
+        runner.invoke(app, ["export-schemas", "--output", str(output)]).exit_code == 0
+    )
+    assert {
+        path.name: path.read_bytes() for path in sorted(output.glob("*.schema.json"))
+    } == first
 
     expected = {
         "document.schema.json",
@@ -529,10 +624,15 @@ def test_exported_schemas_are_deterministic_and_validate_payloads(
         jsonschema.Draft202012Validator(case_schema).validate(invalid)
 
 
-def test_exported_case_schema_enforces_the_full_eligibility_table(tmp_path: Path) -> None:
+def test_exported_case_schema_enforces_the_full_eligibility_table(
+    tmp_path: Path,
+) -> None:
     """Catches a JSONL consumer accepting a Case rejected by canonical validation."""
     output = tmp_path / "schemas"
-    assert CliRunner().invoke(app, ["export-schemas", "--output", str(output)]).exit_code == 0
+    assert (
+        CliRunner().invoke(app, ["export-schemas", "--output", str(output)]).exit_code
+        == 0
+    )
     schema = json.loads((output / "case.schema.json").read_text(encoding="utf-8"))
     validator = jsonschema.Draft202012Validator(schema)
     base = Case.model_validate(
@@ -565,7 +665,13 @@ def test_exported_case_schema_enforces_the_full_eligibility_table(tmp_path: Path
         }
     ).model_dump(mode="json")
 
-    for case_type, review_status, pii_class, search_eligible, answer_eligible in product(
+    for (
+        case_type,
+        review_status,
+        pii_class,
+        search_eligible,
+        answer_eligible,
+    ) in product(
         ("qa", "credits"), _REVIEW_STATUSES, _PII_CLASSES, (False, True), (False, True)
     ):
         payload = {
@@ -581,10 +687,15 @@ def test_exported_case_schema_enforces_the_full_eligibility_table(tmp_path: Path
         )
 
 
-def test_exported_chunk_schema_enforces_privacy_and_answer_dependency(tmp_path: Path) -> None:
+def test_exported_chunk_schema_enforces_privacy_and_answer_dependency(
+    tmp_path: Path,
+) -> None:
     """Catches a JSONL consumer accepting a sensitive or answer-only Chunk."""
     output = tmp_path / "schemas"
-    assert CliRunner().invoke(app, ["export-schemas", "--output", str(output)]).exit_code == 0
+    assert (
+        CliRunner().invoke(app, ["export-schemas", "--output", str(output)]).exit_code
+        == 0
+    )
     schema = json.loads((output / "chunk.schema.json").read_text(encoding="utf-8"))
     validator = jsonschema.Draft202012Validator(schema)
     base = {
@@ -621,7 +732,10 @@ def test_exported_chunk_schema_enforces_privacy_and_answer_dependency(tmp_path: 
 def test_exported_enum_schemas_reject_unreviewed_states(tmp_path: Path) -> None:
     """Catches schema consumers accepting unreviewed relation or currency states."""
     output = tmp_path / "schemas"
-    assert CliRunner().invoke(app, ["export-schemas", "--output", str(output)]).exit_code == 0
+    assert (
+        CliRunner().invoke(app, ["export-schemas", "--output", str(output)]).exit_code
+        == 0
+    )
     relation_schema = json.loads(
         (output / "case-relation.schema.json").read_text(encoding="utf-8")
     )
@@ -635,16 +749,23 @@ def test_exported_enum_schemas_reject_unreviewed_states(tmp_path: Path) -> None:
     }
     assert not jsonschema.Draft202012Validator(relation_schema).is_valid(relation)
 
-    law_schema = json.loads((output / "law-ref.schema.json").read_text(encoding="utf-8"))
+    law_schema = json.loads(
+        (output / "law-ref.schema.json").read_text(encoding="utf-8")
+    )
     law_ref = LawRef.model_validate(_law_ref_payload()).model_dump(mode="json")
     law_ref["currency_status"] = "latest"
     assert not jsonschema.Draft202012Validator(law_schema).is_valid(law_ref)
 
 
-def test_runtime_only_schema_annotations_state_the_true_boundary(tmp_path: Path) -> None:
+def test_runtime_only_schema_annotations_state_the_true_boundary(
+    tmp_path: Path,
+) -> None:
     """Catches relational runtime checks being mislabeled as JSON Schema enforcement."""
     output = tmp_path / "schemas"
-    assert CliRunner().invoke(app, ["export-schemas", "--output", str(output)]).exit_code == 0
+    assert (
+        CliRunner().invoke(app, ["export-schemas", "--output", str(output)]).exit_code
+        == 0
+    )
     case_schema = json.loads((output / "case.schema.json").read_text(encoding="utf-8"))
     bbox_comment = case_schema["$defs"]["SourceSpan"]["$comment"]
     assert bbox_comment == (
@@ -736,9 +857,9 @@ def test_committed_schemas_are_a_byte_for_byte_clean_export(tmp_path: Path) -> N
     result = CliRunner().invoke(app, ["export-schemas", "--output", str(output)])
     assert result.exit_code == 0
     committed = Path("data/schemas")
-    assert {path.name: path.read_bytes() for path in sorted(committed.glob("*.schema.json"))} == {
-        path.name: path.read_bytes() for path in sorted(output.glob("*.schema.json"))
-    }
+    assert {
+        path.name: path.read_bytes() for path in sorted(committed.glob("*.schema.json"))
+    } == {path.name: path.read_bytes() for path in sorted(output.glob("*.schema.json"))}
 
 
 def test_export_overwrites_stale_managed_schema(tmp_path: Path) -> None:
@@ -749,4 +870,7 @@ def test_export_overwrites_stale_managed_schema(tmp_path: Path) -> None:
     stale.write_text("{}\n", encoding="utf-8")
     result = CliRunner().invoke(app, ["export-schemas", "--output", str(output)])
     assert result.exit_code == 0
-    assert json.loads(stale.read_text(encoding="utf-8"))["$id"] == "data/schemas/case.schema.json"
+    assert (
+        json.loads(stale.read_text(encoding="utf-8"))["$id"]
+        == "data/schemas/case.schema.json"
+    )

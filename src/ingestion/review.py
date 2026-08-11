@@ -43,6 +43,7 @@ _SNAPSHOT_COMPLETE_ERROR = (
     "review registry requires a complete terminal decision snapshot"
 )
 _SNAPSHOT_INVALID_ERROR = "review decision snapshot is invalid"
+_RESTRICTED_APPROVAL_ERROR = "restricted candidate cannot be approved"
 _TERMINAL_STATES = {"approved", "rejected"}
 _OS_ACTOR_PATTERN = re.compile(r"^uid:([0-9]+):")
 _INVALID_DUPLICATE_PAGE = re.compile(r"(?:^|-)p0(?:-|$)")
@@ -1261,6 +1262,19 @@ class ReviewStore:
             raise ReviewNotFoundError("case is not in review queue")
         return _record_from_row(row)
 
+    def _assert_candidate_approvable(self, case_id: str) -> None:
+        restricted = self._connection.execute(
+            """
+            SELECT 1
+            FROM canonical_review_locations
+            WHERE case_id = ? AND reason_code = 'restricted-pii'
+            LIMIT 1
+            """,
+            (case_id,),
+        ).fetchone()
+        if restricted is not None:
+            raise ReviewValidationError(_RESTRICTED_APPROVAL_ERROR) from None
+
     def events(self, case_id: str) -> tuple[ReviewEvent, ...]:
         _validate_case_id(case_id)
         rows = self._connection.execute(
@@ -1531,6 +1545,7 @@ class ReviewStore:
             raise ReviewConflictError("stale expected state")
         if record.critical_field_review != "verified":
             raise ReviewValidationError("critical fields must be verified")
+        self._assert_candidate_approvable(case_id)
         now = _format_utc(self._clock())
         self._append_event(
             case_id=case_id,
@@ -1599,6 +1614,7 @@ class ReviewStore:
         self._check_state(record, expected_state)
         if expected_state != "search_approved":
             raise ReviewConflictError("stale expected state")
+        self._assert_candidate_approvable(case_id)
         if any(
             _same_reviewer_identity(prior, reviewer_id)
             for prior in (record.critical_reviewer_id, record.search_reviewer_id)

@@ -71,6 +71,24 @@ class PageNumberingPolicy(BaseModel):
         return self
 
 
+class NativeReviewLayoutSegment(BaseModel):
+    """Manifest-authoritative native layout stratum for sampled review."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+
+    segment_id: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,160}$")
+    start_pdf_page: int = Field(ge=1)
+    end_pdf_page: int = Field(ge=1)
+    sampling_policy: Literal["native-layout-sample"]
+    policy_version: Literal["native-review-layout-segment-v1"]
+
+    @model_validator(mode="after")
+    def has_ordered_page_range(self) -> NativeReviewLayoutSegment:
+        if self.end_pdf_page < self.start_pdf_page:
+            raise ValueError("native review segment end precedes start")
+        return self
+
+
 class SourceDocument(BaseModel):
     """The complete approved contract for one original source PDF."""
 
@@ -92,6 +110,7 @@ class SourceDocument(BaseModel):
     source_dpi: int | None = Field(default=None, gt=0)
     render_dpi: int | None = Field(default=None, gt=0)
     page_numbering: PageNumberingPolicy
+    native_review_layout_segments: tuple[NativeReviewLayoutSegment, ...] = ()
     official_public_url: AnyHttpUrl | None
     official_url_status: Literal["unverified", "verified", "unavailable"]
     redistribution_status: Literal["unverified", "approved", "denied"]
@@ -117,6 +136,26 @@ class SourceDocument(BaseModel):
             raise ValueError("page-size profiles must end at the PDF page count")
         if self.page_numbering.body_end_pdf_page > self.pdf_page_count:
             raise ValueError("body page range exceeds the PDF page count")
+
+        segments = self.native_review_layout_segments
+        if self.extraction_method == "ocr" and segments:
+            raise ValueError("OCR sources cannot declare native review segments")
+        if self.extraction_method == "native" and (
+            self.edition_year in {2020, 2021, 2022} or segments
+        ):
+            if not segments:
+                raise ValueError("native source requires review layout segments")
+            if len({segment.segment_id for segment in segments}) != len(segments):
+                raise ValueError("native review segment identifiers must be unique")
+            expected_page = self.page_numbering.body_start_pdf_page
+            for segment in segments:
+                if segment.start_pdf_page != expected_page:
+                    raise ValueError(
+                        "native review segments must partition the body exactly"
+                    )
+                expected_page = segment.end_pdf_page + 1
+            if expected_page - 1 != self.page_numbering.body_end_pdf_page:
+                raise ValueError("native review segments must end at the body boundary")
 
         relative = PurePath(self.source_relpath)
         if relative.is_absolute() or ".." in relative.parts:

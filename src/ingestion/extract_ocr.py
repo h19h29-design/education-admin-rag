@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import importlib
 import inspect
 import json
 import math
 import os
 import re
+import stat
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
@@ -326,6 +328,13 @@ class OcrAdapter(Protocol):
         """Return measured OCR lines for a complete rendered page."""
 
 
+class RuntimeBoundOcrAdapter(OcrAdapter, Protocol):
+    """OCR adapter that reports the complete runtime used for this run."""
+
+    def complete_runtime_provenance_bytes(self) -> bytes:
+        """Return canonical complete Apple Vision runtime provenance bytes."""
+
+
 def _infer_field_type(text: str) -> FieldType:
     compact = text.strip()
     if "문서번호" in compact or re.match(r"^[가-힣]+\s*\d{4}-\d+", compact):
@@ -472,6 +481,85 @@ class LayoutSegmentProvenance(BaseModel):
         return self
 
 
+class AppleVisionRuntimeProvenance(BaseModel):
+    """Complete local runtime identity accepted by v3 Apple Vision records."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    schema_version: Literal["sen-qa-apple-vision-runtime-provenance/v2"]
+    engine: Literal["apple-vision"]
+    request_revision: Literal[3]
+    language: Literal["ko-KR"]
+    recognition_level: Literal["accurate"]
+    uses_language_correction: Literal[True]
+    macos_build: str = Field(min_length=1, max_length=256)
+    architecture: str = Field(min_length=1, max_length=64)
+    swift_version: str = Field(min_length=1, max_length=128)
+    sdk_version: str = Field(min_length=1, max_length=128)
+    helper_source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    helper_binary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    adapter_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    extractor_pipeline_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    pymupdf_version: str = Field(min_length=1, max_length=64)
+
+
+class _DuplicateRuntimeKey(ValueError):
+    pass
+
+
+def _unique_runtime_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateRuntimeKey
+        result[key] = value
+    return result
+
+
+def _canonical_runtime_provenance_bytes(
+    provenance: AppleVisionRuntimeProvenance,
+) -> bytes:
+    return (
+        json.dumps(
+            provenance.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def build_apple_vision_runtime_provenance(
+    attestation_bytes: bytes,
+) -> AppleVisionRuntimeProvenance:
+    """Build complete provenance only from its canonical, duplicate-free bytes."""
+    provenance: AppleVisionRuntimeProvenance | None = None
+    try:
+        if type(attestation_bytes) is not bytes:
+            raise ValueError
+        payload = json.loads(
+            attestation_bytes.decode("ascii"),
+            object_pairs_hook=_unique_runtime_object,
+        )
+        if type(payload) is not dict:
+            raise ValueError
+        provenance = AppleVisionRuntimeProvenance.model_validate(payload)
+        if _canonical_runtime_provenance_bytes(provenance) != attestation_bytes:
+            raise ValueError
+    except (UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        provenance = None
+    if provenance is None:
+        raise OcrExtractionError("Apple Vision runtime provenance is invalid")
+    return provenance
+
+
 class ExtractedOcrPageRecord(BaseModel):
     """Successful OCR page with immutable source, raster, and review provenance."""
 
@@ -607,7 +695,193 @@ class QuarantinedOcrPageRecord(BaseModel):
         return self
 
 
+_APPLE_VISION_RECORD_HASH_PREFIX: Final = b"sen-qa-apple-vision-page-record-v3\0"
+
+
+def _fingerprint_json_default(value: object) -> object:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    raise TypeError
+
+
+def apple_vision_record_fingerprint_sha256(
+    unsigned_payload: dict[str, object],
+) -> str:
+    """Hash one unsigned v3 record with a domain-separated canonical encoding."""
+    rendered: bytes | None = None
+    try:
+        if (
+            type(unsigned_payload) is not dict
+            or "fingerprint_sha256" in unsigned_payload
+        ):
+            raise ValueError
+        rendered = (
+            json.dumps(
+                unsigned_payload,
+                default=_fingerprint_json_default,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        rendered = None
+    if rendered is None:
+        raise OcrExtractionError("Apple Vision page record is invalid")
+    return hashlib.sha256(_APPLE_VISION_RECORD_HASH_PREFIX + rendered).hexdigest()
+
+
+class ExtractedAppleVisionOcrPageRecord(BaseModel):
+    """Successful local Apple Vision page bound to its complete runtime and content."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, hide_input_in_errors=True
+    )
+
+    schema_version: Literal[3]
+    status: Literal["extracted"] = "extracted"
+    doc_id: str
+    edition_year: Literal[2024, 2025]
+    pdf_page_index: int = Field(ge=1)
+    page_label: str | None
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    render_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    render_dpi: int = Field(gt=0)
+    runtime_provenance: AppleVisionRuntimeProvenance
+    quality_flags: tuple[str, ...]
+    raw_page: RawPage
+    layout_segment_provenance: LayoutSegmentProvenance | None
+    review_queue: tuple[ReviewEntry, ...]
+    critical_review_policy: Literal[
+        "all-fields-human-verification", "stratified-sample-with-layout-escalation"
+    ]
+    critical_fields: tuple[CriticalFieldStatus, ...]
+    review_status: Literal["needs_review", "machine_extracted"]
+    search_eligible: Literal[False] = False
+    answer_eligible: Literal[False] = False
+    fingerprint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def has_matching_raw_provenance_and_fingerprint(
+        self,
+    ) -> ExtractedAppleVisionOcrPageRecord:
+        policy = ocr_policy(self.edition_year)
+        if (
+            self.render_dpi != policy.render_dpi
+            or self.quality_flags != policy.quality_flags
+        ):
+            raise ValueError("OCR run provenance does not match edition policy")
+        if (
+            self.doc_id != self.raw_page.doc_id
+            or self.edition_year != self.raw_page.edition_year
+            or self.pdf_page_index != self.raw_page.pdf_page_index
+            or self.page_label != self.raw_page.page_label
+            or self.render_sha256 != self.raw_page.render_sha256
+            or self.raw_page.extraction_source != "ocr"
+        ):
+            raise ValueError("OCR page envelope does not match raw provenance")
+        if self.raw_page.layout_evidence.status == "not_applicable":
+            raise ValueError("OCR page layout evidence does not match edition policy")
+        evidence = self.raw_page.layout_evidence
+        if evidence.status in {"failed", "not_detected", "detected"} and (
+            evidence.detector_version != APPROVED_LAYOUT_DETECTOR_VERSION
+        ):
+            raise ValueError("OCR page layout detector is not approved")
+        registry_entry = APPROVED_LAYOUT_SEGMENT_REGISTRY.get(self.edition_year)
+        expected_segment = (
+            _layout_segment_provenance(
+                self.edition_year,
+                self.raw_page,
+                source_sha256=self.source_sha256,
+                segment_start_pdf_page=registry_entry.segment_start_pdf_page,
+                segment_end_pdf_page=registry_entry.segment_end_pdf_page,
+            )
+            if registry_entry is not None
+            else None
+        )
+        if self.layout_segment_provenance != expected_segment:
+            raise ValueError(
+                "OCR layout segment provenance does not match raw evidence"
+            )
+        (
+            expected_critical_policy,
+            expected_critical_fields,
+            expected_review_status,
+        ) = _critical_review(
+            self.edition_year,
+            evidence,
+            registry_segment_available=expected_segment is not None,
+        )
+        if (
+            self.critical_review_policy != expected_critical_policy
+            or self.critical_fields != expected_critical_fields
+            or self.review_status != expected_review_status
+        ):
+            raise ValueError(
+                "OCR critical review status does not match fail-closed policy"
+            )
+        expected_review_queue = _review_queue_from_raw_page(
+            self.raw_page,
+            source_sha256=self.source_sha256,
+        )
+        if self.review_queue != expected_review_queue:
+            raise ValueError("OCR review queue does not match raw provenance")
+        expected_fingerprint = apple_vision_record_fingerprint_sha256(
+            self.model_dump(mode="json", exclude={"fingerprint_sha256"})
+        )
+        if not hmac.compare_digest(expected_fingerprint, self.fingerprint_sha256):
+            raise ValueError("Apple Vision page record fingerprint does not match")
+        return self
+
+
+class QuarantinedAppleVisionOcrPageRecord(BaseModel):
+    """Value-free local Apple Vision page failure bound to its complete runtime."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, hide_input_in_errors=True
+    )
+
+    schema_version: Literal[3]
+    status: Literal["quarantined"] = "quarantined"
+    doc_id: str
+    edition_year: Literal[2024, 2025]
+    pdf_page_index: int = Field(ge=1)
+    page_label: str | None
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    render_sha256: str | None = Field(pattern=r"^[0-9a-f]{64}$")
+    render_dpi: int = Field(gt=0)
+    runtime_provenance: AppleVisionRuntimeProvenance
+    quality_flags: tuple[str, ...]
+    reason_code: Literal[
+        "page-render-failed", "ocr-adapter-failed", "ocr-provenance-invalid"
+    ]
+    fingerprint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def matches_edition_policy_and_fingerprint(
+        self,
+    ) -> QuarantinedAppleVisionOcrPageRecord:
+        policy = ocr_policy(self.edition_year)
+        if (
+            self.render_dpi != policy.render_dpi
+            or self.quality_flags != policy.quality_flags
+        ):
+            raise ValueError("OCR run provenance does not match edition policy")
+        if (self.reason_code == "page-render-failed") != (self.render_sha256 is None):
+            raise ValueError("OCR quarantine reason does not match render provenance")
+        expected_fingerprint = apple_vision_record_fingerprint_sha256(
+            self.model_dump(mode="json", exclude={"fingerprint_sha256"})
+        )
+        if not hmac.compare_digest(expected_fingerprint, self.fingerprint_sha256):
+            raise ValueError("Apple Vision page record fingerprint does not match")
+        return self
+
+
 OcrPageRecord: TypeAlias = ExtractedOcrPageRecord | QuarantinedOcrPageRecord
+AppleVisionOcrPageRecord: TypeAlias = (
+    ExtractedAppleVisionOcrPageRecord | QuarantinedAppleVisionOcrPageRecord
+)
 
 
 def _revalidate_review_entry(value: object) -> ReviewEntry | None:
@@ -692,9 +966,147 @@ def _revalidate_ocr_record(value: object) -> OcrPageRecord | None:
         return None
 
 
+def _revalidate_apple_vision_runtime(
+    value: object,
+) -> AppleVisionRuntimeProvenance | None:
+    fields = exact_declared_field_mapping(value, AppleVisionRuntimeProvenance)
+    if fields is None:
+        return None
+    try:
+        return AppleVisionRuntimeProvenance.model_validate(fields)
+    except (TypeError, ValueError):
+        return None
+
+
+def _revalidate_apple_vision_record(
+    value: object,
+) -> AppleVisionOcrPageRecord | None:
+    model: type[ExtractedAppleVisionOcrPageRecord | QuarantinedAppleVisionOcrPageRecord]
+    if type(value) is ExtractedAppleVisionOcrPageRecord:
+        model = ExtractedAppleVisionOcrPageRecord
+    elif type(value) is QuarantinedAppleVisionOcrPageRecord:
+        model = QuarantinedAppleVisionOcrPageRecord
+    else:
+        return None
+    fields = exact_declared_field_mapping(value, model)
+    if fields is None:
+        return None
+    runtime = _revalidate_apple_vision_runtime(fields["runtime_provenance"])
+    if runtime is None:
+        return None
+    fields["runtime_provenance"] = runtime
+    if model is ExtractedAppleVisionOcrPageRecord:
+        raw_page = revalidate_raw_page(fields["raw_page"])
+        raw_review_queue = fields["review_queue"]
+        raw_critical_fields = fields["critical_fields"]
+        raw_segment = fields["layout_segment_provenance"]
+        if (
+            raw_page is None
+            or type(raw_review_queue) is not tuple
+            or type(raw_critical_fields) is not tuple
+        ):
+            return None
+        review_queue = tuple(
+            _revalidate_review_entry(item) for item in raw_review_queue
+        )
+        critical_fields = tuple(
+            _revalidate_critical_field(item) for item in raw_critical_fields
+        )
+        if any(item is None for item in review_queue + critical_fields):
+            return None
+        if raw_segment is None:
+            segment = None
+        else:
+            segment = _revalidate_layout_segment(raw_segment)
+            if segment is None:
+                return None
+        fields["raw_page"] = raw_page
+        fields["review_queue"] = tuple(
+            item for item in review_queue if item is not None
+        )
+        fields["critical_fields"] = tuple(
+            item for item in critical_fields if item is not None
+        )
+        fields["layout_segment_provenance"] = segment
+    try:
+        return model.model_validate(fields)
+    except (TypeError, ValueError):
+        return None
+
+
+def validate_apple_vision_ocr_page_record(
+    value: object,
+) -> AppleVisionOcrPageRecord:
+    """Return a recursively rebuilt v3 record or a value-free boundary error."""
+    record = _revalidate_apple_vision_record(value)
+    if record is None:
+        raise OcrExtractionError("Apple Vision page record is invalid")
+    return record
+
+
 def validate_ocr_page_record(value: object) -> OcrPageRecord:
     """Return a recursively rebuilt record or raise a value-free boundary error."""
     record = _revalidate_ocr_record(value)
+    if record is None:
+        raise OcrExtractionError("OCR page record is invalid")
+    return record
+
+
+ParsedOcrPageRecord: TypeAlias = OcrPageRecord | AppleVisionOcrPageRecord
+
+
+def _reject_nonfinite_json(_: str) -> None:
+    raise ValueError
+
+
+def parse_ocr_page_record(value: bytes | dict[str, object]) -> ParsedOcrPageRecord:
+    """Parse one exact v2/v3 schema-status pair without exposing rejected values."""
+    record: ParsedOcrPageRecord | None = None
+    try:
+        if type(value) is bytes:
+            payload = json.loads(
+                value.decode("utf-8"),
+                object_pairs_hook=_unique_runtime_object,
+                parse_constant=_reject_nonfinite_json,
+            )
+        elif type(value) is dict:
+            payload = value
+        else:
+            raise ValueError
+        if type(payload) is not dict:
+            raise ValueError
+        schema_version = payload.get("schema_version")
+        status = payload.get("status")
+        if type(schema_version) is not int or type(status) is not str:
+            raise ValueError
+        dispatch: dict[tuple[int, str], type[BaseModel]] = {
+            (2, "extracted"): ExtractedOcrPageRecord,
+            (2, "quarantined"): QuarantinedOcrPageRecord,
+            (3, "extracted"): ExtractedAppleVisionOcrPageRecord,
+            (3, "quarantined"): QuarantinedAppleVisionOcrPageRecord,
+        }
+        model = dispatch[(schema_version, status)]
+        normalized = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("ascii")
+        parsed = model.model_validate_json(normalized)
+        if type(parsed) in (ExtractedOcrPageRecord, QuarantinedOcrPageRecord):
+            record = validate_ocr_page_record(parsed)
+        else:
+            record = validate_apple_vision_ocr_page_record(parsed)
+    except (
+        KeyError,
+        UnicodeError,
+        json.JSONDecodeError,
+        OcrExtractionError,
+        TypeError,
+        ValueError,
+    ):
+        record = None
     if record is None:
         raise OcrExtractionError("OCR page record is invalid")
     return record
@@ -1719,3 +2131,653 @@ def extract_ocr_document(
             pdf.close()
         except DOCUMENT_IO_ERRORS:
             raise OcrExtractionError("cannot close approved OCR source PDF") from None
+
+
+_APPLE_VISION_SOURCE_DPI: Final[Mapping[int, int]] = MappingProxyType(
+    {2024: 150, 2025: 300}
+)
+_MAX_EXTRACTOR_PIPELINE_BYTES: Final = 4 * 1024 * 1024
+_MAX_APPLE_VISION_SOURCE_PDF_BYTES: Final = 256 * 1024 * 1024
+
+
+def _live_extractor_pipeline_sha256() -> str | None:
+    """Hash this exact regular source file through one stable no-follow descriptor."""
+    filename = __file__
+    if (
+        type(filename) is not str
+        or not hasattr(os, "O_NOFOLLOW")
+        or Path(filename).name != "extract_ocr.py"
+    ):
+        return None
+    source_path = Path(filename)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | os.O_NOFOLLOW
+    )
+    descriptor: int | None = None
+    digest: str | None = None
+    try:
+        descriptor = os.open(source_path, flags)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > _MAX_EXTRACTOR_PIPELINE_BYTES
+        ):
+            return None
+        hasher = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            hasher.update(chunk)
+            remaining -= len(chunk)
+        trailing = os.read(descriptor, 1)
+        after = os.fstat(descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if remaining == 0 and not trailing and identity_before == identity_after:
+            digest = hasher.hexdigest()
+    except (OSError, OverflowError, TypeError, ValueError):
+        digest = None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                digest = None
+    return digest
+
+
+def _read_verified_apple_vision_source_pdf(
+    source_path: Path, *, expected_sha256: str
+) -> bytes | None:
+    """Read the exact approved regular file once through a stable descriptor."""
+    if (
+        type(source_path) is not type(Path())
+        or type(expected_sha256) is not str
+        or _SHA256_RE.fullmatch(expected_sha256) is None
+        or not hasattr(os, "O_NOFOLLOW")
+    ):
+        return None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | os.O_NOFOLLOW
+    )
+    descriptor: int | None = None
+    candidate: bytes | None = None
+    try:
+        descriptor = os.open(source_path, flags)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > _MAX_APPLE_VISION_SOURCE_PDF_BYTES
+        ):
+            return None
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            digest.update(chunk)
+            remaining -= len(chunk)
+        trailing = os.read(descriptor, 1)
+        after = os.fstat(descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if (
+            remaining == 0
+            and not trailing
+            and identity_before == identity_after
+            and hmac.compare_digest(digest.hexdigest(), expected_sha256)
+        ):
+            candidate = b"".join(chunks)
+    except (OSError, OverflowError, TypeError, ValueError):
+        candidate = None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                candidate = None
+    return candidate
+
+
+def _approved_apple_vision_document(value: object) -> SourceDocument | None:
+    document = revalidate_source_document(value)
+    if document is None:
+        return None
+    registry_entry = APPROVED_LAYOUT_SEGMENT_REGISTRY.get(document.edition_year)
+    expected_source_dpi = _APPLE_VISION_SOURCE_DPI.get(document.edition_year)
+    policy = _OCR_POLICIES.get(document.edition_year)
+    if (
+        registry_entry is None
+        or expected_source_dpi is None
+        or policy is None
+        or document.extraction_method != "ocr"
+        or document.doc_id != registry_entry.doc_id
+        or document.sha256 != registry_entry.source_sha256
+        or document.source_dpi != expected_source_dpi
+        or document.render_dpi != policy.render_dpi
+        or document.pdf_page_count != registry_entry.segment_end_pdf_page + 1
+        or document.page_numbering.mode != "offset"
+        or document.page_numbering.body_start_pdf_page
+        != registry_entry.segment_start_pdf_page
+        or document.page_numbering.body_end_pdf_page
+        != registry_entry.segment_end_pdf_page
+        or document.page_numbering.offset != 0
+    ):
+        return None
+    return document
+
+
+def _approved_apple_vision_pages(
+    value: object, *, page_count: int
+) -> tuple[int, ...] | None:
+    if (
+        type(value) is not tuple
+        or not value
+        or any(type(index) is not int for index in value)
+    ):
+        return None
+    page_indexes = value
+    if (
+        tuple(sorted(page_indexes)) != page_indexes
+        or len(set(page_indexes)) != len(page_indexes)
+        or page_indexes[0] < 1
+        or page_indexes[-1] > page_count
+    ):
+        return None
+    return page_indexes
+
+
+def _adapter_runtime_provenance_bytes(
+    adapter: RuntimeBoundOcrAdapter,
+) -> bytes | None:
+    runtime_bytes: object | None = None
+    try:
+        method = adapter.complete_runtime_provenance_bytes
+        if callable(method):
+            runtime_bytes = method()
+    except (
+        AttributeError,
+        OcrAdapterError,
+        OcrExtractionError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        runtime_bytes = None
+    return runtime_bytes if type(runtime_bytes) is bytes else None
+
+
+def _apple_vision_quarantine_record(
+    *,
+    document: SourceDocument,
+    pdf_page_index: int,
+    page_label: str | None,
+    render_sha256: str | None,
+    runtime_provenance: AppleVisionRuntimeProvenance,
+    reason_code: Literal[
+        "page-render-failed", "ocr-adapter-failed", "ocr-provenance-invalid"
+    ],
+) -> QuarantinedAppleVisionOcrPageRecord:
+    policy = _OCR_POLICIES[document.edition_year]
+    unsigned: dict[str, object] = {
+        "schema_version": 3,
+        "status": "quarantined",
+        "doc_id": document.doc_id,
+        "edition_year": document.edition_year,
+        "pdf_page_index": pdf_page_index,
+        "page_label": page_label,
+        "source_sha256": document.sha256,
+        "render_sha256": render_sha256,
+        "render_dpi": policy.render_dpi,
+        "runtime_provenance": runtime_provenance,
+        "quality_flags": policy.quality_flags,
+        "reason_code": reason_code,
+    }
+    return QuarantinedAppleVisionOcrPageRecord.model_validate(
+        {
+            **unsigned,
+            "fingerprint_sha256": apple_vision_record_fingerprint_sha256(unsigned),
+        }
+    )
+
+
+def _apple_vision_extracted_record(
+    *,
+    document: SourceDocument,
+    pdf_page_index: int,
+    page_label: str | None,
+    render_sha256: str,
+    runtime_provenance: AppleVisionRuntimeProvenance,
+    raw_page: RawPage,
+    point_lines: tuple[AdapterLine, ...],
+    layout_segment: LayoutSegmentProvenance | None,
+    critical_policy: Literal[
+        "all-fields-human-verification", "stratified-sample-with-layout-escalation"
+    ],
+    critical_fields: tuple[CriticalFieldStatus, ...],
+    review_status: Literal["needs_review", "machine_extracted"],
+) -> ExtractedAppleVisionOcrPageRecord:
+    policy = _OCR_POLICIES[document.edition_year]
+    unsigned: dict[str, object] = {
+        "schema_version": 3,
+        "status": "extracted",
+        "doc_id": document.doc_id,
+        "edition_year": document.edition_year,
+        "pdf_page_index": pdf_page_index,
+        "page_label": page_label,
+        "source_sha256": document.sha256,
+        "render_sha256": render_sha256,
+        "render_dpi": policy.render_dpi,
+        "runtime_provenance": runtime_provenance,
+        "quality_flags": policy.quality_flags,
+        "raw_page": raw_page,
+        "layout_segment_provenance": layout_segment,
+        "review_queue": _review_queue(
+            point_lines,
+            source_sha256=document.sha256,
+            pdf_page_index=pdf_page_index,
+        ),
+        "critical_review_policy": critical_policy,
+        "critical_fields": critical_fields,
+        "review_status": review_status,
+        "search_eligible": False,
+        "answer_eligible": False,
+    }
+    return ExtractedAppleVisionOcrPageRecord.model_validate(
+        {
+            **unsigned,
+            "fingerprint_sha256": apple_vision_record_fingerprint_sha256(unsigned),
+        }
+    )
+
+
+def _revalidate_adapter_lines(value: object) -> tuple[AdapterLine, ...] | None:
+    if type(value) is not tuple:
+        return None
+    output: list[AdapterLine] = []
+    for raw_line in value:
+        fields = exact_declared_field_mapping(raw_line, AdapterLine)
+        if fields is None or type(fields["bbox"]) is not tuple:
+            return None
+        try:
+            output.append(AdapterLine.model_validate(fields))
+        except (TypeError, ValueError):
+            return None
+    return tuple(output)
+
+
+def _extract_apple_vision_pages(
+    pages: tuple[Any, ...],
+    *,
+    document: SourceDocument,
+    page_indexes: tuple[int, ...],
+    adapter: OcrAdapter,
+    runtime_provenance: AppleVisionRuntimeProvenance,
+) -> tuple[AppleVisionOcrPageRecord, ...]:
+    policy = _OCR_POLICIES[document.edition_year]
+    layout_detector = GreenCardBorderDetector()
+    records: list[AppleVisionOcrPageRecord] = []
+    for pdf_page_index in page_indexes:
+        label = printed_page_label(
+            document.edition_year,
+            pdf_page_index,
+            policy=document.page_numbering,
+        )
+        try:
+            page = pages[pdf_page_index - 1]
+            page_rect = page.rect
+            rotated_width = float(page_rect.width)
+            rotated_height = float(page_rect.height)
+            if (
+                not math.isfinite(rotated_width)
+                or not math.isfinite(rotated_height)
+                or rotated_width <= 0
+                or rotated_height <= 0
+            ):
+                raise ValueError("page point geometry is invalid")
+            derotation_matrix = page.derotation_matrix
+            pixmap = page.get_pixmap(dpi=policy.render_dpi, alpha=False)
+            if int(pixmap.n) != 3:
+                raise OSError("render did not produce RGB8")
+        except PAGE_EXTRACTION_ERRORS:
+            records.append(
+                _apple_vision_quarantine_record(
+                    document=document,
+                    pdf_page_index=pdf_page_index,
+                    page_label=label,
+                    render_sha256=None,
+                    runtime_provenance=runtime_provenance,
+                    reason_code="page-render-failed",
+                )
+            )
+            continue
+        render_sha256 = _render_hash(pixmap, render_dpi=policy.render_dpi)
+        raster_image = RasterImage(
+            width=int(pixmap.width),
+            height=int(pixmap.height),
+            rgb_bytes=bytes(pixmap.samples),
+        )
+        try:
+            adapter_lines = adapter.recognize(raster_image)
+        except OcrAdapterError:
+            records.append(
+                _apple_vision_quarantine_record(
+                    document=document,
+                    pdf_page_index=pdf_page_index,
+                    page_label=label,
+                    render_sha256=render_sha256,
+                    runtime_provenance=runtime_provenance,
+                    reason_code="ocr-adapter-failed",
+                )
+            )
+            continue
+        try:
+            validated_adapter_lines = _revalidate_adapter_lines(adapter_lines)
+            if validated_adapter_lines is None:
+                raise ValueError("Apple Vision adapter output is invalid")
+            ordered_pixel_lines = sort_reading_order(
+                validated_adapter_lines, page_width=float(pixmap.width)
+            )
+            point_lines, page_width, page_height = _scale_lines_to_pdf_points(
+                ordered_pixel_lines,
+                page_rect=page_rect,
+                derotation_matrix=derotation_matrix,
+                raster_width=int(pixmap.width),
+                raster_height=int(pixmap.height),
+            )
+            layout_evidence = _layout_evidence(
+                document.edition_year,
+                raster_image,
+                layout_detector,
+                page_rect=page_rect,
+                derotation_matrix=derotation_matrix,
+            )
+            raw_page = _raw_ocr_page(
+                document=document,
+                pdf_page_index=pdf_page_index,
+                page_label=label,
+                page_width=page_width,
+                page_height=page_height,
+                render_sha256=render_sha256,
+                lines=point_lines,
+                layout_evidence=layout_evidence,
+            )
+            layout_segment = _layout_segment_provenance(
+                document.edition_year,
+                raw_page,
+                source_sha256=document.sha256,
+                segment_start_pdf_page=document.page_numbering.body_start_pdf_page,
+                segment_end_pdf_page=document.page_numbering.body_end_pdf_page,
+            )
+            critical_policy, critical_fields, review_status = _critical_review(
+                document.edition_year,
+                layout_evidence,
+                registry_segment_available=layout_segment is not None,
+            )
+            record = _apple_vision_extracted_record(
+                document=document,
+                pdf_page_index=pdf_page_index,
+                page_label=label,
+                render_sha256=render_sha256,
+                runtime_provenance=runtime_provenance,
+                raw_page=raw_page,
+                point_lines=point_lines,
+                layout_segment=layout_segment,
+                critical_policy=critical_policy,
+                critical_fields=critical_fields,
+                review_status=review_status,
+            )
+        except (OcrExtractionError, TypeError, ValueError):
+            records.append(
+                _apple_vision_quarantine_record(
+                    document=document,
+                    pdf_page_index=pdf_page_index,
+                    page_label=label,
+                    render_sha256=render_sha256,
+                    runtime_provenance=runtime_provenance,
+                    reason_code="ocr-provenance-invalid",
+                )
+            )
+            continue
+        records.append(record)
+    return tuple(records)
+
+
+def extract_apple_vision_document(
+    source_path: Path,
+    document: SourceDocument,
+    page_indexes: tuple[int, ...],
+    adapter: RuntimeBoundOcrAdapter,
+    runtime_provenance: AppleVisionRuntimeProvenance,
+) -> tuple[AppleVisionOcrPageRecord, ...]:
+    """Extract approved 2024/2025 pages directly into runtime-bound v3 records."""
+    approved_document = _approved_apple_vision_document(document)
+    if approved_document is None:
+        raise OcrExtractionError("approved Apple Vision document contract is invalid")
+    approved_runtime = _revalidate_apple_vision_runtime(runtime_provenance)
+    runtime_bytes = (
+        _canonical_runtime_provenance_bytes(approved_runtime)
+        if approved_runtime is not None
+        else None
+    )
+    adapter_runtime_bytes = _adapter_runtime_provenance_bytes(adapter)
+    live_extractor_pipeline_sha256 = _live_extractor_pipeline_sha256()
+    if (
+        approved_runtime is None
+        or runtime_bytes is None
+        or adapter_runtime_bytes is None
+        or live_extractor_pipeline_sha256 is None
+        or not hmac.compare_digest(
+            approved_runtime.extractor_pipeline_sha256,
+            live_extractor_pipeline_sha256,
+        )
+        or not hmac.compare_digest(runtime_bytes, adapter_runtime_bytes)
+    ):
+        raise OcrExtractionError("Apple Vision runtime contract is invalid")
+    approved_pages = _approved_apple_vision_pages(
+        page_indexes, page_count=approved_document.pdf_page_count
+    )
+    if approved_pages is None:
+        raise OcrExtractionError("approved Apple Vision selected pages are invalid")
+    source_bytes = _read_verified_apple_vision_source_pdf(
+        source_path, expected_sha256=approved_document.sha256
+    )
+    if source_bytes is None:
+        raise OcrExtractionError(
+            "approved Apple Vision source PDF identity is invalid"
+        ) from None
+    pdf: Any | None = None
+    try:
+        import pymupdf
+
+        pdf = pymupdf.open(  # type: ignore[no-untyped-call]
+            stream=source_bytes, filetype="pdf"
+        )
+    except DOCUMENT_IO_ERRORS:
+        pdf = None
+    if pdf is None:
+        raise OcrExtractionError("cannot open approved Apple Vision source PDF")
+    records: tuple[AppleVisionOcrPageRecord, ...] | None = None
+    page_count_changed = False
+    close_failed = False
+    try:
+        if len(pdf) != approved_document.pdf_page_count:
+            page_count_changed = True
+        else:
+            pages = tuple(
+                pdf[index] for index in range(approved_document.pdf_page_count)
+            )
+            records = _extract_apple_vision_pages(
+                pages,
+                document=approved_document,
+                page_indexes=approved_pages,
+                adapter=adapter,
+                runtime_provenance=approved_runtime,
+            )
+    finally:
+        try:
+            pdf.close()  # type: ignore[no-untyped-call]
+        except DOCUMENT_IO_ERRORS:
+            close_failed = True
+    if close_failed:
+        raise OcrExtractionError("cannot close approved Apple Vision source PDF")
+    if page_count_changed:
+        raise OcrExtractionError("approved Apple Vision source page count changed")
+    if records is None:
+        raise OcrExtractionError("Apple Vision document extraction failed")
+    return records
+
+
+def write_apple_vision_jsonl(
+    output_path: Path,
+    records: tuple[AppleVisionOcrPageRecord, ...],
+    *,
+    document: SourceDocument,
+    expected_runtime_fingerprint: str,
+    selected_page_indexes: tuple[int, ...],
+) -> None:
+    """Atomically write one exact runtime-bound Apple Vision page selection."""
+    approved_document = _approved_apple_vision_document(document)
+    if approved_document is None:
+        raise OcrExtractionError("approved Apple Vision document contract is invalid")
+    approved_pages = _approved_apple_vision_pages(
+        selected_page_indexes,
+        page_count=approved_document.pdf_page_count,
+    )
+    if approved_pages is None:
+        raise OcrExtractionError("approved Apple Vision selected pages are invalid")
+    if (
+        type(expected_runtime_fingerprint) is not str
+        or _IMAGE_DIGEST_RE.fullmatch(expected_runtime_fingerprint) is None
+    ):
+        raise OcrExtractionError("Apple Vision runtime fingerprint is invalid")
+    if type(records) is not tuple:
+        raise OcrExtractionError("Apple Vision page records are invalid")
+    validated_records: list[AppleVisionOcrPageRecord] = []
+    records_are_valid = True
+    for value in records:
+        try:
+            record = _revalidate_apple_vision_record(value)
+        except (OcrExtractionError, TypeError, ValueError):
+            record = None
+        if record is None:
+            records_are_valid = False
+            break
+        validated_records.append(record)
+    if not records_are_valid:
+        raise OcrExtractionError("Apple Vision page records are invalid")
+    ordered = tuple(sorted(validated_records, key=lambda record: record.pdf_page_index))
+    if tuple(record.pdf_page_index for record in ordered) != approved_pages:
+        raise OcrExtractionError(
+            "Apple Vision page records do not match selected pages"
+        )
+    policy = _OCR_POLICIES[approved_document.edition_year]
+    expected_runtime_bytes: bytes | None = None
+    run_matches = True
+    for record in ordered:
+        runtime_bytes = _canonical_runtime_provenance_bytes(record.runtime_provenance)
+        runtime_fingerprint = "sha256:" + hashlib.sha256(runtime_bytes).hexdigest()
+        if expected_runtime_bytes is None:
+            expected_runtime_bytes = runtime_bytes
+        if (
+            record.doc_id != approved_document.doc_id
+            or record.edition_year != approved_document.edition_year
+            or record.source_sha256 != approved_document.sha256
+            or record.render_dpi != policy.render_dpi
+            or record.quality_flags != policy.quality_flags
+            or record.page_label
+            != printed_page_label(
+                approved_document.edition_year,
+                record.pdf_page_index,
+                policy=approved_document.page_numbering,
+            )
+            or not hmac.compare_digest(runtime_bytes, expected_runtime_bytes)
+            or not hmac.compare_digest(
+                runtime_fingerprint, expected_runtime_fingerprint
+            )
+        ):
+            run_matches = False
+            break
+    if not run_matches:
+        raise OcrExtractionError("Apple Vision page records do not match approved run")
+    rendered = "".join(
+        json.dumps(
+            record.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+        for record in ordered
+    )
+    temporary_name: str | None = None
+    write_failed = False
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            dir=output_path.parent,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(rendered)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, output_path)
+        temporary_name = None
+    except (OSError, TypeError, ValueError):
+        write_failed = True
+    if temporary_name is not None:
+        try:
+            os.unlink(temporary_name)
+        except OSError:
+            pass
+    if write_failed:
+        raise OcrExtractionError("cannot write Apple Vision extraction output")

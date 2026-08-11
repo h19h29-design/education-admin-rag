@@ -30,8 +30,10 @@ export SEN_QA_CANONICAL_DIR="$SEN_QA_ROOT/canonical"
 export SEN_QA_REGISTRY_FILE="$SEN_QA_CANONICAL_DIR/review-registry.json"
 export SEN_QA_REVIEW_STATE_DIR="$SEN_QA_ROOT/review-state"
 export SEN_QA_REVIEW_DB="$SEN_QA_REVIEW_STATE_DIR/review.sqlite3"
+export SEN_QA_QUARANTINE_SIDECAR="$SEN_QA_REVIEW_STATE_DIR/parser-quarantine-resolutions.json"
 export SEN_QA_QUEUE_DIR="$SEN_QA_ROOT/review-queue"
 export SEN_QA_CORRECTION_DIR="$SEN_QA_ROOT/corrections"
+export SEN_QA_ANNOTATION_DIR="$SEN_QA_ROOT/approved-quarantine-annotations"
 export SEN_QA_BROKER_DIR="$SEN_QA_ROOT/review-broker"
 export SEN_QA_BROKER_SOCKET="$SEN_QA_BROKER_DIR/review.sock"
 
@@ -40,6 +42,7 @@ export SEN_QA_REVIEW_GROUP='senqa-reviewer'
 export SEN_QA_SERVICE_GROUP='senqa-review-service'
 export SEN_QA_SERVICE_USER='<review-service-account>'
 export SEN_QA_REVIEWER_PROBE_USER='<reviewer-account>'
+export SEN_QA_SECOND_REVIEWER_PROBE_USER='<second-reviewer-account>'
 export SEN_QA_BROKER_CONTAINER='<root-managed-review-broker-container>'
 export SEN_QA_BROKER_IMAGE='<public-image>@sha256:<64-lowercase-hex>'
 export SEN_QA_DOCKER='/var/packages/ContainerManager/target/usr/bin/docker'
@@ -50,6 +53,7 @@ getent group "$SEN_QA_REVIEW_GROUP" >/dev/null
 getent group "$SEN_QA_SERVICE_GROUP" >/dev/null
 id "$SEN_QA_SERVICE_USER" >/dev/null
 id "$SEN_QA_REVIEWER_PROBE_USER" >/dev/null
+id "$SEN_QA_SECOND_REVIEWER_PROBE_USER" >/dev/null
 command -v setfacl >/dev/null
 command -v getfacl >/dev/null
 command -v sudo >/dev/null
@@ -101,6 +105,8 @@ review-registry.json + expected SHA-256  -> /input/review-registry.json:ro
 /volume1/education-admin/review-state    -> /data/review-state:rw
 /volume1/education-admin/review-queue    -> /data/review-queue:rw
 /volume1/education-admin/corrections     -> /data/corrections:rw
+/volume1/education-admin/approved-quarantine-annotations
+                                             -> /data/approved-quarantine-annotations:ro
 ```
 
 ## 3. 쓰기 경계: service DB와 reviewer 작업 경로
@@ -119,6 +125,8 @@ install -d -o "$SEN_QA_SERVICE_USER" -g "$SEN_QA_SERVICE_GROUP" -m 0700 \
   "$SEN_QA_REVIEW_STATE_DIR"
 install -d -o "$SEN_QA_SERVICE_USER" -g "$SEN_QA_REVIEW_GROUP" -m 2770 \
   "$SEN_QA_QUEUE_DIR" "$SEN_QA_CORRECTION_DIR"
+install -d -o root -g "$SEN_QA_SERVICE_GROUP" -m 0550 \
+  "$SEN_QA_ANNOTATION_DIR"
 install -d -o "$SEN_QA_SERVICE_USER" -g "$SEN_QA_REVIEW_GROUP" -m 2750 \
   "$SEN_QA_BROKER_DIR"
 
@@ -138,6 +146,14 @@ find "$SEN_QA_REVIEW_STATE_DIR" -maxdepth 1 \
   -exec chmod 0600 {} +
 find "$SEN_QA_QUEUE_DIR" "$SEN_QA_CORRECTION_DIR" -type f \
   -exec chmod 0660 {} +
+find "$SEN_QA_ANNOTATION_DIR" -type f \
+  -exec chown root:"$SEN_QA_SERVICE_GROUP" {} + \
+  -exec chmod 0440 {} +
+
+test -f "$SEN_QA_QUARANTINE_SIDECAR"
+chown "$SEN_QA_SERVICE_USER:$SEN_QA_SERVICE_GROUP" \
+  "$SEN_QA_QUARANTINE_SIDECAR"
+chmod 0600 "$SEN_QA_QUARANTINE_SIDECAR"
 ```
 
 ## 4. 제한형 broker 계약
@@ -185,6 +201,8 @@ printf '%s\n' "$SEN_QA_REVIEW_REGISTRY_SHA256" | grep -Eq '^[0-9a-f]{64}$' || {
 export SEN_QA_SERVICE_UID="$(id -u "$SEN_QA_SERVICE_USER")"
 export SEN_QA_SERVICE_GID="$(getent group "$SEN_QA_SERVICE_GROUP" | cut -d: -f3)"
 export SEN_QA_REVIEW_GID="$(getent group "$SEN_QA_REVIEW_GROUP" | cut -d: -f3)"
+export SEN_QA_REVIEWER_UID="$(id -u "$SEN_QA_REVIEWER_PROBE_USER")"
+export SEN_QA_SECOND_REVIEWER_UID="$(id -u "$SEN_QA_SECOND_REVIEWER_PROBE_USER")"
 
 "$SEN_QA_DOCKER" run -d --name "$SEN_QA_BROKER_CONTAINER" \
   --restart unless-stopped --network none --read-only --cap-drop ALL \
@@ -196,6 +214,7 @@ export SEN_QA_REVIEW_GID="$(getent group "$SEN_QA_REVIEW_GROUP" | cut -d: -f3)"
   -v "$SEN_QA_RAW_DIR:/data/raw:ro" \
   -v "$SEN_QA_CANONICAL_DIR:/data/canonical:ro" \
   -v "$SEN_QA_REVIEW_STATE_DIR:/data/review-state:rw" \
+  -v "$SEN_QA_ANNOTATION_DIR:/data/approved-quarantine-annotations:ro" \
   -v "$SEN_QA_BROKER_DIR:/run/sen-qa:rw" \
   -v "/etc/passwd:/etc/passwd:ro" \
   --entrypoint /opt/venv/bin/python \
@@ -204,7 +223,12 @@ export SEN_QA_REVIEW_GID="$(getent group "$SEN_QA_REVIEW_GROUP" | cut -d: -f3)"
   --database /data/review-state/review.sqlite3 \
   --registry /data/canonical/review-registry.json \
   --registry-sha256 "$SEN_QA_REVIEW_REGISTRY_SHA256" \
-  --manifest-root /data/canonical/manifests
+  --manifest-root /data/canonical/manifests \
+  --quarantine-sidecar /data/review-state/parser-quarantine-resolutions.json \
+  --annotation-manifest-root /data/approved-quarantine-annotations \
+  --quarantine-reviewer-uid "$SEN_QA_REVIEWER_UID" \
+  --quarantine-reviewer-uid "$SEN_QA_SECOND_REVIEWER_UID" \
+  --annotation-owner-uid 0
 ```
 
 ## 5. 운영 전 검증 명령
@@ -285,3 +309,80 @@ canonical 발급기와 review registry는 중앙 `src/corpus/ids.py` validator�
 남은 production blocker는 root 소유 broker의 실제 NAS 계정 통합 시험이다. 이를
 닫힌 뒤에만 broker를 통해 `assert-ready`를 실행하고 release 증적에 registry hash,
 이미지 digest, blocker count, 두 OS actor UID를 값 최소화 형태로 남긴다.
+
+## 7. parser quarantine 해소 sidecar
+
+`parser-quarantines.jsonl`은 case review queue와 별개의 선행 검수 대상이다.
+`src.ingestion.quarantine_review`의 draft는 원본 package를 변경하지 않고 release,
+registry, manifest, raw authority, parser authority, quarantine file SHA-256과 count를
+묶는다. 같은 JSONL 행이 반복돼도 각 occurrence는 서로 다른 ordinal과 opaque ID를
+가진다. sidecar에는 본문을 넣지 않고 기존 page, bbox, text SHA-256만 보존한다.
+
+허용 disposition은 다음뿐이다.
+
+- `unresolved`: 아직 판단하지 않았거나 upstream OCR 재추출이 필요한 상태
+- `confirmed_noncase`: 해당 occurrence 전체가 사례가 아님을 사람이 확인한 상태
+- `corrected`: 원래 occurrence의 모든 span을 정확히 한 번씩 hierarchy, case 또는
+  fragment role에 배정한 상태
+
+upstream `page-extraction-failed`, `page-render-failed`, `ocr-adapter-failed`,
+`ocr-provenance-invalid`는 사람이 닫을 수 없다. 원본을 같은 OCR authority 계약으로
+재추출하고 새 parser/quarantine authority를 발급해야 한다. `corrected`는 새 문자열을
+받지 않으며, role 값은 exact source span의 normalized projection에서만 파생한다.
+span 일부만 배정하거나 중복 배정하면 실패한다.
+
+운영 순서는 반드시 분리한다.
+
+1. ingestion service가 `create_resolution_draft`로 canonical bytes를 만든다.
+2. root 소유 broker가 `SO_PEERCRED` actor를 `uid:<uid>:<account>`로 만들고 고정된
+   reviewer UID allowlist를 확인한 뒤 건별 `append_resolution_event`를 호출한다.
+   reviewer는 2,257개 span이나 reviewer ID를 socket body에 넣지 않는다. operator가
+   root 소유 annotation root에 `0440` canonical manifest를 동결하고 SHA-256을
+   전달한 뒤, client는 아래 네 필드만 보낸다.
+
+   ```json
+   {"operation":"resolve-quarantine","expected_head_sha256":"<current-sidecar-sha256>","annotation_manifest_id":"decision-0001.json","annotation_manifest_sha256":"<approved-manifest-sha256>"}
+   ```
+
+   broker는 absolute root부터 모든 directory component를 `O_DIRECTORY|O_NOFOLLOW`로
+   descriptor-walk하고, 고정된 manifest와 sidecar parent descriptor를 operation이
+   끝날 때까지 유지한다. manifest는 size-bounded/stable read하며 sidecar 전용 `0600`
+   lock 아래 expected head를 compare-and-swap한다. 성공 시 hash-chain event 하나를
+   추가한 canonical sidecar를 같은 held parent의 `O_EXCL` `0600` 임시 파일에 기록하고
+   file `fsync`, dirfd 기반 atomic replace, directory `fsync` 순서로 내구화한다.
+   stale head와 replay는 값 없는 code로 실패하며 기존 sidecar를 부분 갱신하지 않는다.
+3. broker를 중지하고 sidecar를 `0600` 일반 파일로 동결한 뒤, 별도 operator가
+   SHA-256을 release 증적에 기록한다. 검증 명령이 같은 실행에서 expected SHA를
+   계산해 넘기면 외부 seal로 인정하지 않는다.
+4. 다음 실행에서 `load_resolution_authority(path, expected_sha256=<증적값>)`로만
+   sidecar를 연다. symlink, FIFO, mode drift, noncanonical JSON, duplicate key,
+   broken event chain, authority drift는 값 없이 실패한다.
+5. 모든 occurrence가 terminal일 때만 `reparse_with_resolution`을 실행한다. 함수는
+   2020~2025 닫힌 dispatch, exact page/source binding, 전체 occurrence 재대조를 하고
+   parser quarantine이 하나라도 다시 나오면 실패한다.
+6. 성공한 parse 결과는 기존 package를 덮어쓰지 않고 새 빈 release root에
+   재-stage한다. 모든 새 case는 다시 `needs_review`, search/answer ineligible로
+   시작하며 사람 case review를 별도로 완료해야 한다.
+
+재-stage는 `prepare_resolved_review_corpus`만 사용한다. 이 경계는 기존
+`VerifiedParseRun`과 quarantine 포함 `PreparedReviewBatch`를 재생성해 서로
+대조하고, 전달된 결과를 내부 `reparse_with_resolution` 결과와 canonical byte
+단위로 비교한다. 새 parser authority v2는 이전 parser authority, 이전 quarantine
+SHA-256, 이전 registry, manifest/raw authority, 외부 resolution SHA-256과 문서별
+input/resolved-parse SHA-256을 함께 묶는다. 기존 review database, decision snapshot,
+attestation, candidate 또는 sampling authority는 복사하지 않는다.
+
+resolved package는 `sen-qa-ingestion-evidence/v4`,
+`sen-qa-review-package/v4`, `sen-qa-review-ready-attestation/v3`을 사용하고
+`parser-quarantine-resolutions.json`을 `0600`으로 포함한다. evidence와 ready
+attestation은 그 파일의 외부 SHA-256을 함께 봉인한다. 새 release root는 완전히
+비어 있어야 하며, sidecar 누락·변조, unresolved occurrence, 과거 authority drift,
+재parse quarantine 재발 중 하나라도 있으면 staging/export/finalizer가 모두
+실패한다.
+
+broker operation과 value-free event envelope는 코드와 로컬 동시성/crash 회귀시험에
+연결돼 있다. 남은 production blocker는 이 launch 계약을 NAS에 설치한 뒤 두 실제 NAS reviewer UID로 같은 expected head에 동시에 요청해 정확히 한 요청만 성공하고,
+다른 요청은 `resolution_head_stale`이며 sidecar event가 정확히 하나인지 확인하는
+계정/ACL 통합 시험이다. 이 시험 전의 sidecar는 개발 증적일 뿐 human-ready나
+release-ready로 표시하면 안 된다. 기존 quarantine 포함 v3 package와 운영 alias는
+그대로 fail closed 상태를 유지한다.

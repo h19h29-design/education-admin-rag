@@ -6,6 +6,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Self
 
 import pytest
 import typer
@@ -14,6 +15,7 @@ from typer.testing import CliRunner
 import src.cli as cli_module
 from src.cli import app
 from src.evaluation.release_report import ReleaseEvaluationReport
+from src.ingestion.extract_ocr import QuarantinedOcrPageRecord
 from src.ingestion.review import (
     CanonicalReviewRegistry,
     ReviewReference,
@@ -28,7 +30,6 @@ from src.retrieval.dense import DenseBuildResult, DenseSnapshotResult
 from src.retrieval.lexical import build_lexical_index
 from tests.ingestion.test_parse_metadata import (
     _native_quarantine_records,
-    _ocr_quarantine_record,
     _write_jsonl,
     _write_manifest,
 )
@@ -38,6 +39,70 @@ CONTENT_A = "a" * 64
 CONTENT_B = "b" * 64
 CASE_1 = "senqa-2025-contract-contract-general-1"
 CASE_2 = "senqa-2025-contract-contract-general-2"
+
+
+def _vision_runtime_bytes() -> bytes:
+    payload = {
+        "schema_version": "sen-qa-apple-vision-runtime-provenance/v2",
+        "engine": "apple-vision",
+        "request_revision": 3,
+        "language": "ko-KR",
+        "recognition_level": "accurate",
+        "uses_language_correction": True,
+        "macos_build": "test-build",
+        "architecture": "arm64",
+        "swift_version": "Swift 6.3.2",
+        "sdk_version": "macosx26.4",
+        "helper_source_sha256": "1" * 64,
+        "helper_binary_sha256": "2" * 64,
+        "adapter_sha256": "3" * 64,
+        "extractor_pipeline_sha256": "4" * 64,
+        "pymupdf_version": "1.26.7",
+    }
+    return (
+        json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+
+
+def _vision_cli_arguments(
+    *,
+    year: int,
+    pages: str,
+    output: Path,
+    manifest: Path,
+    helper: Path,
+    helper_source: Path,
+    runtime: Path,
+    runtime_sha256: str = (
+        "b7f5138112774db534f8d13efbef4ed6003449fec5e7acb6e05e5217960f4da7"
+    ),
+) -> list[str]:
+    return [
+        "extract-vision-ocr",
+        "--year",
+        str(year),
+        "--pages",
+        pages,
+        "--output",
+        str(output),
+        "--manifest",
+        str(manifest),
+        "--helper",
+        str(helper),
+        "--helper-sha256",
+        "2" * 64,
+        "--helper-source",
+        str(helper_source),
+        "--swift-version",
+        "Swift 6.3.2",
+        "--sdk-version",
+        "macosx26.4",
+        "--runtime-provenance",
+        str(runtime),
+        "--expected-runtime-provenance-sha256",
+        runtime_sha256,
+    ]
 
 
 def _registry() -> VerifiedCanonicalReviewRegistry:
@@ -1190,7 +1255,1157 @@ def test_parse_metadata_cli_emits_one_canonical_value_free_json_line(
     )
 
 
-def test_stage_review_corpus_cli_reports_only_counts_and_registry_hash(
+def test_parse_metadata_cli_passes_the_exact_v3_ocr_authority_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches the CLI dropping independently pinned Vision authority."""
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_bytes(b"input\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b"{}\n")
+    lock = tmp_path / "ocr-authority.json"
+    lock.write_bytes(b"{}\n")
+    captured: dict[str, object] = {}
+
+    def build(path: Path, **kwargs: object) -> object:
+        captured["input_path"] = path
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(cli_module, "build_parse_metadata", build)
+    monkeypatch.setattr(
+        cli_module,
+        "canonical_metadata_bytes",
+        lambda _metadata: b'{"metadata_schema":"sen-qa-parse-metadata-v1"}\n',
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "parse-metadata",
+            "--input",
+            str(input_path),
+            "--manifest",
+            str(manifest),
+            "--year",
+            "2024",
+            "--pages",
+            "1-324",
+            "--ocr-authority-lock",
+            str(lock),
+            "--expected-ocr-authority-lock-sha256",
+            "a" * 64,
+        ],
+        env={"SEN_QA_INGESTION_IMAGE_DIGEST": ""},
+    )
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert result.stdout.strip() == ('{"metadata_schema":"sen-qa-parse-metadata-v1"}')
+    assert captured == {
+        "edition_year": 2024,
+        "expected_image_digest": None,
+        "expected_ocr_authority_lock_sha256": "a" * 64,
+        "input_path": input_path,
+        "manifest_path": manifest,
+        "ocr_authority_lock_path": lock,
+        "pages": "1-324",
+    }
+
+
+def test_parse_metadata_cli_rejects_legacy_digest_for_v3_before_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches the v2 image authority being combined with a 2024/25 lock."""
+    sentinel = "PRIVATE-PARSE-DOWNGRADE-SENTINEL"
+    input_path = tmp_path / f"{sentinel}.jsonl"
+    input_path.write_bytes(b"input\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b"{}\n")
+    lock = tmp_path / "ocr-authority.json"
+    lock.write_bytes(b"{}\n")
+    monkeypatch.setattr(cli_module, "build_parse_metadata", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        cli_module,
+        "canonical_metadata_bytes",
+        lambda _metadata: b'{"unexpected":"downgrade-accepted"}\n',
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "parse-metadata",
+            "--input",
+            str(input_path),
+            "--manifest",
+            str(manifest),
+            "--year",
+            "2024",
+            "--pages",
+            "1-324",
+            "--ocr-authority-lock",
+            str(lock),
+            "--expected-ocr-authority-lock-sha256",
+            "a" * 64,
+        ],
+        env={"SEN_QA_INGESTION_IMAGE_DIGEST": "sha256:" + "d" * 64},
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr == ""
+    assert result.stdout.strip() == "failed=1 error_code=authority_invalid"
+    assert sentinel not in result.stdout
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_parse_metadata_cli_rejects_authority_free_v3_before_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a 2024/25 parse falling back to an authority-free route."""
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_bytes(b"input\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b"{}\n")
+    monkeypatch.setattr(cli_module, "build_parse_metadata", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        cli_module,
+        "canonical_metadata_bytes",
+        lambda _metadata: b'{"unexpected":"authority-free"}\n',
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "parse-metadata",
+            "--input",
+            str(input_path),
+            "--manifest",
+            str(manifest),
+            "--year",
+            "2025",
+            "--pages",
+            "1-314",
+        ],
+        env={"SEN_QA_INGESTION_IMAGE_DIGEST": ""},
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr == ""
+    assert result.stdout.strip() == "failed=1 error_code=authority_invalid"
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_parse_metadata_cli_rejects_malformed_v3_authority_hash_before_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches an ambiguous prefixed lock digest reaching the parser boundary."""
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_bytes(b"input\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b"{}\n")
+    lock = tmp_path / "lock.json"
+    lock.write_bytes(b"{}\n")
+    monkeypatch.setattr(cli_module, "build_parse_metadata", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        cli_module,
+        "canonical_metadata_bytes",
+        lambda _metadata: b'{"unexpected":"malformed-authority"}\n',
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "parse-metadata",
+            "--input",
+            str(input_path),
+            "--manifest",
+            str(manifest),
+            "--year",
+            "2024",
+            "--pages",
+            "1-324",
+            "--ocr-authority-lock",
+            str(lock),
+            "--expected-ocr-authority-lock-sha256",
+            "sha256:" + "a" * 64,
+        ],
+        env={"SEN_QA_INGESTION_IMAGE_DIGEST": ""},
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr == ""
+    assert result.stdout.strip() == "failed=1 error_code=authority_invalid"
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_parse_metadata_cli_rejects_symlinked_v3_authority_before_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches lock path substitution before the strict parser loader runs."""
+    sentinel = "PRIVATE-PARSE-LOCK-SYMLINK-SENTINEL"
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_bytes(b"input\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b"{}\n")
+    target = tmp_path / f"{sentinel}.json"
+    target.write_bytes(b"{}\n")
+    lock = tmp_path / "lock.json"
+    lock.symlink_to(target)
+    monkeypatch.setattr(cli_module, "build_parse_metadata", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        cli_module,
+        "canonical_metadata_bytes",
+        lambda _metadata: b'{"unexpected":"symlink-authority"}\n',
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "parse-metadata",
+            "--input",
+            str(input_path),
+            "--manifest",
+            str(manifest),
+            "--year",
+            "2025",
+            "--pages",
+            "1-314",
+            "--ocr-authority-lock",
+            str(lock),
+            "--expected-ocr-authority-lock-sha256",
+            "a" * 64,
+        ],
+        env={"SEN_QA_INGESTION_IMAGE_DIGEST": ""},
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr == ""
+    assert result.stdout.strip() == "failed=1 error_code=authority_invalid"
+    assert sentinel not in result.stdout
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_extract_vision_ocr_cli_runs_the_verified_v3_pipeline_and_hashes_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches the operational command omitting the v3 extractor or run binding."""
+    manifest = Path("data/manifests/sen_qa_sources.json")
+    document = next(
+        item for item in cli_module.load_manifest(manifest) if item.edition_year == 2024
+    )
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / document.source_relpath
+    source.write_bytes(b"verified by test boundary")
+    output = tmp_path / "output"
+    helper = tmp_path / "vision-helper"
+    helper.write_bytes(b"helper")
+    helper_source = tmp_path / "vision-helper.swift"
+    helper_source.write_bytes(b"source")
+    runtime_raw = _vision_runtime_bytes()
+    runtime_path = tmp_path / "runtime-provenance.json"
+    runtime_path.write_bytes(runtime_raw)
+    captured: dict[str, object] = {}
+
+    class FakeAdapter:
+        def __init__(self, **kwargs: object) -> None:
+            captured["adapter"] = kwargs
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def complete_runtime_provenance_bytes(self) -> bytes:
+            return runtime_raw
+
+    records = tuple(
+        SimpleNamespace(status="extracted") for _ in range(document.pdf_page_count)
+    )
+
+    def extract(*args: object) -> tuple[object, ...]:
+        captured["extract"] = args
+        return records
+
+    def write(path: Path, values: object, **kwargs: object) -> None:
+        captured["write"] = (path, values, kwargs)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"vision-jsonl\n")
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(cli_module, "verify_source", lambda *_args: None)
+    monkeypatch.setattr(cli_module, "AppleVisionOcrAdapter", FakeAdapter, raising=False)
+    monkeypatch.setattr(
+        cli_module, "extract_apple_vision_document", extract, raising=False
+    )
+    monkeypatch.setattr(cli_module, "write_apple_vision_jsonl", write, raising=False)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "extract-vision-ocr",
+            "--year",
+            "2024",
+            "--pages",
+            f"1-{document.pdf_page_count}",
+            "--output",
+            str(output),
+            "--manifest",
+            str(manifest),
+            "--helper",
+            str(helper),
+            "--helper-sha256",
+            "2" * 64,
+            "--helper-source",
+            str(helper_source),
+            "--swift-version",
+            "Swift 6.3.2",
+            "--sdk-version",
+            "macosx26.4",
+            "--runtime-provenance",
+            str(runtime_path),
+            "--expected-runtime-provenance-sha256",
+            "b7f5138112774db534f8d13efbef4ed6003449fec5e7acb6e05e5217960f4da7",
+        ],
+        env={
+            "SEN_QA_SOURCE_ROOT": str(source_root),
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "",
+        },
+    )
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "documents=1 pages=324 extracted=324 quarantined=0 "
+        "runtime_sha256=b7f5138112774db534f8d13efbef4ed6003449fec5e7acb6e05e5217960f4da7 "
+        "output_sha256=a0e9c46802040e01ac40ea41009d6e2f57d118fc8c4324fa9cdbfbb2eb6ddbbe "
+        "failed=0"
+    )
+    assert captured["adapter"] == {
+        "expected_helper_sha256": "2" * 64,
+        "helper_path": helper,
+        "helper_source_path": helper_source,
+        "sdk_version": "macosx26.4",
+        "swift_version": "Swift 6.3.2",
+    }
+    extract_args = captured["extract"]
+    assert isinstance(extract_args, tuple)
+    assert extract_args[0] == source
+    assert extract_args[1] == document
+    assert extract_args[2] == tuple(range(1, document.pdf_page_count + 1))
+    assert type(extract_args[4]).__name__ == "AppleVisionRuntimeProvenance"
+    write_path, write_records, write_kwargs = captured["write"]
+    assert write_path == output / "sen-qa-2024.jsonl"
+    assert write_records is records
+    assert write_kwargs == {
+        "document": document,
+        "expected_runtime_fingerprint": (
+            "sha256:b7f5138112774db534f8d13efbef4ed6003449fec5e7acb6e05e5217960f4da7"
+        ),
+        "selected_page_indexes": tuple(range(1, document.pdf_page_count + 1)),
+    }
+
+
+def test_extract_vision_ocr_cli_rejects_non_darwin_before_private_input_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a non-Apple host reaching private source or runtime bytes."""
+    sentinel = "PRIVATE-NON-DARWIN-SENTINEL"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(sentinel, encoding="utf-8")
+    helper = tmp_path / "helper"
+    helper.write_text(sentinel, encoding="utf-8")
+    helper_source = tmp_path / "helper.swift"
+    helper_source.write_text(sentinel, encoding="utf-8")
+    runtime = tmp_path / "runtime.json"
+    runtime.write_text(sentinel, encoding="utf-8")
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "extract-vision-ocr",
+            "--year",
+            "2024",
+            "--pages",
+            "1",
+            "--output",
+            str(tmp_path / "output"),
+            "--manifest",
+            str(manifest),
+            "--helper",
+            str(helper),
+            "--helper-sha256",
+            "2" * 64,
+            "--helper-source",
+            str(helper_source),
+            "--swift-version",
+            "Swift 6.3.2",
+            "--sdk-version",
+            "macosx26.4",
+            "--runtime-provenance",
+            str(runtime),
+            "--expected-runtime-provenance-sha256",
+            "9" * 64,
+        ],
+        env={"SEN_QA_SOURCE_ROOT": str(source_root)},
+    )
+
+    assert result.exit_code == 2
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "documents=0 pages=0 extracted=0 quarantined=0 "
+        "failed=1 error_code=vision_ocr_platform_unsupported"
+    )
+    assert sentinel not in result.stdout
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_extract_vision_ocr_cli_rejects_legacy_2023_before_source_or_runtime_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches the v3 command accepting the approved Paddle-only 2023 source."""
+    sentinel = "PRIVATE-LEGACY-2023-SENTINEL"
+    manifest = Path("data/manifests/sen_qa_sources.json")
+    document = next(
+        item for item in cli_module.load_manifest(manifest) if item.edition_year == 2023
+    )
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / document.source_relpath).write_text(sentinel, encoding="utf-8")
+    helper = tmp_path / "helper"
+    helper.write_text(sentinel, encoding="utf-8")
+    helper_source = tmp_path / "helper.swift"
+    helper_source.write_text(sentinel, encoding="utf-8")
+    runtime = tmp_path / "runtime.json"
+    runtime.write_text(sentinel, encoding="utf-8")
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "extract-vision-ocr",
+            "--year",
+            "2023",
+            "--pages",
+            "1",
+            "--output",
+            str(tmp_path / "output"),
+            "--manifest",
+            str(manifest),
+            "--helper",
+            str(helper),
+            "--helper-sha256",
+            "2" * 64,
+            "--helper-source",
+            str(helper_source),
+            "--swift-version",
+            "Swift 6.3.2",
+            "--sdk-version",
+            "macosx26.4",
+            "--runtime-provenance",
+            str(runtime),
+            "--expected-runtime-provenance-sha256",
+            "9" * 64,
+        ],
+        env={
+            "SEN_QA_SOURCE_ROOT": str(source_root),
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "",
+        },
+    )
+
+    assert result.exit_code == 2
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "documents=0 pages=0 extracted=0 quarantined=0 "
+        "failed=1 error_code=vision_ocr_year_not_supported"
+    )
+    assert sentinel not in result.stdout
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_extract_vision_ocr_cli_rejects_legacy_image_authority_before_input_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches v2 container identity being mixed into a v3 Vision run."""
+    sentinel = "PRIVATE-LEGACY-AUTHORITY-SENTINEL"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(sentinel, encoding="utf-8")
+    helper = tmp_path / "helper"
+    helper.write_text(sentinel, encoding="utf-8")
+    helper_source = tmp_path / "helper.swift"
+    helper_source.write_text(sentinel, encoding="utf-8")
+    runtime = tmp_path / "runtime.json"
+    runtime.write_text(sentinel, encoding="utf-8")
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "extract-vision-ocr",
+            "--year",
+            "2024",
+            "--pages",
+            "1",
+            "--output",
+            str(tmp_path / "output"),
+            "--manifest",
+            str(manifest),
+            "--helper",
+            str(helper),
+            "--helper-sha256",
+            "2" * 64,
+            "--helper-source",
+            str(helper_source),
+            "--swift-version",
+            "Swift 6.3.2",
+            "--sdk-version",
+            "macosx26.4",
+            "--runtime-provenance",
+            str(runtime),
+            "--expected-runtime-provenance-sha256",
+            "9" * 64,
+        ],
+        env={
+            "SEN_QA_SOURCE_ROOT": str(source_root),
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "sha256:" + "d" * 64,
+        },
+    )
+
+    assert result.exit_code == 2
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "documents=0 pages=0 extracted=0 quarantined=0 "
+        "failed=1 error_code=vision_ocr_legacy_authority_forbidden"
+    )
+    assert sentinel not in result.stdout
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_extract_vision_ocr_cli_rejects_symlinked_runtime_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches runtime attestation path substitution through a symlink."""
+    sentinel = "PRIVATE-RUNTIME-SYMLINK-SENTINEL"
+    manifest = Path("data/manifests/sen_qa_sources.json")
+    document = next(
+        item for item in cli_module.load_manifest(manifest) if item.edition_year == 2024
+    )
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / document.source_relpath).write_bytes(b"source")
+    helper = tmp_path / "helper"
+    helper.write_bytes(b"helper")
+    helper_source = tmp_path / "helper.swift"
+    helper_source.write_bytes(b"source")
+    runtime_raw = _vision_runtime_bytes()
+    runtime_target = tmp_path / f"{sentinel}.json"
+    runtime_target.write_bytes(runtime_raw)
+    runtime_link = tmp_path / "runtime.json"
+    runtime_link.symlink_to(runtime_target)
+
+    class FakeAdapter:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def complete_runtime_provenance_bytes(self) -> bytes:
+            return runtime_raw
+
+    def write(path: Path, *_args: object, **_kwargs: object) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"vision-jsonl\n")
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(cli_module, "verify_source", lambda *_args: None)
+    monkeypatch.setattr(cli_module, "AppleVisionOcrAdapter", FakeAdapter)
+    monkeypatch.setattr(
+        cli_module,
+        "extract_apple_vision_document",
+        lambda *_args: (SimpleNamespace(status="extracted"),),
+    )
+    monkeypatch.setattr(cli_module, "write_apple_vision_jsonl", write)
+
+    result = CliRunner().invoke(
+        app,
+        _vision_cli_arguments(
+            year=2024,
+            pages=f"1-{document.pdf_page_count}",
+            output=tmp_path / "output",
+            manifest=manifest,
+            helper=helper,
+            helper_source=helper_source,
+            runtime=runtime_link,
+        ),
+        env={
+            "SEN_QA_SOURCE_ROOT": str(source_root),
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "",
+        },
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "documents=0 pages=0 extracted=0 quarantined=0 "
+        "failed=1 error_code=vision_ocr_failed"
+    )
+    assert sentinel not in result.stdout
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "missing_kind", ["runtime", "helper", "helper-source", "manifest", "output-file"]
+)
+def test_extract_vision_ocr_cli_sanitizes_missing_private_input_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_kind: str,
+) -> None:
+    """Catches Click disclosing a missing operator-supplied private path."""
+    sentinel = "PRIVATE-MISSING-VISION-PATH-SENTINEL"
+    approved_manifest = Path("data/manifests/sen_qa_sources.json")
+    document = next(
+        item
+        for item in cli_module.load_manifest(approved_manifest)
+        if item.edition_year == 2024
+    )
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / document.source_relpath).write_bytes(b"source")
+    helper = tmp_path / "helper"
+    if missing_kind != "helper":
+        helper.write_bytes(b"helper")
+    helper_source = tmp_path / "helper.swift"
+    if missing_kind != "helper-source":
+        helper_source.write_bytes(b"source")
+    runtime = tmp_path / "runtime.json"
+    if missing_kind != "runtime":
+        runtime.write_bytes(_vision_runtime_bytes())
+    manifest = (
+        tmp_path / f"{sentinel}.json"
+        if missing_kind == "manifest"
+        else approved_manifest
+    )
+    if missing_kind == "runtime":
+        runtime = tmp_path / f"{sentinel}.json"
+    elif missing_kind == "helper":
+        helper = tmp_path / sentinel
+    elif missing_kind == "helper-source":
+        helper_source = tmp_path / sentinel
+    output = tmp_path / "output"
+    if missing_kind == "output-file":
+        output = tmp_path / sentinel
+        output.write_bytes(b"not-a-directory")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(cli_module, "verify_source", lambda *_args: None)
+
+    result = CliRunner().invoke(
+        app,
+        _vision_cli_arguments(
+            year=2024,
+            pages=f"1-{document.pdf_page_count}",
+            output=output,
+            manifest=manifest,
+            helper=helper,
+            helper_source=helper_source,
+            runtime=runtime,
+        ),
+        env={
+            "SEN_QA_SOURCE_ROOT": str(source_root),
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "",
+        },
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout.strip() == (
+        "documents=0 pages=0 extracted=0 quarantined=0 "
+        "failed=1 error_code=vision_ocr_failed"
+    )
+    assert sentinel not in result.stdout + result.stderr
+    assert result.exception is not None
+    diagnostics = str(result.exception) + repr(result.exception)
+    assert sentinel not in diagnostics
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_extract_vision_ocr_cli_rejects_runtime_file_hash_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches operator-expected provenance being ignored after reading the file."""
+    sentinel = "PRIVATE-RUNTIME-HASH-SENTINEL"
+    manifest = Path("data/manifests/sen_qa_sources.json")
+    document = next(
+        item for item in cli_module.load_manifest(manifest) if item.edition_year == 2024
+    )
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / document.source_relpath).write_bytes(b"source")
+    helper = tmp_path / "helper"
+    helper.write_bytes(b"helper")
+    helper_source = tmp_path / "helper.swift"
+    helper_source.write_bytes(b"source")
+    runtime_raw = _vision_runtime_bytes()
+    runtime = tmp_path / f"{sentinel}.json"
+    runtime.write_bytes(runtime_raw)
+
+    class FakeAdapter:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def complete_runtime_provenance_bytes(self) -> bytes:
+            return runtime_raw
+
+    def write(path: Path, *_args: object, **_kwargs: object) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"vision-jsonl\n")
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(cli_module, "verify_source", lambda *_args: None)
+    monkeypatch.setattr(cli_module, "AppleVisionOcrAdapter", FakeAdapter)
+    monkeypatch.setattr(
+        cli_module,
+        "extract_apple_vision_document",
+        lambda *_args: (SimpleNamespace(status="extracted"),),
+    )
+    monkeypatch.setattr(cli_module, "write_apple_vision_jsonl", write)
+
+    result = CliRunner().invoke(
+        app,
+        _vision_cli_arguments(
+            year=2024,
+            pages=f"1-{document.pdf_page_count}",
+            output=tmp_path / "output",
+            manifest=manifest,
+            helper=helper,
+            helper_source=helper_source,
+            runtime=runtime,
+            runtime_sha256="9" * 64,
+        ),
+        env={
+            "SEN_QA_SOURCE_ROOT": str(source_root),
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "",
+        },
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "documents=0 pages=0 extracted=0 quarantined=0 "
+        "failed=1 error_code=vision_ocr_failed"
+    )
+    assert sentinel not in result.stdout
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_extract_vision_ocr_cli_rejects_adapter_runtime_attestation_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a live helper run being rebound to another runtime file."""
+    sentinel = "PRIVATE-ADAPTER-RUNTIME-SENTINEL"
+    manifest = Path("data/manifests/sen_qa_sources.json")
+    document = next(
+        item for item in cli_module.load_manifest(manifest) if item.edition_year == 2024
+    )
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / document.source_relpath).write_bytes(b"source")
+    helper = tmp_path / "helper"
+    helper.write_bytes(b"helper")
+    helper_source = tmp_path / "helper.swift"
+    helper_source.write_bytes(b"source")
+    runtime = tmp_path / "runtime.json"
+    runtime.write_bytes(_vision_runtime_bytes())
+
+    class MismatchedAdapter:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def complete_runtime_provenance_bytes(self) -> bytes:
+            return sentinel.encode("ascii")
+
+    def write(path: Path, *_args: object, **_kwargs: object) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"vision-jsonl\n")
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(cli_module, "verify_source", lambda *_args: None)
+    monkeypatch.setattr(cli_module, "AppleVisionOcrAdapter", MismatchedAdapter)
+    monkeypatch.setattr(
+        cli_module,
+        "extract_apple_vision_document",
+        lambda *_args: (SimpleNamespace(status="extracted"),),
+    )
+    monkeypatch.setattr(cli_module, "write_apple_vision_jsonl", write)
+
+    result = CliRunner().invoke(
+        app,
+        _vision_cli_arguments(
+            year=2024,
+            pages=f"1-{document.pdf_page_count}",
+            output=tmp_path / "output",
+            manifest=manifest,
+            helper=helper,
+            helper_source=helper_source,
+            runtime=runtime,
+        ),
+        env={
+            "SEN_QA_SOURCE_ROOT": str(source_root),
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "",
+        },
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "documents=0 pages=0 extracted=0 quarantined=0 "
+        "failed=1 error_code=vision_ocr_failed"
+    )
+    assert sentinel not in result.stdout
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_extract_vision_ocr_cli_rejects_partial_document_before_source_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a partial page selection being published as an annual run."""
+    sentinel = "PRIVATE-PARTIAL-VISION-RUN-SENTINEL"
+    manifest = Path("data/manifests/sen_qa_sources.json")
+    document = next(
+        item for item in cli_module.load_manifest(manifest) if item.edition_year == 2024
+    )
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / document.source_relpath).write_text(sentinel, encoding="utf-8")
+    helper = tmp_path / "helper"
+    helper.write_text(sentinel, encoding="utf-8")
+    helper_source = tmp_path / "helper.swift"
+    helper_source.write_text(sentinel, encoding="utf-8")
+    runtime = tmp_path / "runtime.json"
+    runtime.write_text(sentinel, encoding="utf-8")
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    result = CliRunner().invoke(
+        app,
+        _vision_cli_arguments(
+            year=2024,
+            pages="1",
+            output=tmp_path / "output",
+            manifest=manifest,
+            helper=helper,
+            helper_source=helper_source,
+            runtime=runtime,
+        ),
+        env={
+            "SEN_QA_SOURCE_ROOT": str(source_root),
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "",
+        },
+    )
+
+    assert result.exit_code == 2
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "documents=0 pages=0 extracted=0 quarantined=0 "
+        "failed=1 error_code=vision_ocr_pages_incomplete"
+    )
+    assert sentinel not in result.stdout
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_extract_vision_ocr_cli_rejects_symlink_substitution_before_output_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a post-write output symlink being hashed as the annual artifact."""
+    sentinel = "PRIVATE-OUTPUT-SYMLINK-SENTINEL"
+    manifest = Path("data/manifests/sen_qa_sources.json")
+    document = next(
+        item for item in cli_module.load_manifest(manifest) if item.edition_year == 2024
+    )
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / document.source_relpath).write_bytes(b"source")
+    helper = tmp_path / "helper"
+    helper.write_bytes(b"helper")
+    helper_source = tmp_path / "helper.swift"
+    helper_source.write_bytes(b"source")
+    runtime_raw = _vision_runtime_bytes()
+    runtime = tmp_path / "runtime.json"
+    runtime.write_bytes(runtime_raw)
+    private_target = tmp_path / sentinel
+
+    class FakeAdapter:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def complete_runtime_provenance_bytes(self) -> bytes:
+            return runtime_raw
+
+    def write(path: Path, *_args: object, **_kwargs: object) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        private_target.write_bytes(b"vision-jsonl\n")
+        path.symlink_to(private_target)
+
+    records = tuple(
+        SimpleNamespace(status="extracted") for _ in range(document.pdf_page_count)
+    )
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(cli_module, "verify_source", lambda *_args: None)
+    monkeypatch.setattr(cli_module, "AppleVisionOcrAdapter", FakeAdapter)
+    monkeypatch.setattr(
+        cli_module, "extract_apple_vision_document", lambda *_args: records
+    )
+    monkeypatch.setattr(cli_module, "write_apple_vision_jsonl", write)
+
+    result = CliRunner().invoke(
+        app,
+        _vision_cli_arguments(
+            year=2024,
+            pages=f"1-{document.pdf_page_count}",
+            output=tmp_path / "output",
+            manifest=manifest,
+            helper=helper,
+            helper_source=helper_source,
+            runtime=runtime,
+        ),
+        env={
+            "SEN_QA_SOURCE_ROOT": str(source_root),
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "",
+        },
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "documents=0 pages=0 extracted=0 quarantined=0 "
+        "failed=1 error_code=vision_ocr_failed"
+    )
+    assert sentinel not in result.stdout
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_extract_vision_ocr_cli_rejects_unmanaged_output_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches an annual artifact being mixed with files outside command ownership."""
+    sentinel = "PRIVATE-UNMANAGED-OUTPUT-SENTINEL"
+    manifest = Path("data/manifests/sen_qa_sources.json")
+    document = next(
+        item for item in cli_module.load_manifest(manifest) if item.edition_year == 2024
+    )
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / document.source_relpath).write_bytes(b"source")
+    helper = tmp_path / "helper"
+    helper.write_bytes(b"helper")
+    helper_source = tmp_path / "helper.swift"
+    helper_source.write_bytes(b"source")
+    runtime_raw = _vision_runtime_bytes()
+    runtime = tmp_path / "runtime.json"
+    runtime.write_bytes(runtime_raw)
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / sentinel).write_bytes(b"unmanaged")
+
+    class FakeAdapter:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def complete_runtime_provenance_bytes(self) -> bytes:
+            return runtime_raw
+
+    def write(path: Path, *_args: object, **_kwargs: object) -> None:
+        path.write_bytes(b"vision-jsonl\n")
+
+    records = tuple(
+        SimpleNamespace(status="extracted") for _ in range(document.pdf_page_count)
+    )
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(cli_module, "verify_source", lambda *_args: None)
+    monkeypatch.setattr(cli_module, "AppleVisionOcrAdapter", FakeAdapter)
+    monkeypatch.setattr(
+        cli_module, "extract_apple_vision_document", lambda *_args: records
+    )
+    monkeypatch.setattr(cli_module, "write_apple_vision_jsonl", write)
+
+    result = CliRunner().invoke(
+        app,
+        _vision_cli_arguments(
+            year=2024,
+            pages=f"1-{document.pdf_page_count}",
+            output=output,
+            manifest=manifest,
+            helper=helper,
+            helper_source=helper_source,
+            runtime=runtime,
+        ),
+        env={
+            "SEN_QA_SOURCE_ROOT": str(source_root),
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "",
+        },
+    )
+
+    assert result.exit_code == 2
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "documents=0 pages=0 extracted=0 quarantined=0 "
+        "failed=1 error_code=vision_ocr_output_not_clean"
+    )
+    assert sentinel not in result.stdout
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+
+
+def test_extract_vision_ocr_cli_writes_quarantine_evidence_but_exits_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a complete annual run silently succeeding with a quarantined page."""
+    manifest = Path("data/manifests/sen_qa_sources.json")
+    document = next(
+        item for item in cli_module.load_manifest(manifest) if item.edition_year == 2024
+    )
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / document.source_relpath).write_bytes(b"source")
+    helper = tmp_path / "helper"
+    helper.write_bytes(b"helper")
+    helper_source = tmp_path / "helper.swift"
+    helper_source.write_bytes(b"source")
+    runtime_raw = _vision_runtime_bytes()
+    runtime = tmp_path / "runtime.json"
+    runtime.write_bytes(runtime_raw)
+
+    class FakeAdapter:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def complete_runtime_provenance_bytes(self) -> bytes:
+            return runtime_raw
+
+    def write(path: Path, *_args: object, **_kwargs: object) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"vision-jsonl\n")
+
+    records = (
+        *(SimpleNamespace(status="extracted") for _ in range(323)),
+        SimpleNamespace(status="quarantined"),
+    )
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(cli_module, "verify_source", lambda *_args: None)
+    monkeypatch.setattr(cli_module, "AppleVisionOcrAdapter", FakeAdapter)
+    monkeypatch.setattr(
+        cli_module, "extract_apple_vision_document", lambda *_args: records
+    )
+    monkeypatch.setattr(cli_module, "write_apple_vision_jsonl", write)
+
+    result = CliRunner().invoke(
+        app,
+        _vision_cli_arguments(
+            year=2024,
+            pages=f"1-{document.pdf_page_count}",
+            output=tmp_path / "output",
+            manifest=manifest,
+            helper=helper,
+            helper_source=helper_source,
+            runtime=runtime,
+        ),
+        env={
+            "SEN_QA_SOURCE_ROOT": str(source_root),
+            "SEN_QA_INGESTION_IMAGE_DIGEST": "",
+        },
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr == ""
+    assert result.stdout.strip() == (
+        "documents=1 pages=324 extracted=323 quarantined=1 "
+        "runtime_sha256=b7f5138112774db534f8d13efbef4ed6003449fec5e7acb6e05e5217960f4da7 "
+        "output_sha256=a0e9c46802040e01ac40ea41009d6e2f57d118fc8c4324fa9cdbfbb2eb6ddbbe "
+        "failed=1"
+    )
+
+
+def test_stage_review_corpus_native_cli_reports_only_counts_and_registry_hash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1209,11 +2424,14 @@ def test_stage_review_corpus_cli_reports_only_counts_and_registry_hash(
         registry = Registry()
 
     batch = Batch()
-    monkeypatch.setattr(
-        cli_module,
-        "prepare_review_corpus_from_artifacts",
-        lambda *_args, **_kwargs: batch,
-    )
+    captured: dict[str, object] = {}
+
+    def prepare(input_path: Path, **kwargs: object) -> Batch:
+        captured["input_root"] = input_path
+        captured.update(kwargs)
+        return batch
+
+    monkeypatch.setattr(cli_module, "prepare_review_corpus_from_artifacts", prepare)
     monkeypatch.setattr(
         cli_module,
         "write_review_package",
@@ -1235,7 +2453,7 @@ def test_stage_review_corpus_cli_reports_only_counts_and_registry_hash(
             "--ingestion-version",
             "ingestion-v1",
         ],
-        env={"SEN_QA_INGESTION_IMAGE_DIGEST": "sha256:" + "d" * 64},
+        env={"SEN_QA_INGESTION_IMAGE_DIGEST": ""},
     )
 
     assert result.exit_code == 0
@@ -1243,6 +2461,220 @@ def test_stage_review_corpus_cli_reports_only_counts_and_registry_hash(
     assert result.stdout.strip() == (
         f"cases=2 quarantines=3 registry_sha256={fingerprint} failed=0"
     )
+    assert captured == {
+        "expected_image_digest": None,
+        "expected_ocr_authority_lock_sha256": None,
+        "ingestion_version": "ingestion-v1",
+        "input_root": input_root,
+        "manifest_path": manifest,
+        "ocr_authority_lock_path": None,
+    }
+
+
+def test_stage_review_corpus_ocr_cli_passes_independent_authority_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches dropping either verified OCR authority argument at the CLI boundary."""
+    input_root = tmp_path / "raw-pages"
+    input_root.mkdir()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b"{}\n")
+    lock = tmp_path / "ocr-authority-lock.json"
+    lock.write_bytes(b"{}\n")
+    lock_sha256 = "a" * 64
+    captured: dict[str, object] = {}
+    batch = SimpleNamespace(
+        cases=(object(),),
+        quarantine_count=0,
+        registry=SimpleNamespace(fingerprint_sha256="f" * 64),
+    )
+
+    def prepare(input_path: Path, **kwargs: object) -> object:
+        captured["input_root"] = input_path
+        captured.update(kwargs)
+        return batch
+
+    monkeypatch.setattr(cli_module, "prepare_review_corpus_from_artifacts", prepare)
+    monkeypatch.setattr(
+        cli_module,
+        "write_review_package",
+        lambda root, *, release_id, batch: root / "review",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "stage-review-corpus",
+            "--input-root",
+            str(input_root),
+            "--manifest",
+            str(manifest),
+            "--output-root",
+            str(tmp_path),
+            "--release-id",
+            "corpus-20250808123456-deadbeef",
+            "--ingestion-version",
+            "ingestion-v1",
+            "--ocr-authority-lock",
+            str(lock),
+            "--expected-ocr-authority-lock-sha256",
+            lock_sha256,
+        ],
+        env={"SEN_QA_INGESTION_IMAGE_DIGEST": ""},
+    )
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert captured == {
+        "expected_image_digest": None,
+        "expected_ocr_authority_lock_sha256": lock_sha256,
+        "ingestion_version": "ingestion-v1",
+        "input_root": input_root,
+        "manifest_path": manifest,
+        "ocr_authority_lock_path": lock,
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing-lock",
+        "missing-sha",
+        "missing-path",
+        "directory",
+        "symlink",
+        "malformed-sha",
+        "legacy-only",
+        "legacy-ambiguity",
+    ],
+)
+def test_stage_review_corpus_cli_rejects_unpaired_or_untrusted_authority_value_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    """Catches malformed authority options reaching staging or leaking path values."""
+    sentinel = "PRIVATE-OCR-AUTHORITY-SENTINEL"
+    input_root = tmp_path / "raw-pages"
+    input_root.mkdir()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b"{}\n")
+    lock = tmp_path / f"{sentinel}.json"
+    lock.write_bytes(b"{}\n")
+    lock_argument: Path | None = lock
+    sha_argument: str | None = "a" * 64
+    legacy_digest = ""
+    if case == "missing-lock":
+        lock_argument = None
+    elif case == "missing-sha":
+        sha_argument = None
+    elif case == "missing-path":
+        lock_argument = tmp_path / f"missing-{sentinel}.json"
+    elif case == "directory":
+        lock_argument = tmp_path / sentinel
+        lock_argument.mkdir()
+    elif case == "symlink":
+        link = tmp_path / f"link-{sentinel}.json"
+        link.symlink_to(lock)
+        lock_argument = link
+    elif case == "malformed-sha":
+        sha_argument = "sha256:" + "a" * 64
+    elif case == "legacy-only":
+        lock_argument = None
+        sha_argument = None
+        legacy_digest = "sha256:" + "d" * 64
+    else:
+        legacy_digest = "sha256:" + "d" * 64
+    arguments = [
+        "stage-review-corpus",
+        "--input-root",
+        str(input_root),
+        "--manifest",
+        str(manifest),
+        "--output-root",
+        str(tmp_path),
+        "--release-id",
+        "corpus-20250808123456-deadbeef",
+        "--ingestion-version",
+        "ingestion-v1",
+    ]
+    if lock_argument is not None:
+        arguments.extend(("--ocr-authority-lock", str(lock_argument)))
+    if sha_argument is not None:
+        arguments.extend(("--expected-ocr-authority-lock-sha256", sha_argument))
+
+    def must_not_prepare(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("invalid authority must fail before staging")
+
+    monkeypatch.setattr(
+        cli_module,
+        "prepare_review_corpus_from_artifacts",
+        must_not_prepare,
+    )
+    result = CliRunner().invoke(
+        app,
+        arguments,
+        env={"SEN_QA_INGESTION_IMAGE_DIGEST": legacy_digest},
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout.strip() == "failed=1 error_code=review_staging_failed"
+    assert result.stderr == ""
+    assert sentinel not in result.stdout + result.stderr
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+    assert sentinel not in str(result.exception) + repr(result.exception)
+
+
+def test_stage_review_corpus_cli_sanitizes_staging_type_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a dependency type error disclosing lock paths through Click."""
+    sentinel = "PRIVATE-STAGING-TYPE-SENTINEL"
+    input_root = tmp_path / "raw-pages"
+    input_root.mkdir()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b"{}\n")
+    lock = tmp_path / f"{sentinel}.json"
+    lock.write_bytes(b"{}\n")
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise TypeError(sentinel)
+
+    monkeypatch.setattr(cli_module, "prepare_review_corpus_from_artifacts", fail)
+    result = CliRunner().invoke(
+        app,
+        [
+            "stage-review-corpus",
+            "--input-root",
+            str(input_root),
+            "--manifest",
+            str(manifest),
+            "--output-root",
+            str(tmp_path),
+            "--release-id",
+            "corpus-20250808123456-deadbeef",
+            "--ingestion-version",
+            "ingestion-v1",
+            "--ocr-authority-lock",
+            str(lock),
+            "--expected-ocr-authority-lock-sha256",
+            "a" * 64,
+        ],
+        env={"SEN_QA_INGESTION_IMAGE_DIGEST": ""},
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout.strip() == "failed=1 error_code=review_staging_failed"
+    assert result.stderr == ""
+    assert sentinel not in result.stdout + result.stderr
+    assert result.exception is not None
+    assert result.exception.__cause__ is None
+    assert result.exception.__context__ is None
+    assert sentinel not in str(result.exception) + repr(result.exception)
 
 
 def test_review_export_ready_cli_is_value_free(
@@ -1454,16 +2886,32 @@ def test_parse_metadata_cli_canonical_failure_has_one_fixed_error(
     assert result.exception.__context__ is None
 
 
-def test_parse_metadata_cli_requires_matching_ocr_image_digest(
+def test_parse_metadata_cli_preserves_matching_legacy_2023_image_digest(
     tmp_path: Path,
 ) -> None:
-    """Catches OCR metadata running without binding the ingestion container image."""
+    """Catches the approved 2023 Paddle route losing its container binding."""
     manifest_path, documents = _write_manifest(tmp_path)
     digest = "sha256:" + "d" * 64
     input_path = tmp_path / "ocr.jsonl"
+    document = documents[3]
+    assert document.render_dpi is not None
     _write_jsonl(
         input_path,
-        (_ocr_quarantine_record(documents[-1], image_digest=digest),),
+        (
+            QuarantinedOcrPageRecord(
+                schema_version=2,
+                doc_id=document.doc_id,
+                edition_year=2023,
+                pdf_page_index=2,
+                page_label="1",
+                source_sha256=document.sha256,
+                render_sha256=None,
+                render_dpi=document.render_dpi,
+                image_digest=digest,
+                quality_flags=("source_approx_96dpi",),
+                reason_code="page-render-failed",
+            ),
+        ),
     )
     command = [
         "parse-metadata",
@@ -1472,7 +2920,7 @@ def test_parse_metadata_cli_requires_matching_ocr_image_digest(
         "--manifest",
         str(manifest_path),
         "--year",
-        "2025",
+        "2023",
         "--pages",
         "2",
     ]

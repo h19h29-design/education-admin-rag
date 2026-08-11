@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import stat
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -41,6 +42,319 @@ from tests.evaluation.test_release_report import _gold, _ingestion, _retrieval
 
 RELEASE_ID = "corpus-20250808123456-deadbeef"
 BACKUP_TOOL_LOCK = Path("config/backup-tools.lock.json")
+
+
+def _stage_script_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
+    roots: dict[str, Path] = {}
+    for name in ("source", "artifacts", "private-eval"):
+        root = tmp_path / name
+        root.mkdir()
+        roots[name] = root.resolve()
+    raw_root = (
+        roots["artifacts"] / "releases" / "corpus-20250807123456-11111111" / "raw-pages"
+    )
+    raw_root.mkdir(parents=True)
+    authority_lock = tmp_path / "ocr-authority-lock.json"
+    authority_lock.write_bytes(b"canonical-authority-lock\n")
+    environment = {
+        "PATH": os.environ["PATH"],
+        "SEN_QA_RELEASE_ID": RELEASE_ID,
+        "SEN_QA_SOURCE_ROOT": str(roots["source"]),
+        "SEN_QA_ARTIFACT_ROOT": str(roots["artifacts"]),
+        "SEN_QA_PRIVATE_EVAL_ROOT": str(roots["private-eval"]),
+        "SEN_QA_INGESTION_IMAGE": "sen-qa-ingestion:v2@sha256:" + "a" * 64,
+        "SEN_QA_RAW_PAGES_ROOT": str(raw_root.resolve()),
+        "SEN_QA_OCR_AUTHORITY_LOCK": str(authority_lock.resolve()),
+        "SEN_QA_OCR_AUTHORITY_LOCK_SHA256": "b" * 64,
+    }
+    return environment, raw_root.resolve(), authority_lock.resolve()
+
+
+def _write_successful_stage_docker(tmp_path: Path, environment: dict[str, str]) -> Path:
+    fake_bin = tmp_path / "stage-bin"
+    fake_bin.mkdir()
+    capture = tmp_path / "docker-arguments"
+    docker = fake_bin / "docker"
+    docker.write_text(
+        """#!/usr/bin/env bash
+set -eu
+: > "$SEN_QA_CAPTURE"
+output=""
+authority=""
+for argument in "$@"; do
+  printf '%s\n' "$argument" >> "$SEN_QA_CAPTURE"
+  case "$argument" in
+    *:/sen-qa/output:rw) output="${argument%:/sen-qa/output:rw}" ;;
+    *:/sen-qa/ocr-authority-lock.json:ro)
+      authority="${argument%:/sen-qa/ocr-authority-lock.json:ro}"
+      ;;
+  esac
+done
+test -n "$output"
+test -n "$authority"
+mkdir -p "$output/review/candidates"
+chmod 0700 "$output/review" "$output/review/candidates"
+for name in registry.json documents.json review-queue.jsonl review.sqlite3; do
+  : > "$output/review/$name"
+  chmod 0600 "$output/review/$name"
+done
+printf '{}\n' > "$output/review/candidates/senqa-2025-contract-contract-general-1.json"
+chmod 0600 "$output/review/candidates/senqa-2025-contract-contract-general-1.json"
+candidate_sha="$(shasum -a 256 "$output/review/candidates/senqa-2025-contract-contract-general-1.json" | awk '{print $1}')"
+printf '{"cases":[{"case_id":"senqa-2025-contract-contract-general-1","content_sha256":"%s","source_locations":[]}],"schema_version":"sen-qa-canonical-review-registry/v1"}\n' "$candidate_sha" > "$output/review/registry.json"
+printf '{"doc_id":"sen-qa-2025","edition_year":2025,"page_id":1,"reason_code":"ambiguous-case-boundary"}\n' > "$output/review/parser-quarantines.jsonl"
+chmod 0600 "$output/review/parser-quarantines.jsonl"
+quarantine_sha="$(shasum -a 256 "$output/review/parser-quarantines.jsonl" | awk '{print $1}')"
+printf '{"case_count":1,"quarantine_count":1,"parser_quarantines_sha256":"%s","schema_version":"sen-qa-review-package/v3"}\n' "$quarantine_sha" > "$output/review/summary.json"
+printf '{"parser_quarantine_count":1,"parser_quarantines_sha256":"%s","schema_version":"sen-qa-ingestion-evidence/v3"}\n' "$quarantine_sha" > "$output/review/ingestion-evidence.json"
+chmod 0600 "$output/review/summary.json" "$output/review/ingestion-evidence.json"
+cp "$authority" "$output/review/ocr-authority-lock.json"
+chmod 0600 "$output/review/ocr-authority-lock.json"
+case "${SEN_QA_STAGE_MUTATION:-}" in
+  candidate-missing) rm "$output/review/candidates/"*.json ;;
+  candidate-mode) chmod 0644 "$output/review/candidates/"*.json ;;
+  candidate-hash) printf '{}\n' >> "$output/review/candidates/"*.json ;;
+  candidate-extra) cp "$output/review/candidates/"*.json "$output/review/candidates/extra.json" ;;
+  quarantine-missing) rm "$output/review/parser-quarantines.jsonl" ;;
+  quarantine-mode) chmod 0644 "$output/review/parser-quarantines.jsonl" ;;
+  quarantine-hash) printf '%064d' 0 >> "$output/review/parser-quarantines.jsonl" ;;
+  quarantine-count) printf '{}\n' >> "$output/review/parser-quarantines.jsonl" ;;
+  metadata-count-disagree)
+    printf '{"parser_quarantine_count":2,"parser_quarantines_sha256":"%s","schema_version":"sen-qa-ingestion-evidence/v3"}\n' "$quarantine_sha" > "$output/review/ingestion-evidence.json"
+    ;;
+  zero-quarantine)
+    rm "$output/review/parser-quarantines.jsonl"
+    printf '{"case_count":1,"quarantine_count":0,"schema_version":"sen-qa-review-package/v2"}\n' > "$output/review/summary.json"
+    printf '{"parser_quarantine_count":0,"schema_version":"sen-qa-ingestion-evidence/v2"}\n' > "$output/review/ingestion-evidence.json"
+    ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["SEN_QA_CAPTURE"] = str(capture)
+    return capture
+
+
+def test_prebuilt_stage_script_mounts_exact_authorities_read_only_and_writes_review_only(
+    tmp_path: Path,
+) -> None:
+    environment, raw_root, authority_lock = _stage_script_environment(tmp_path)
+    capture = _write_successful_stage_docker(tmp_path, environment)
+
+    completed = subprocess.run(
+        ["bash", "scripts/stage-review-corpus.sh"],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    release_root = Path(environment["SEN_QA_ARTIFACT_ROOT"]) / "releases" / RELEASE_ID
+    review_root = release_root / "review"
+    arguments = capture.read_text(encoding="utf-8").splitlines()
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert completed.stdout == (
+        f"release_id={RELEASE_ID} stage=review_pending failed=0\n"
+    )
+    assert {path.name for path in release_root.iterdir()} == {"review"}
+    assert stat.S_IMODE(review_root.stat().st_mode) == 0o700
+    assert (review_root / "ocr-authority-lock.json").read_bytes() == (
+        authority_lock.read_bytes()
+    )
+    assert "--network" in arguments
+    assert "none" in arguments
+    assert "--read-only" in arguments
+    assert f"{raw_root}:/sen-qa/raw-pages:ro" in arguments
+    assert f"{authority_lock}:/sen-qa/ocr-authority-lock.json:ro" in arguments
+    assert f"{release_root}:/sen-qa/output:rw" in arguments
+    assert "stage-review-corpus" in arguments
+    assert "--ocr-authority-lock" in arguments
+    assert "/sen-qa/ocr-authority-lock.json" in arguments
+    assert "--expected-ocr-authority-lock-sha256" in arguments
+    assert "b" * 64 in arguments
+    assert "--ingestion-version" in arguments
+    assert "image-" + "a" * 64 in arguments
+    assert environment["SEN_QA_SOURCE_ROOT"] not in "\n".join(arguments)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "candidate-missing",
+        "candidate-mode",
+        "candidate-hash",
+        "candidate-extra",
+        "quarantine-missing",
+        "quarantine-mode",
+        "quarantine-hash",
+        "quarantine-count",
+        "metadata-count-disagree",
+    ],
+)
+def test_prebuilt_stage_script_rejects_incomplete_or_forged_review_payload(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Catches staged candidates or quarantine authority drifting from metadata."""
+    environment, _, _ = _stage_script_environment(tmp_path)
+    _write_successful_stage_docker(tmp_path, environment)
+    environment["SEN_QA_STAGE_MUTATION"] = mutation
+
+    completed = subprocess.run(
+        ["bash", "scripts/stage-review-corpus.sh"],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert completed.stderr == "failed=1 error_code=review_output_invalid\n"
+
+
+def test_prebuilt_stage_script_accepts_metadata_bound_zero_quarantine_package(
+    tmp_path: Path,
+) -> None:
+    """Catches the valid v2 absence contract being mistaken for a missing artifact."""
+    environment, _, _ = _stage_script_environment(tmp_path)
+    _write_successful_stage_docker(tmp_path, environment)
+    environment["SEN_QA_STAGE_MUTATION"] = "zero-quarantine"
+
+    completed = subprocess.run(
+        ["bash", "scripts/stage-review-corpus.sh"],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert completed.stdout == (
+        f"release_id={RELEASE_ID} stage=review_pending failed=0\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "error_code"),
+    [
+        ("raw-relative", "review_raw_root_invalid"),
+        ("raw-symlink", "review_raw_root_invalid"),
+        ("raw-artifact-overlap", "review_raw_root_invalid"),
+        ("raw-output-ancestor", "review_raw_root_invalid"),
+        ("lock-symlink", "ocr_authority_lock_invalid"),
+        ("sha-prefixed", "ocr_authority_lock_sha256_invalid"),
+        ("legacy-env", "review_staging_environment_ambiguous"),
+        ("output-exists", "review_output_exists"),
+        ("argument", "review_staging_arguments_invalid"),
+    ],
+)
+def test_prebuilt_stage_script_rejects_path_hash_and_environment_ambiguity(
+    tmp_path: Path,
+    case: str,
+    error_code: str,
+) -> None:
+    environment, raw_root, authority_lock = _stage_script_environment(tmp_path)
+    private = "PRIVATE-STAGE-SENTINEL"
+    arguments = ["bash", "scripts/stage-review-corpus.sh"]
+    if case == "raw-relative":
+        environment["SEN_QA_RAW_PAGES_ROOT"] = private
+    elif case == "raw-symlink":
+        link = tmp_path / f"raw-{private}"
+        link.symlink_to(raw_root, target_is_directory=True)
+        environment["SEN_QA_RAW_PAGES_ROOT"] = str(link)
+    elif case == "raw-artifact-overlap":
+        environment["SEN_QA_RAW_PAGES_ROOT"] = environment["SEN_QA_ARTIFACT_ROOT"]
+    elif case == "raw-output-ancestor":
+        environment["SEN_QA_RAW_PAGES_ROOT"] = str(
+            Path(environment["SEN_QA_ARTIFACT_ROOT"]) / "releases"
+        )
+    elif case == "lock-symlink":
+        link = tmp_path / f"lock-{private}.json"
+        link.symlink_to(authority_lock)
+        environment["SEN_QA_OCR_AUTHORITY_LOCK"] = str(link)
+    elif case == "sha-prefixed":
+        environment["SEN_QA_OCR_AUTHORITY_LOCK_SHA256"] = "sha256:" + "b" * 64
+    elif case == "legacy-env":
+        environment["SEN_QA_INGESTION_IMAGE_DIGEST"] = "sha256:" + "c" * 64
+    elif case == "output-exists":
+        output = Path(environment["SEN_QA_ARTIFACT_ROOT"]) / "releases" / RELEASE_ID
+        output.mkdir(parents=True)
+    else:
+        arguments.append(private)
+    fake_bin = tmp_path / "must-not-run-bin"
+    fake_bin.mkdir()
+    called = tmp_path / "docker-called"
+    docker = fake_bin / "docker"
+    docker.write_text(
+        '#!/usr/bin/env bash\nprintf called > "$SEN_QA_DOCKER_CALLED"\nexit 99\n',
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["SEN_QA_DOCKER_CALLED"] = str(called)
+
+    completed = subprocess.run(
+        arguments,
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == f"failed=1 error_code={error_code}\n"
+    assert private not in completed.stdout + completed.stderr
+    assert not called.exists()
+
+
+def test_prebuilt_stage_script_sanitizes_container_output_on_failure(
+    tmp_path: Path,
+) -> None:
+    environment, _, _ = _stage_script_environment(tmp_path)
+    private = "PRIVATE-CONTAINER-OCR-SOURCE-SENTINEL"
+    fake_bin = tmp_path / "failing-stage-bin"
+    fake_bin.mkdir()
+    docker = fake_bin / "docker"
+    docker.write_text(
+        (
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' '{private}'\n"
+            f"printf '%s\\n' '{private}' >&2\n"
+            "exit 9\n"
+        ),
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+    completed = subprocess.run(
+        ["bash", "scripts/stage-review-corpus.sh"],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert completed.stderr == "failed=1 error_code=review_staging_failed\n"
+    assert private not in completed.stdout + completed.stderr
 
 
 def _backup_payload(root: Path) -> None:

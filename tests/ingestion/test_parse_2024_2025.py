@@ -188,6 +188,22 @@ def _actual_hierarchy_lines(year: int) -> list[dict[str, object]]:
     ]
 
 
+def _merged_2024_hierarchy_lines() -> list[dict[str, object]]:
+    """Mirror Apple Vision's one-observation-per-heading projection."""
+    return [
+        {
+            "text": "IV 합성 계약",
+            "bbox": [430.0, 32.0, 550.0, 57.0],
+            "confidence": 0.96,
+        },
+        {
+            "text": "4 합성 운영",
+            "bbox": [60.0, 160.0, 430.0, 185.0],
+            "confidence": 0.96,
+        },
+    ]
+
+
 def _actual_first_card_top(year: int) -> float:
     return 217.0 if year == 2024 else 202.0
 
@@ -419,6 +435,173 @@ def test_plain_digit_in_card_opens_case_even_when_title_arrives_first(
     assert candidate_locations.index(title_location) < candidate_locations.index(
         number_location
     )
+
+
+def test_2024_unique_merged_vision_hierarchy_opens_review_locked_case() -> None:
+    """Catches one-line Vision headings losing otherwise locatable card cases."""
+    top = _actual_first_card_top(2024)
+    page = _actual_card_page(
+        2024,
+        [
+            *_merged_2024_hierarchy_lines(),
+            *_actual_case_lines("1", top, "병합"),
+        ],
+        [[60.0, top, 540.0, top + 240.0]],
+    )
+
+    result = parse_pages((page,), edition_year=2024)
+
+    assert len(result.cases) == 1
+    assert result.quarantines == ()
+    candidate = result.cases[0]
+    assert (candidate.domain, candidate.part) == ("합성 계약", "합성 운영")
+    assert candidate.review_status == "needs_review"
+    assert not candidate.search_eligible
+    assert not candidate.answer_eligible
+
+
+def test_2024_conflicting_merged_and_split_domain_quarantines_page() -> None:
+    """Catches one OCR projection silently overriding a conflicting hierarchy."""
+    top = _actual_first_card_top(2024)
+    page = _actual_card_page(
+        2024,
+        [
+            *_merged_2024_hierarchy_lines(),
+            {
+                "text": "V",
+                "bbox": [430.0, 65.0, 455.0, 90.0],
+                "confidence": 0.96,
+            },
+            {
+                "text": "충돌 영역",
+                "bbox": [465.0, 65.0, 550.0, 90.0],
+                "confidence": 0.96,
+            },
+            *_actual_case_lines("1", top, "충돌"),
+        ],
+        [[60.0, top, 540.0, top + 240.0]],
+    )
+
+    result = parse_pages((page,), edition_year=2024)
+
+    assert result.cases == ()
+    assert [item.reason_code for item in result.quarantines] == ["ambiguous_boundary"]
+    assert result.quarantines[0].page_ids == (10,)
+
+
+def test_2024_multiple_merged_left_headings_quarantine_instead_of_reusing_state() -> (
+    None
+):
+    """Catches an ambiguous Vision heading picking or inheriting a stale part."""
+    top = _actual_first_card_top(2024)
+    first = _actual_card_page(
+        2024,
+        [
+            *_merged_2024_hierarchy_lines(),
+            *_actual_case_lines("1", top, "첫번째"),
+        ],
+        [[60.0, top, 540.0, top + 240.0]],
+    )
+    ambiguous = _actual_card_page(
+        2024,
+        [
+            *_merged_2024_hierarchy_lines(),
+            {
+                "text": "5 합성 다른 운영",
+                "bbox": [60.0, 187.0, 430.0, 212.0],
+                "confidence": 0.96,
+            },
+            *_actual_case_lines("2", top, "둘번째"),
+        ],
+        [[60.0, top, 540.0, top + 240.0]],
+    )
+    assert ambiguous.layout_segment_provenance is not None
+    ambiguous = ambiguous.model_copy(
+        update={
+            "pdf_page_index": 11,
+            "page_label": "11",
+            "layout_segment_provenance": ambiguous.layout_segment_provenance.model_copy(
+                update={"pdf_page_index": 11}
+            ),
+        }
+    )
+
+    result = parse_pages((first, ambiguous), edition_year=2024)
+
+    assert [case.case_no for case in result.cases] == ["1"]
+    assert [item.reason_code for item in result.quarantines] == ["ambiguous_boundary"]
+    assert result.quarantines[0].page_ids == (11,)
+    assert not result.cases[0].search_eligible
+    assert not result.cases[0].answer_eligible
+
+
+def test_2024_ambiguous_next_page_keeps_unclosed_case_evidence_together() -> None:
+    """Catches an unclosed case being split from its ambiguous continuation page."""
+    top = _actual_first_card_top(2024)
+    first = _actual_card_page(
+        2024,
+        [
+            *_merged_2024_hierarchy_lines(),
+            *_actual_case_lines("1", top, "미완료"),
+        ],
+        [[60.0, top, 540.0, top + 60.0]],
+    )
+    ambiguous = _actual_card_page(
+        2024,
+        [
+            *_merged_2024_hierarchy_lines(),
+            {
+                "text": "5 합성 다른 운영",
+                "bbox": [60.0, 187.0, 430.0, 212.0],
+                "confidence": 0.96,
+            },
+        ],
+        [[60.0, top, 540.0, top + 60.0]],
+    )
+    assert ambiguous.layout_segment_provenance is not None
+    ambiguous = ambiguous.model_copy(
+        update={
+            "pdf_page_index": 11,
+            "page_label": "11",
+            "layout_segment_provenance": ambiguous.layout_segment_provenance.model_copy(
+                update={"pdf_page_index": 11}
+            ),
+        }
+    )
+
+    result = parse_pages((first, ambiguous), edition_year=2024)
+
+    assert result.cases == ()
+    assert [item.reason_code for item in result.quarantines] == ["ambiguous_boundary"]
+    assert result.quarantines[0].page_ids == (10, 11)
+    assert result.quarantines[0].span_count > len(ambiguous.lines)
+
+
+def test_2025_narrow_centered_vision_part_heading_opens_ineligible_case() -> None:
+    """Catches Vision's tight heading box falling below the reviewed width floor."""
+    top = _actual_first_card_top(2025)
+    hierarchy = _actual_hierarchy_lines(2025)
+    page = _actual_card_page(
+        2025,
+        [
+            {
+                "text": "1편 합성 운영",
+                "bbox": [252.0, 88.0, 348.0, 120.0],
+                "confidence": 0.96,
+            },
+            *hierarchy[1:],
+            *_actual_case_lines("1", top, "좁은 폭"),
+        ],
+        [[60.0, top, 540.0, top + 240.0]],
+    )
+
+    result = parse_pages((page,), edition_year=2025)
+
+    assert len(result.cases) == 1
+    assert result.quarantines == ()
+    assert result.cases[0].part == "합성 운영"
+    assert not result.cases[0].search_eligible
+    assert not result.cases[0].answer_eligible
 
 
 @pytest.mark.parametrize("year", [2024, 2025])

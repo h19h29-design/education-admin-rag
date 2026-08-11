@@ -344,6 +344,12 @@ class IngestionRun(CanonicalModel):
     extractor_version: str = Field(min_length=1)
     ocr_engine_version: str | None = None
     ocr_model_version: str | None = None
+    ocr_authority_lock_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    ocr_authority_self_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     container_image: str = Field(min_length=1)
     normalizer_version: str = Field(min_length=1)
     parser_version: str = Field(min_length=1)
@@ -368,6 +374,22 @@ class IngestionRun(CanonicalModel):
                 char not in "0123456789abcdef" for char in source_sha256
             ):
                 raise ValueError("source SHA-256 values must be lowercase hexadecimal")
+        authority_values = (
+            self.ocr_authority_lock_sha256,
+            self.ocr_authority_self_sha256,
+        )
+        if (authority_values[0] is None) != (authority_values[1] is None):
+            raise ValueError("OCR authority hashes must be present as an exact pair")
+        if authority_values[0] is not None and (
+            self.ocr_engine_version != f"authority-lock:{authority_values[0]}"
+            or self.ocr_model_version != f"authority-self:{authority_values[1]}"
+        ):
+            raise ValueError("OCR authority hashes must bind the OCR version fields")
+        if authority_values[0] is None and (
+            (self.ocr_engine_version or "").startswith("authority-lock:")
+            or (self.ocr_model_version or "").startswith("authority-self:")
+        ):
+            raise ValueError("OCR authority version fields require authority hashes")
         return self
 
 

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import stat
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn, cast
@@ -34,6 +35,14 @@ from src.corpus.storage import (
     load_review_decision_snapshot,
     read_issuance_snapshot,
 )
+from src.ingestion.ocr_authority import (
+    OcrAuthorityEntry,
+    OcrAuthorityLock,
+    OcrAuthorityLockError,
+    canonical_ocr_authority_bytes,
+    load_ocr_authority_lock,
+)
+from src.ingestion.quarantine_review import load_resolution_authority
 from src.ingestion.review import (
     CanonicalReviewRegistry,
     VerifiedCanonicalReviewRegistry,
@@ -52,6 +61,23 @@ class FinalizationError(ValueError):
 
 class _DuplicateKey(ValueError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedOcrAuthority:
+    lock: OcrAuthorityLock
+    lock_file_sha256: str
+    lock_self_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _LoadedIngestionEvidence:
+    document_page_counts: dict[str, DocumentPageCounts]
+    manifest_sha256: str
+    parser_authority_sha256: str
+    raw_authority_sha256: str
+    ocr_authority: _VerifiedOcrAuthority | None
+    resolution_authority_sha256: str | None
 
 
 def _raise(code: str) -> NoReturn:
@@ -114,7 +140,7 @@ def _read_regular(path: Path, *, max_bytes: int = _MAX_METADATA_BYTES) -> bytes 
 def _json_object(raw: bytes) -> dict[str, object] | None:
     try:
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
-    except (UnicodeError, json.JSONDecodeError, _DuplicateKey):
+    except (UnicodeError, RecursionError, ValueError):
         return None
     return cast(dict[str, object], value) if type(value) is dict else None
 
@@ -138,12 +164,13 @@ def _load_attestation(
     raw = _read_regular(package / "review-ready.attestation.json")
     if (
         raw is None
-        or not _SHA256_RE.fullmatch(expected_sha256)
+        or type(expected_sha256) is not str
+        or _SHA256_RE.fullmatch(expected_sha256) is None
         or not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), expected_sha256)
     ):
         _raise("review_ready_attestation_invalid")
     payload = _json_object(raw)
-    expected_fields = {
+    base_fields = {
         "approved_count",
         "candidate_binding_sha256",
         "case_count",
@@ -155,14 +182,25 @@ def _load_attestation(
         "schema_version",
         "snapshot_sha256",
     }
+    if payload is None:
+        _raise("review_ready_attestation_invalid")
+    schema_version = payload.get("schema_version")
+    if schema_version == "sen-qa-review-ready-attestation/v1":
+        expected_fields = base_fields
+    elif schema_version == "sen-qa-review-ready-attestation/v2":
+        expected_fields = base_fields | {"ocr_authority_lock_sha256"}
+    elif schema_version == "sen-qa-review-ready-attestation/v3":
+        expected_fields = base_fields | {"resolution_authority_sha256"}
+        if "ocr_authority_lock_sha256" in payload:
+            expected_fields.add("ocr_authority_lock_sha256")
+    else:
+        _raise("review_ready_attestation_invalid")
     if (
-        payload is None
-        or set(payload) != expected_fields
-        or payload["schema_version"] != "sen-qa-review-ready-attestation/v1"
+        set(payload) != expected_fields
         or payload["release_id"] != release_id
         or payload["registry_sha256"] != expected_registry_sha256
         or any(
-            not isinstance(payload[key], str)
+            type(payload[key]) is not str
             or _SHA256_RE.fullmatch(cast(str, payload[key])) is None
             for key in (
                 "candidate_binding_sha256",
@@ -172,9 +210,7 @@ def _load_attestation(
             )
         )
         or any(
-            isinstance(payload[key], bool)
-            or not isinstance(payload[key], int)
-            or cast(int, payload[key]) < 0
+            type(payload[key]) is not int or cast(int, payload[key]) < 0
             for key in ("approved_count", "case_count", "rejected_count")
         )
         or cast(int, payload["case_count"]) < 1
@@ -182,6 +218,24 @@ def _load_attestation(
         or cast(int, payload["approved_count"]) + cast(int, payload["rejected_count"])
         != cast(int, payload["case_count"])
         or _canonical_json(payload) + b"\n" != raw
+    ):
+        _raise("review_ready_attestation_invalid")
+    if (
+        schema_version
+        in {
+            "sen-qa-review-ready-attestation/v2",
+            "sen-qa-review-ready-attestation/v3",
+        }
+        and "ocr_authority_lock_sha256" in payload
+        and (
+            type(payload["ocr_authority_lock_sha256"]) is not str
+            or _SHA256_RE.fullmatch(payload["ocr_authority_lock_sha256"]) is None
+        )
+    ):
+        _raise("review_ready_attestation_invalid")
+    if schema_version == "sen-qa-review-ready-attestation/v3" and (
+        type(payload["resolution_authority_sha256"]) is not str
+        or _SHA256_RE.fullmatch(payload["resolution_authority_sha256"]) is None
     ):
         _raise("review_ready_attestation_invalid")
     return payload
@@ -217,35 +271,112 @@ def _load_documents(package: Path, *, expected_sha256: str) -> tuple[Document, .
     return documents
 
 
+def _path_is_absent(path: Path) -> bool:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _authority_matches_documents(
+    lock: OcrAuthorityLock,
+    documents: tuple[Document, ...],
+) -> bool:
+    expected_runtime_shape = {
+        2023: ("sen-qa-ocr-page/v2", "paddleocr"),
+        2024: ("sen-qa-ocr-page/v3", "apple-vision"),
+        2025: ("sen-qa-ocr-page/v3", "apple-vision"),
+    }
+    if (
+        type(lock.entries) is not tuple
+        or len(lock.entries) != 3
+        or any(type(entry) is not OcrAuthorityEntry for entry in lock.entries)
+        or tuple(entry.year for entry in lock.entries) != (2023, 2024, 2025)
+    ):
+        return False
+    ocr_documents = {
+        document.doc_id: document
+        for document in documents
+        if document.extraction_method == "ocr"
+    }
+    if set(ocr_documents) != {entry.doc_id for entry in lock.entries}:
+        return False
+    for entry in lock.entries:
+        if (
+            type(entry) is not OcrAuthorityEntry
+            or type(entry.year) is not int
+            or entry.year not in expected_runtime_shape
+            or (entry.record_schema, entry.engine) != expected_runtime_shape[entry.year]
+        ):
+            return False
+        document = ocr_documents[entry.doc_id]
+        if document.edition_year != entry.year or not hmac.compare_digest(
+            document.sha256, entry.source_sha256
+        ):
+            return False
+    return True
+
+
 def _load_evidence(
     package: Path,
     *,
     expected_sha256: str,
     documents: tuple[Document, ...],
-) -> tuple[dict[str, DocumentPageCounts], str, str, str]:
+    attestation: dict[str, object],
+) -> _LoadedIngestionEvidence:
     raw = _read_regular(package / "ingestion-evidence.json")
-    if raw is None or not hmac.compare_digest(
-        hashlib.sha256(raw).hexdigest(), expected_sha256
+    if (
+        raw is None
+        or type(expected_sha256) is not str
+        or _SHA256_RE.fullmatch(expected_sha256) is None
+        or not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), expected_sha256)
     ):
         _raise("ingestion_evidence_invalid")
     payload = _json_object(raw)
-    if (
-        payload is None
-        or set(payload)
-        != {
-            "document_page_counts",
-            "manifest_sha256",
-            "parser_quarantine_count",
-            "parser_authority_sha256",
-            "raw_authority_sha256",
-            "schema_version",
+    base_fields = {
+        "document_page_counts",
+        "manifest_sha256",
+        "parser_quarantine_count",
+        "parser_authority_sha256",
+        "raw_authority_sha256",
+        "schema_version",
+    }
+    if payload is None:
+        _raise("ingestion_evidence_invalid")
+    schema_version = payload.get("schema_version")
+    has_ocr = any(document.extraction_method == "ocr" for document in documents)
+    resolution_fields = {
+        "resolution_authority_sha256",
+        "resolved_from_parser_authority_sha256",
+        "resolved_from_parser_quarantines_sha256",
+        "resolved_from_registry_sha256",
+    }
+    if schema_version == "sen-qa-ingestion-evidence/v1":
+        expected_fields = base_fields
+    elif schema_version == "sen-qa-ingestion-evidence/v2":
+        expected_fields = base_fields | {
+            "ocr_authority_lock_sha256",
+            "ocr_authority_self_sha256",
         }
-        or payload["schema_version"] != "sen-qa-ingestion-evidence/v1"
+    elif schema_version == "sen-qa-ingestion-evidence/v4":
+        expected_fields = base_fields | resolution_fields
+        if has_ocr:
+            expected_fields |= {
+                "ocr_authority_lock_sha256",
+                "ocr_authority_self_sha256",
+            }
+    else:
+        _raise("ingestion_evidence_invalid")
+    if (
+        set(payload) != expected_fields
         or type(payload["document_page_counts"]) is not dict
         or type(payload["parser_quarantine_count"]) is not int
         or payload["parser_quarantine_count"] != 0
         or any(
-            not isinstance(payload[key], str)
+            type(payload[key]) is not str
             or _SHA256_RE.fullmatch(cast(str, payload[key])) is None
             for key in (
                 "manifest_sha256",
@@ -256,35 +387,140 @@ def _load_evidence(
         or _canonical_json(payload) + b"\n" != raw
     ):
         _raise("ingestion_evidence_invalid")
+    serialized_counts = cast(dict[object, object], payload["document_page_counts"])
+    if any(type(doc_id) is not str for doc_id in serialized_counts):
+        _raise("ingestion_evidence_invalid")
     try:
         counts = {
             doc_id: DocumentPageCounts.model_validate(item)
-            for doc_id, item in cast(
-                dict[object, object], payload["document_page_counts"]
-            ).items()
-            if isinstance(doc_id, str)
+            for doc_id, item in cast(dict[str, object], serialized_counts).items()
         }
     except (TypeError, ValueError):
         _raise("ingestion_evidence_invalid")
     document_by_id = {item.doc_id: item for item in documents}
-    if (
-        set(counts) != set(document_by_id)
-        or len(counts)
-        != len(cast(dict[object, object], payload["document_page_counts"]))
-        or any(
-            count.succeeded + count.quarantined + count.failed
-            != document_by_id[doc_id].pdf_page_count
-            or count.quarantined != 0
-            or count.failed != 0
-            for doc_id, count in counts.items()
-        )
+    if set(counts) != set(document_by_id) or any(
+        count.succeeded + count.quarantined + count.failed
+        != document_by_id[doc_id].pdf_page_count
+        or count.quarantined != 0
+        or count.failed != 0
+        for doc_id, count in counts.items()
     ):
         _raise("ingestion_evidence_incomplete")
-    return (
-        counts,
-        cast(str, payload["manifest_sha256"]),
-        cast(str, payload["parser_authority_sha256"]),
-        cast(str, payload["raw_authority_sha256"]),
+    authority_path = package / "ocr-authority-lock.json"
+    quarantine_path = package / "parser-quarantines.jsonl"
+    resolution_path = package / "parser-quarantine-resolutions.json"
+    if not _path_is_absent(quarantine_path):
+        _raise("ingestion_evidence_invalid")
+    resolution_sha256: str | None = None
+    if schema_version == "sen-qa-ingestion-evidence/v4":
+        raw_resolution_sha256 = payload["resolution_authority_sha256"]
+        if (
+            attestation.get("schema_version") != "sen-qa-review-ready-attestation/v3"
+            or type(raw_resolution_sha256) is not str
+            or _SHA256_RE.fullmatch(raw_resolution_sha256) is None
+            or attestation.get("resolution_authority_sha256") != raw_resolution_sha256
+        ):
+            _raise("ingestion_evidence_invalid")
+        resolution = None
+        try:
+            resolution = load_resolution_authority(
+                resolution_path,
+                expected_sha256=raw_resolution_sha256,
+            )
+        except (OSError, TypeError, ValueError):
+            resolution = None
+        if (
+            resolution is None
+            or getattr(resolution, "release_id", None) != attestation.get("release_id")
+            or resolution.quarantine_count <= 0
+            or any(item.disposition == "unresolved" for item in resolution.resolutions)
+            or resolution.manifest_sha256 != payload["manifest_sha256"]
+            or resolution.raw_authority_sha256 != payload["raw_authority_sha256"]
+            or resolution.registry_sha256 != payload["resolved_from_registry_sha256"]
+            or resolution.registry_sha256 == attestation.get("registry_sha256")
+            or resolution.parser_authority_sha256
+            != payload["resolved_from_parser_authority_sha256"]
+            or resolution.parser_quarantines_sha256
+            != payload["resolved_from_parser_quarantines_sha256"]
+            or resolution.parser_authority_sha256 == payload["parser_authority_sha256"]
+        ):
+            _raise("ingestion_evidence_invalid")
+        resolution_sha256 = raw_resolution_sha256
+    elif not _path_is_absent(resolution_path):
+        _raise("ingestion_evidence_invalid")
+    if not has_ocr:
+        if attestation.get("schema_version") != (
+            "sen-qa-review-ready-attestation/v3"
+            if schema_version == "sen-qa-ingestion-evidence/v4"
+            else "sen-qa-review-ready-attestation/v1"
+        ) or not _path_is_absent(authority_path):
+            _raise("ingestion_evidence_invalid")
+        authority = None
+    else:
+        if schema_version not in {
+            "sen-qa-ingestion-evidence/v2",
+            "sen-qa-ingestion-evidence/v4",
+        }:
+            _raise("ingestion_evidence_invalid")
+        file_sha256 = payload["ocr_authority_lock_sha256"]
+        self_sha256 = payload["ocr_authority_self_sha256"]
+        attested_file_sha256 = attestation.get("ocr_authority_lock_sha256")
+        if (
+            attestation.get("schema_version")
+            != (
+                "sen-qa-review-ready-attestation/v3"
+                if schema_version == "sen-qa-ingestion-evidence/v4"
+                else "sen-qa-review-ready-attestation/v2"
+            )
+            or type(file_sha256) is not str
+            or _SHA256_RE.fullmatch(file_sha256) is None
+            or type(self_sha256) is not str
+            or _SHA256_RE.fullmatch(self_sha256) is None
+            or type(attested_file_sha256) is not str
+            or not hmac.compare_digest(file_sha256, attested_file_sha256)
+        ):
+            _raise("ingestion_evidence_invalid")
+        lock: OcrAuthorityLock | None = None
+        canonical: bytes | None = None
+        try:
+            lock = load_ocr_authority_lock(
+                authority_path,
+                expected_sha256=file_sha256,
+            )
+            canonical = canonical_ocr_authority_bytes(lock)
+        except (
+            OcrAuthorityLockError,
+            OSError,
+            RecursionError,
+            OverflowError,
+            TypeError,
+            ValueError,
+        ):
+            lock = None
+            canonical = None
+        if (
+            type(lock) is not OcrAuthorityLock
+            or type(canonical) is not bytes
+            or not hmac.compare_digest(
+                hashlib.sha256(canonical).hexdigest(), file_sha256
+            )
+            or type(lock.self_sha256) is not str
+            or not hmac.compare_digest(lock.self_sha256, self_sha256)
+            or not _authority_matches_documents(lock, documents)
+        ):
+            _raise("ingestion_evidence_invalid")
+        authority = _VerifiedOcrAuthority(
+            lock=lock,
+            lock_file_sha256=file_sha256,
+            lock_self_sha256=self_sha256,
+        )
+    return _LoadedIngestionEvidence(
+        document_page_counts=counts,
+        manifest_sha256=cast(str, payload["manifest_sha256"]),
+        parser_authority_sha256=cast(str, payload["parser_authority_sha256"]),
+        raw_authority_sha256=cast(str, payload["raw_authority_sha256"]),
+        ocr_authority=authority,
+        resolution_authority_sha256=resolution_sha256,
     )
 
 
@@ -424,6 +660,63 @@ def _run_deltas(
     return created, changed, deleted
 
 
+def _build_ingestion_run(
+    *,
+    release_id: str,
+    documents: tuple[Document, ...],
+    evidence: _LoadedIngestionEvidence,
+    started_at: datetime,
+    ended_at: datetime,
+    created_case_ids: tuple[str, ...],
+    changed_case_ids: tuple[str, ...],
+    deleted_case_ids: tuple[str, ...],
+    approved_by: str,
+    container_image: str,
+) -> IngestionRun:
+    has_ocr = any(document.extraction_method == "ocr" for document in documents)
+    authority = evidence.ocr_authority
+    if has_ocr != (authority is not None):
+        _raise("ingestion_evidence_invalid")
+    versions = tuple(sorted({item.ingestion_version for item in documents}))
+    version_sha256 = hashlib.sha256(_canonical_json(versions)).hexdigest()
+    authority_file_sha256 = (
+        authority.lock_file_sha256 if authority is not None else None
+    )
+    authority_self_sha256 = (
+        authority.lock_self_sha256 if authority is not None else None
+    )
+    return IngestionRun(
+        run_id=f"run-{release_id}",
+        release_id=release_id,
+        started_at=started_at,
+        ended_at=ended_at,
+        manifest_version=f"sha256:{evidence.manifest_sha256}",
+        source_sha256s=tuple(sorted(item.sha256 for item in documents)),
+        extractor_version=f"ingestion-set:{version_sha256}",
+        ocr_engine_version=(
+            f"authority-lock:{authority_file_sha256}"
+            if authority_file_sha256 is not None
+            else None
+        ),
+        ocr_model_version=(
+            f"authority-self:{authority_self_sha256}"
+            if authority_self_sha256 is not None
+            else None
+        ),
+        ocr_authority_lock_sha256=authority_file_sha256,
+        ocr_authority_self_sha256=authority_self_sha256,
+        container_image=container_image,
+        normalizer_version=f"raw-authority:{evidence.raw_authority_sha256}",
+        parser_version=f"parser-authority:{evidence.parser_authority_sha256}",
+        schema_version="sen-qa-canonical-storage/v1",
+        document_page_counts=evidence.document_page_counts,
+        created_case_ids=created_case_ids,
+        changed_case_ids=changed_case_ids,
+        deleted_case_ids=deleted_case_ids,
+        approved_by=approved_by,
+    )
+
+
 def _finalize_review_ready_bundle(
     package: Path,
     release_root: Path,
@@ -473,17 +766,18 @@ def _finalize_review_ready_bundle(
         package,
         expected_sha256=cast(str, attestation["documents_sha256"]),
     )
-    counts, manifest_sha, parser_sha, raw_sha = _load_evidence(
+    evidence = _load_evidence(
         package,
         expected_sha256=cast(str, attestation["ingestion_evidence_sha256"]),
         documents=documents,
+        attestation=attestation,
     )
     cases, envelopes, registry, snapshot = _terminal_cases(
         package,
         attestation=attestation,
         expected_registry_sha256=expected_registry_sha256,
-        parser_authority_sha256=parser_sha,
-        raw_authority_sha256=raw_sha,
+        parser_authority_sha256=evidence.parser_authority_sha256,
+        raw_authority_sha256=evidence.raw_authority_sha256,
     )
     tokenizer = load_locked_tokenizer(
         embedding_model_lock,
@@ -529,35 +823,17 @@ def _finalize_review_ready_bundle(
     issuance = read_issuance_snapshot(issuance_registry_path)
     created, changed, deleted = _run_deltas(cases, issuance.records)
     started_at, ended_at = _event_times(snapshot)
-    versions = tuple(sorted({item.ingestion_version for item in documents}))
-    version_sha = hashlib.sha256(_canonical_json(versions)).hexdigest()
-    run = IngestionRun(
-        run_id=f"run-{release_id}",
+    run = _build_ingestion_run(
         release_id=release_id,
+        documents=documents,
+        evidence=evidence,
         started_at=started_at,
         ended_at=ended_at,
-        manifest_version=f"sha256:{manifest_sha}",
-        source_sha256s=tuple(sorted(item.sha256 for item in documents)),
-        extractor_version=f"ingestion-set:{version_sha}",
-        ocr_engine_version=(
-            f"container:{container_image}"
-            if any(item.extraction_method == "ocr" for item in documents)
-            else None
-        ),
-        ocr_model_version=(
-            f"container:{container_image}"
-            if any(item.extraction_method == "ocr" for item in documents)
-            else None
-        ),
-        container_image=container_image,
-        normalizer_version=f"raw-authority:{raw_sha}",
-        parser_version=f"parser-authority:{parser_sha}",
-        schema_version="sen-qa-canonical-storage/v1",
-        document_page_counts=counts,
         created_case_ids=created,
         changed_case_ids=changed,
         deleted_case_ids=deleted,
         approved_by=f"review-snapshot:{snapshot.fingerprint_sha256}",
+        container_image=container_image,
     )
     batch = CanonicalStorageBatch(
         release_id=release_id,

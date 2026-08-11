@@ -69,11 +69,14 @@ denial.
 
 ## Build status and human checkpoint
 
-`build-corpus.sh` runs source verification and all 1,877 approved extraction
-pages in network-disabled, read-only containers. It then validates the managed
-annual JSONL layout, derives privacy/quality assessments, binds every raw role
-span into a promotion envelope, and writes one owner-only
-`CanonicalReviewRegistry` plus `ReviewStore`. It exits successfully at
+The legacy all-Paddle `build-corpus.sh` entrypoint is blocked. First follow
+[`source-intake.md`](source-intake.md) and
+[`local-vision-ocr.md`](local-vision-ocr.md): native/Paddle work remains in the
+digest-pinned ingestion image, while 2024/2025 Apple Vision runs locally twice
+under a live, canonical runtime authority. `stage-review-corpus.sh` then
+validates the closed 1,877-page JSONL layout, derives privacy/quality
+assessments, binds every raw role span into a promotion envelope, and writes one
+owner-only `CanonicalReviewRegistry` plus `ReviewStore`. It exits successfully at
 `stage=review_pending`; it does not create canonical storage or an index.
 Unknown files, quarantined source provenance, hash drift, an existing review
 package, or malformed parser input fail closed without printing candidate text.

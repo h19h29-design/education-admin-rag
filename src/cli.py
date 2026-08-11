@@ -6,7 +6,9 @@ import re
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -38,6 +40,7 @@ from src.evaluation.release_report import (
     ReleaseReportError,
     create_release_evaluation_report,
 )
+from src.ingestion.apple_vision_ocr import AppleVisionOcrAdapter
 from src.ingestion.extract_native import (
     NativeExtractionError,
     extract_document,
@@ -47,10 +50,13 @@ from src.ingestion.extract_ocr import (
     ModelLockError,
     OcrAdapterError,
     OcrExtractionError,
+    build_apple_vision_runtime_provenance,
     create_paddle_adapter,
+    extract_apple_vision_document,
     extract_ocr_document,
     load_model_lock,
     validate_installed_models,
+    write_apple_vision_jsonl,
     write_ocr_jsonl,
 )
 from src.ingestion.manifest import (
@@ -1352,23 +1358,279 @@ def extract_ocr(
         raise typer.Exit(code=1)
 
 
+def _vision_ocr_fail(code: str, *, exit_code: int = 1) -> NoReturn:
+    typer.echo(
+        f"documents=0 pages=0 extracted=0 quarantined=0 failed=1 error_code={code}"
+    )
+    raise SystemExit(exit_code) from None
+
+
+def _stream_sha256(path: Path) -> str | None:
+    if type(path) is not type(Path()):
+        return None
+    descriptor: int | None = None
+    output: str | None = None
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            return None
+        descriptor = os.open(path, flags)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+            return None
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+        after = os.fstat(descriptor)
+        if total == before.st_size and (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) == (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            output = digest.hexdigest()
+    except (OSError, OverflowError, ValueError):
+        output = None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                output = None
+    return output
+
+
+def _read_vision_runtime_provenance(path: Path) -> bytes | None:
+    maximum_bytes = 65_536
+    if type(path) is not type(Path()):
+        return None
+    descriptor: int | None = None
+    raw: bytes | None = None
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            return None
+        descriptor = os.open(path, flags)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > maximum_bytes
+        ):
+            return None
+        chunks: list[bytes] = []
+        remaining = maximum_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(8192, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        candidate = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(candidate) != before.st_size
+            or len(candidate) > maximum_bytes
+            or (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+        ):
+            return None
+        raw = candidate
+    except (OSError, OverflowError, ValueError):
+        raw = None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                raw = None
+    return raw
+
+
+@app.command("extract-vision-ocr")
+def extract_vision_ocr(
+    year: int = typer.Option(..., "--year"),
+    pages: str = typer.Option(..., "--pages"),
+    output: Path = typer.Option(..., "--output"),  # noqa: B008
+    manifest: Path = typer.Option(  # noqa: B008
+        Path("data/manifests/sen_qa_sources.json"),
+        "--manifest",
+    ),
+    helper: Path = typer.Option(  # noqa: B008
+        ..., "--helper"
+    ),
+    helper_sha256: str = typer.Option(..., "--helper-sha256"),
+    helper_source: Path = typer.Option(  # noqa: B008
+        ..., "--helper-source"
+    ),
+    swift_version: str = typer.Option(..., "--swift-version"),
+    sdk_version: str = typer.Option(..., "--sdk-version"),
+    runtime_provenance: Path = typer.Option(  # noqa: B008
+        ..., "--runtime-provenance"
+    ),
+    expected_runtime_provenance_sha256: str = typer.Option(
+        ..., "--expected-runtime-provenance-sha256"
+    ),
+) -> None:
+    """Run one approved local Apple Vision v3 extraction with exact provenance."""
+    if sys.platform != "darwin":
+        _vision_ocr_fail("vision_ocr_platform_unsupported", exit_code=2)
+    if year not in (2024, 2025):
+        _vision_ocr_fail("vision_ocr_year_not_supported", exit_code=2)
+    if os.environ.get("SEN_QA_INGESTION_IMAGE_DIGEST"):
+        _vision_ocr_fail("vision_ocr_legacy_authority_forbidden", exit_code=2)
+    source_root_value = os.environ.get("SEN_QA_SOURCE_ROOT")
+    if source_root_value is None:
+        _vision_ocr_fail("vision_ocr_input_invalid", exit_code=2)
+    vision_failed = False
+    try:
+        source_root, output = _resolve_extraction_paths(Path(source_root_value), output)
+        page_indexes = _parse_ocr_pages(pages)
+        documents = load_manifest(manifest)
+        selected = tuple(
+            document for document in documents if document.edition_year == year
+        )
+        if len(selected) != 1:
+            raise ValueError
+        document = selected[0]
+        if page_indexes != tuple(range(1, document.pdf_page_count + 1)):
+            _vision_ocr_fail("vision_ocr_pages_incomplete", exit_code=2)
+        managed_output = output / f"{document.doc_id}.jsonl"
+        if output.exists():
+            entries = tuple(output.iterdir())
+            if any(entry != managed_output for entry in entries) or (
+                managed_output.exists()
+                and (managed_output.is_symlink() or not managed_output.is_file())
+            ):
+                _vision_ocr_fail("vision_ocr_output_not_clean", exit_code=2)
+        source = resolve_source(source_root, document)
+        verify_source(source, document)
+        if re.fullmatch(r"[0-9a-f]{64}", expected_runtime_provenance_sha256) is None:
+            raise ValueError
+        runtime_raw = _read_vision_runtime_provenance(runtime_provenance)
+        if runtime_raw is None:
+            raise ValueError
+        runtime_sha256 = hashlib.sha256(runtime_raw).hexdigest()
+        if runtime_sha256 != expected_runtime_provenance_sha256:
+            raise ValueError
+        runtime = build_apple_vision_runtime_provenance(runtime_raw)
+        with AppleVisionOcrAdapter(
+            helper_path=helper,
+            expected_helper_sha256=helper_sha256,
+            helper_source_path=helper_source,
+            swift_version=swift_version,
+            sdk_version=sdk_version,
+        ) as adapter:
+            if adapter.complete_runtime_provenance_bytes() != runtime_raw:
+                raise ValueError
+            records = extract_apple_vision_document(
+                source,
+                document,
+                page_indexes,
+                adapter,
+                runtime,
+            )
+        write_apple_vision_jsonl(
+            managed_output,
+            records,
+            document=document,
+            expected_runtime_fingerprint="sha256:" + runtime_sha256,
+            selected_page_indexes=page_indexes,
+        )
+        output_sha256 = _stream_sha256(managed_output)
+        if output_sha256 is None:
+            raise OSError
+    except (
+        ManifestError,
+        NativeExtractionError,
+        OcrAdapterError,
+        OcrExtractionError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        vision_failed = True
+    if vision_failed:
+        _vision_ocr_fail("vision_ocr_failed")
+    extracted = sum(record.status == "extracted" for record in records)
+    quarantined = sum(record.status == "quarantined" for record in records)
+    failed = int(quarantined > 0)
+    typer.echo(
+        f"documents=1 pages={len(records)} extracted={extracted} "
+        f"quarantined={quarantined} runtime_sha256={runtime_sha256} "
+        f"output_sha256={output_sha256} failed={failed}"
+    )
+    if quarantined:
+        raise typer.Exit(code=1)
+
+
 @app.command("parse-metadata")
 def parse_metadata(
     input_path: Path = typer.Option(..., "--input"),  # noqa: B008
     manifest: Path = typer.Option(..., "--manifest"),  # noqa: B008
     year: int = typer.Option(..., "--year"),
     pages: str = typer.Option(..., "--pages"),
+    ocr_authority_lock: Path | None = typer.Option(  # noqa: B008
+        None, "--ocr-authority-lock"
+    ),
+    expected_ocr_authority_lock_sha256: str | None = typer.Option(
+        None, "--expected-ocr-authority-lock-sha256"
+    ),
 ) -> None:
     """Validate annual extractor JSONL and emit only canonical aggregate metadata."""
     error_code: str | None = None
     rendered: bytes | None = None
     try:
+        legacy_image_digest = os.environ.get("SEN_QA_INGESTION_IMAGE_DIGEST") or None
+        if year in (2024, 2025) and (
+            legacy_image_digest is not None
+            or ocr_authority_lock is None
+            or ocr_authority_lock.is_symlink()
+            or not ocr_authority_lock.is_file()
+            or expected_ocr_authority_lock_sha256 is None
+            or re.fullmatch(r"[0-9a-f]{64}", expected_ocr_authority_lock_sha256) is None
+        ):
+            raise ParseMetadataError("authority_invalid")
         metadata = build_parse_metadata(
             input_path,
             manifest_path=manifest,
             edition_year=year,
             pages=pages,
-            expected_image_digest=os.environ.get("SEN_QA_INGESTION_IMAGE_DIGEST"),
+            expected_image_digest=legacy_image_digest,
+            ocr_authority_lock_path=ocr_authority_lock,
+            expected_ocr_authority_lock_sha256=(expected_ocr_authority_lock_sha256),
         )
         rendered = canonical_metadata_bytes(metadata)
     except ParseMetadataError as error:
@@ -1394,15 +1656,47 @@ def stage_review_corpus(
     ),
     release_id: str = typer.Option(..., "--release-id"),
     ingestion_version: str = typer.Option(..., "--ingestion-version"),
+    ocr_authority_lock: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--ocr-authority-lock",
+    ),
+    expected_ocr_authority_lock_sha256: str | None = typer.Option(
+        None,
+        "--expected-ocr-authority-lock-sha256",
+    ),
 ) -> None:
     """Create one value-free review registry and owner-only review checkpoint."""
     batch = None
     try:
+        legacy_image_digest = os.environ.get("SEN_QA_INGESTION_IMAGE_DIGEST") or None
+        has_authority_path = ocr_authority_lock is not None
+        has_authority_sha256 = expected_ocr_authority_lock_sha256 is not None
+        if (
+            legacy_image_digest is not None
+            or has_authority_path != has_authority_sha256
+            or (
+                has_authority_path
+                and (
+                    not isinstance(ocr_authority_lock, Path)
+                    or ocr_authority_lock.is_symlink()
+                    or not ocr_authority_lock.is_file()
+                    or not isinstance(expected_ocr_authority_lock_sha256, str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        expected_ocr_authority_lock_sha256,
+                    )
+                    is None
+                )
+            )
+        ):
+            raise StagingError("staging_input_invalid")
         batch = prepare_review_corpus_from_artifacts(
             input_root,
             manifest_path=manifest,
             ingestion_version=ingestion_version,
-            expected_image_digest=os.environ.get("SEN_QA_INGESTION_IMAGE_DIGEST"),
+            expected_image_digest=None,
+            ocr_authority_lock_path=ocr_authority_lock,
+            expected_ocr_authority_lock_sha256=(expected_ocr_authority_lock_sha256),
         )
         write_review_package(output_root, release_id=release_id, batch=batch)
     except (OSError, StagingError, TypeError, ValueError):
