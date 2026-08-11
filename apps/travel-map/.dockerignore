@@ -1,0 +1,32 @@
+# Start deny-by-default. Only immutable application code and normalized runtime
+# resources are available to Docker; the final stage makes its own allow-list.
+**
+
+!pyproject.toml
+!uv.lock
+!app/
+!app/**
+!resources/
+!resources/rules/
+!resources/rules/**
+!resources/geodata/
+!resources/geodata/manifest.json
+!resources/geodata/seoul.geojson
+!resources/geodata/seoul-plus-12km.geojson
+!resources/institution-snapshots/
+!resources/institution-snapshots/**
+
+# Explicit defence-in-depth exclusions for sensitive, raw, and non-runtime data.
+.env
+.env.*
+.git/
+tests/
+e2e/
+artifacts/
+node_modules/
+test-results/
+playwright-report/
+resources/geodata/source/
+resources/institution-sources/
+resources/raw/
+**/raw/
