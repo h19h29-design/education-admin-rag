@@ -382,7 +382,7 @@ def validate_and_transform(
         type(raw) is not bytes
         or not raw
         or len(raw) > _MAX_WEBHOOK_BYTES
-        or event != "Note Hook"
+        or event not in {"Note Hook", "Confidential Note Hook"}
         or type(supplied_secret) is not str
         or type(expected_secret) is not str
         or not 16 <= len(expected_secret) <= 512

@@ -189,6 +189,25 @@ def test_valid_webhook_runs_filter_once() -> None:
     assert checked == expected
 
 
+def test_confidential_note_hook_event_runs_filter_once() -> None:
+    calls: list[bytes] = []
+
+    def filter_runner(raw: bytes) -> bytes:
+        calls.append(raw)
+        return b"[SILENT]\n"
+
+    checked = validate_and_transform(
+        b'{"object_kind":"note"}',
+        event="Confidential Note Hook",
+        supplied_secret="correct-secret-12",
+        expected_secret="correct-secret-12",
+        filter_runner=filter_runner,
+    )
+
+    assert checked is None
+    assert calls == [b'{"object_kind":"note"}']
+
+
 def test_answer_job_runs_hermes_without_tools_then_delivers() -> None:
     captured: dict[str, object] = {}
 
