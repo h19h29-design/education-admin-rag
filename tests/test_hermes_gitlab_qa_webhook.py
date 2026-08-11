@@ -40,7 +40,7 @@ def _search_fixture(tmp_path: Path, *, exit_code: int = 0) -> tuple[Path, Path]:
         + (
             "exit 7\n"
             if exit_code
-            else 'printf \'%s\\n\' \'{"complete_corpus":false,"production_eligible":false,"query":"fixture","results":[{"case_id":"senqa-2022-case-a","edition_year":2022,"pdf_pages":[4],"title":"fixture"}],"schema_version":"sen-qa-preview-search-response/v1","warning_code":"unreviewed_incomplete_preview"}\'\n'
+            else 'test "$5" = "20" || exit 8\nprintf \'%s\\n\' \'{"complete_corpus":false,"production_eligible":false,"query":"fixture","results":[{"case_id":"senqa-2022-case-a","edition_year":2022,"pdf_pages":[4],"title":"fixture"}],"schema_version":"sen-qa-preview-search-response/v1","warning_code":"unreviewed_incomplete_preview"}\'\n'
         )
     )
     search.chmod(0o500)

@@ -50,6 +50,14 @@ test("completion accepts only exact public fields", () => {
   );
 });
 
+test("completion preserves up to twenty ranked cases", () => {
+  const cases = Array.from({ length: 20 }, (_, index) => ({
+    ...PUBLIC_CASE,
+    case_id: `senqa-2022-case-${index}`,
+  }));
+  assert.equal(normalizeCompletion({ ...COMPLETION, cases })?.cases.length, 20);
+});
+
 test("completion rejects a case with malformed page authority", () => {
   assert.equal(
     normalizeCompletion({

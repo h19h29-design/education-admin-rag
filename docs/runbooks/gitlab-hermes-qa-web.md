@@ -82,5 +82,8 @@ SENQA_PREVIEW_SEARCH_CONFIG
 
 7. GitLab UI에서 issue가 public으로 보이지 않는지 비로그인 세션으로 확인한다.
 
+관련 사례는 프리뷰 검색 순위를 유지해 최대 20건까지 표시한다. 검색 결과가 20건보다
+적거나 관련성 필터를 통과한 사례가 적으면 실제 관련 사례 수만 표시한다.
+
 실패 시 기존 status/review route나 운영 alias를 변경하지 않는다. 새 QA path route와
 Worker route만 비활성화하고 confidential test issue를 보존해 감사한다.

@@ -62,7 +62,7 @@ _FORBIDDEN_PUBLIC_TERMS = (
     "complete_corpus",
     "review_status",
 )
-_MAX_CASES = 5
+_MAX_CASES = 20
 _MAX_ANSWER_CHARACTERS = 32_000
 _MAX_TITLE_CHARACTERS = 2_000
 _MAX_CASE_TEXT_CHARACTERS = 24_000
@@ -224,10 +224,9 @@ def public_cases_from_evidence(
         if case is None:
             _raise()
         searchable = f"{case.title}\n{case.question}\n{case.answer}".casefold()
-        heading = f"{case.title}\n{case.question}".casefold()
         matched = {token for token in tokens if token in searchable}
         if len(matched) >= 2 or any(
-            len(token) >= 4 and token in heading for token in tokens
+            len(token) >= 4 and token in searchable for token in tokens
         ):
             selected.append(case)
     return tuple(selected)

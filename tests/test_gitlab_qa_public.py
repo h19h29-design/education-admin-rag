@@ -82,6 +82,23 @@ def test_two_meaningful_terms_make_case_relevant() -> None:
     assert [case.case_id for case in cases] == ["senqa-2022-case-a"]
 
 
+def test_twenty_relevant_cases_are_preserved_in_rank_order() -> None:
+    results: list[dict[str, object]] = []
+    for index in range(20):
+        result = _result()
+        result["case_id"] = f"senqa-2022-case-{index}"
+        results.append(result)
+    evidence = _evidence(results[0])
+    evidence["results"] = results
+
+    cases = public_cases_from_evidence("학교 수의계약 기준", evidence)
+
+    assert len(cases) == 20
+    assert [case.case_id for case in cases] == [
+        f"senqa-2022-case-{index}" for index in range(20)
+    ]
+
+
 def test_long_specific_term_in_title_is_relevant() -> None:
     evidence = _evidence(
         _result(
@@ -91,6 +108,18 @@ def test_long_specific_term_in_title_is_relevant() -> None:
         )
     )
     assert len(public_cases_from_evidence("기간제교원", evidence)) == 1
+
+
+def test_long_specific_term_in_answer_is_relevant() -> None:
+    evidence = _evidence(
+        _result(
+            title="계약 문의",
+            question="절차 안내",
+            answer="이 경우에는 수의계약 절차를 적용합니다.",
+        )
+    )
+
+    assert len(public_cases_from_evidence("수의계약", evidence)) == 1
 
 
 def test_public_case_drops_internal_fields() -> None:

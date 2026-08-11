@@ -207,7 +207,7 @@ def _valid_evidence(value: object) -> bool:
         or evidence.get("production_eligible") is not False
         or evidence.get("complete_corpus") is not False
         or type(evidence.get("results")) is not list
-        or len(evidence["results"]) > 5
+        or len(evidence["results"]) > 20
     ):
         return False
     for result in evidence["results"]:

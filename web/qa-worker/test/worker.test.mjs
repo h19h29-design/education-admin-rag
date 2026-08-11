@@ -177,11 +177,15 @@ function answerNote(requestId, overrides = {}) {
 }
 
 test("poll returns only the matching structured public answer", async () => {
+  const rankedCases = Array.from({ length: 20 }, (_, index) => ({
+    ...PUBLIC_CASE,
+    case_id: `senqa-2022-case-${index}`,
+  }));
   const runtime = env(async () =>
     Response.json([
       { body: "ordinary comment" },
       {
-        body: answerNote("senqa-07070707070707070707070707070707"),
+        body: answerNote("senqa-07070707070707070707070707070707", { cases: rankedCases }),
       },
     ]),
   );
@@ -208,7 +212,7 @@ test("poll returns only the matching structured public answer", async () => {
   assert.equal(body.status, "complete");
   assert.equal(body.answer, "계약 기준입니다. [2022년 · PDF 4쪽]");
   assert.equal(body.answer_kind, "grounded");
-  assert.deepEqual(body.cases, [PUBLIC_CASE]);
+  assert.deepEqual(body.cases, rankedCases);
   assert.equal(JSON.stringify(body).includes("issue_iid"), false);
   assert.equal(JSON.stringify(body).includes("production_eligible"), false);
 });

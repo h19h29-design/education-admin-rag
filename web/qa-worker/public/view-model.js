@@ -99,7 +99,7 @@ export function normalizeCompletion(value) {
     !["grounded", "no_evidence", "cases_only"].includes(value.answer_kind) ||
     !publicText(value.answer, 32_000) ||
     !Array.isArray(value.cases) ||
-    value.cases.length > 5
+    value.cases.length > 20
   ) {
     return null;
   }

@@ -78,7 +78,7 @@ def _search(question: str) -> dict[str, object] | None:
                 str(config),
                 "--json",
                 "--limit",
-                "5",
+                "20",
                 "--",
                 question,
             ],
@@ -118,7 +118,7 @@ def _search(question: str) -> dict[str, object] | None:
         or parsed.get("complete_corpus") is not False
         or type(parsed.get("query")) is not str
         or type(parsed.get("results")) is not list
-        or len(parsed["results"]) > 5
+        or len(parsed["results"]) > 20
     ):
         return None
     return {key: value for key, value in parsed.items() if key != "query"}

@@ -90,6 +90,29 @@ def test_filter_output_becomes_exact_qa_request() -> None:
     assert checked == _request()
 
 
+def test_filter_output_accepts_twenty_ranked_results() -> None:
+    payload = {
+        "command": "ask",
+        "evidence": json.loads(json.dumps(_request().evidence)),
+        "project": "h19h19/education-admin-rag",
+        "project_id": 428,
+        "question": _request().question,
+        "request_id": REQUEST_ID,
+        "target_iid": 73,
+    }
+    original = payload["evidence"]["results"][0]
+    payload["evidence"]["results"] = [
+        {**original, "case_id": f"senqa-2022-case-{index}"} for index in range(20)
+    ]
+
+    checked = parse_filter_output(
+        (json.dumps(payload, ensure_ascii=False) + "\n").encode()
+    )
+
+    assert checked is not None
+    assert len(checked.evidence["results"]) == 20
+
+
 def test_silent_and_malformed_filter_output_are_not_jobs() -> None:
     assert parse_filter_output(b"[SILENT]\n") is None
     assert parse_filter_output(b"not-json\n") is None
