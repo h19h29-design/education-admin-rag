@@ -105,6 +105,8 @@ def test_prompt_treats_question_as_data_and_requires_grounded_preview_answer() -
     assert '"case_id":"senqa-2022-case-a"' in prompt
     assert '"question":"수의계약이 가능한 경우를 알려줘"' in prompt
     assert "PDF 4쪽" in prompt
+    assert "제목, 인사말, 목록, 표, 코드블록을 쓰지 마세요" in prompt
+    assert "허용 근거 표기: [senqa-2022-case-a · 2022년 · PDF 4쪽]" in prompt
     for forbidden in (
         "gitlab",
         "webhook",
