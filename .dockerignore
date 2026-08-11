@@ -20,6 +20,9 @@ src/evaluation/*
 !src/ingestion/
 src/ingestion/*
 !src/ingestion/*.py
+!src/integrations/
+src/integrations/*
+!src/integrations/*.py
 !src/retrieval/
 src/retrieval/*
 !src/retrieval/*.py

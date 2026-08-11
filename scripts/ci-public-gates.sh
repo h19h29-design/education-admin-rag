@@ -15,6 +15,9 @@ case "${1:-}" in
     uv run ruff format --check src
     uv run mypy --strict --explicit-package-bases src
     uv lock --check --offline
+    npm --prefix web/qa-worker test
+    node --check web/qa-worker/src/worker.js
+    node --check web/qa-worker/public/app.js
     ;;
   security)
     ./scripts/verify-public-repo.sh

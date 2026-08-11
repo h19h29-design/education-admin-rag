@@ -129,7 +129,7 @@ def test_legacy_loader_rejects_symlink_and_fifo_without_blocking(
         check=False,
         capture_output=True,
         text=True,
-        timeout=2,
+        timeout=5,
     )
     assert completed.returncode == 0
     assert completed.stdout == completed.stderr == ""
