@@ -148,6 +148,55 @@ async def test_kakao_map_classifies_official_no_results_as_empty_not_schema_erro
     assert requests == expected_requests
 
 
+# Break caught: the official walk empty-result status is treated as malformed schema.
+@pytest.mark.asyncio
+async def test_kakao_walk_classifies_route_result_not_found_as_empty() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json={"status": "ROUTE_RESULT_NOT_FOUND"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await KakaoWalkProvider(
+            http=http,
+            rest_key=SecretStr("key"),
+        ).get_routes(route_query(TravelMode.WALK))
+
+    assert result.routes == ()
+    assert [warning.code for warning in result.warnings] == ["NO_RESULTS"]
+
+
+# Break caught: schema drift in the first of three walk calls is lost when only the
+# final call's observed fingerprint is retained.
+@pytest.mark.asyncio
+async def test_kakao_walk_fingerprint_covers_every_mode_response() -> None:
+    async def fingerprint(*, drift_first: bool) -> str | None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload = load_json("kakao-walk.json")
+            if drift_first and request.url.params["route_mode"] == "BROAD_FIRST":
+                payload["nested_contract_drift"] = {"new_field": True}
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            provider = KakaoWalkProvider(http=http, rest_key=SecretStr("key"))
+            result = await provider.get_routes(route_query(TravelMode.WALK))
+            assert len(result.routes) == 3
+            return provider.last_schema_fingerprint
+
+    stable = await fingerprint(drift_first=False)
+    drifted = await fingerprint(drift_first=True)
+
+    assert type(stable) is str and len(stable) == 64
+    assert type(drifted) is str and len(drifted) == 64
+    assert stable != drifted
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status", "expected"),

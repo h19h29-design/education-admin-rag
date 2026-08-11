@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 
 import pytest
 from app.settings import Settings
@@ -66,6 +67,16 @@ def test_development_settings_allow_missing_credentials_but_not_bad_limits() -> 
     assert settings.opinet_cert_key is None
     with pytest.raises(ValidationError):
         Settings(provider_timeout_seconds=float("nan"), _env_file=None)
+
+
+# Break caught: copying the documented development env template makes startup fail.
+def test_development_env_example_treats_blank_optional_credentials_as_missing() -> None:
+    settings = Settings(_env_file=Path("apps/travel-map/.env.example"))
+
+    assert settings.environment == "development"
+    assert settings.kakao_rest_api_key is None
+    assert settings.seoul_transit_service_key is None
+    assert settings.opinet_cert_key is None
 
 
 @pytest.mark.parametrize(

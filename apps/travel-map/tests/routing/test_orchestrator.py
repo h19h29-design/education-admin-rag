@@ -510,3 +510,80 @@ async def test_orchestrator_does_not_supplement_ambiguous_public_geometry() -> N
     assert [warning.code for warning in collection.warnings] == [
         "GEOMETRY_MATCH_AMBIGUOUS"
     ]
+
+
+# Break caught: rejecting a globally unique assignment because one route has two
+# local candidates before the other route constrains the shared candidate.
+@pytest.mark.asyncio
+async def test_orchestrator_uses_unique_global_geometry_assignment() -> None:
+    public_a = replace(
+        route(
+            "public-a",
+            seconds=1_000,
+            meters=10_000,
+            cost=None,
+            source="SEOUL_TRANSIT",
+        ),
+        warnings=("GEOMETRY_MISSING",),
+    )
+    public_b = replace(
+        route(
+            "public-b",
+            seconds=1_015,
+            meters=10_150,
+            cost=None,
+            source="SEOUL_TRANSIT",
+        ),
+        warnings=("GEOMETRY_MISSING",),
+    )
+    public = FakeProvider(
+        "SEOUL_TRANSIT",
+        ProviderResult(provider="SEOUL_TRANSIT", routes=(public_a, public_b)),
+    )
+    geometry_x = (
+        Coordinate(37.55, 126.97),
+        Coordinate(37.54, 127.05),
+        Coordinate(37.56, 126.98),
+    )
+    geometry_y = (
+        Coordinate(37.55, 126.97),
+        Coordinate(37.57, 126.90),
+        Coordinate(37.56, 126.98),
+    )
+    kakao = FakeProvider(
+        "KAKAO_TRANSIT",
+        ProviderResult(
+            provider="KAKAO_TRANSIT",
+            routes=(
+                route(
+                    "kakao-x",
+                    seconds=990,
+                    meters=9_900,
+                    source="KAKAO_TRANSIT",
+                    geometry=geometry_x,
+                ),
+                route(
+                    "kakao-y",
+                    seconds=1_010,
+                    meters=10_100,
+                    source="KAKAO_TRANSIT",
+                    geometry=geometry_y,
+                ),
+            ),
+        ),
+    )
+    orchestrator = RouteOrchestrator(
+        {TravelMode.TRANSIT: (public, kakao)},
+        max_concurrency=1,
+    )
+
+    collection = await orchestrator.collect(base_query(), {TravelMode.TRANSIT})
+
+    assert [item.geometry for item in collection.routes] == [geometry_x, geometry_y]
+    assert [item.id for item in collection.routes] == [
+        "public-a+geometry:kakao-x",
+        "public-b+geometry:kakao-y",
+    ]
+    assert [warning.code for warning in collection.warnings] == [
+        "GEOMETRY_SUPPLEMENTED"
+    ]

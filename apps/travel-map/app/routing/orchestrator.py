@@ -266,26 +266,46 @@ def _supplement_public_geometry(
     public_routes: tuple[RouteOption, ...],
     kakao_routes: tuple[RouteOption, ...],
 ) -> tuple[tuple[RouteOption, ...], ProviderWarning]:
-    matches: list[tuple[RouteOption, RouteOption]] = []
-    used_kakao_ids: set[str] = set()
-    for public_route in public_routes:
-        candidates = tuple(
-            kakao_route
-            for kakao_route in kakao_routes
+    candidate_edges = tuple(
+        tuple(
+            index
+            for index, kakao_route in enumerate(kakao_routes)
             if _geometry_candidate_matches(public_route, kakao_route)
         )
-        if len(candidates) != 1 or candidates[0].id in used_kakao_ids:
-            return kakao_routes, ProviderWarning(
-                code=(
-                    "GEOMETRY_MATCH_AMBIGUOUS"
-                    if len(candidates) > 1 or candidates
-                    else "GEOMETRY_MATCH_NOT_FOUND"
-                ),
-                message="Public route geometry could not be matched uniquely",
-                source="ROUTE_ORCHESTRATOR",
-            )
-        used_kakao_ids.add(candidates[0].id)
-        matches.append((public_route, candidates[0]))
+        for public_route in public_routes
+    )
+    if any(not edges for edges in candidate_edges):
+        return kakao_routes, ProviderWarning(
+            code="GEOMETRY_MATCH_NOT_FOUND",
+            message="Public route geometry could not be matched uniquely",
+            source="ROUTE_ORCHESTRATOR",
+        )
+    assignment = _find_perfect_geometry_matching(
+        candidate_edges,
+        candidate_count=len(kakao_routes),
+    )
+    if assignment is None or any(
+        _find_perfect_geometry_matching(
+            candidate_edges,
+            candidate_count=len(kakao_routes),
+            forbidden=(public_index, candidate_index),
+        )
+        is not None
+        for public_index, candidate_index in enumerate(assignment)
+    ):
+        return kakao_routes, ProviderWarning(
+            code="GEOMETRY_MATCH_AMBIGUOUS",
+            message="Public route geometry could not be matched uniquely",
+            source="ROUTE_ORCHESTRATOR",
+        )
+    matches = tuple(
+        (public_route, kakao_routes[candidate_index])
+        for public_route, candidate_index in zip(
+            public_routes,
+            assignment,
+            strict=True,
+        )
+    )
 
     supplemented = tuple(
         replace(
@@ -307,6 +327,37 @@ def _supplement_public_geometry(
         message="Public route geometry was matched to a unique Kakao route",
         source="ROUTE_ORCHESTRATOR",
     )
+
+
+def _find_perfect_geometry_matching(
+    candidate_edges: tuple[tuple[int, ...], ...],
+    *,
+    candidate_count: int,
+    forbidden: tuple[int, int] | None = None,
+) -> tuple[int, ...] | None:
+    candidate_to_public = [-1] * candidate_count
+
+    def augment(public_index: int, seen: set[int]) -> bool:
+        for candidate_index in candidate_edges[public_index]:
+            if forbidden == (public_index, candidate_index) or candidate_index in seen:
+                continue
+            seen.add(candidate_index)
+            previous_public = candidate_to_public[candidate_index]
+            if previous_public == -1 or augment(previous_public, seen):
+                candidate_to_public[candidate_index] = public_index
+                return True
+        return False
+
+    for public_index in range(len(candidate_edges)):
+        if not augment(public_index, set()):
+            return None
+    public_to_candidate = [-1] * len(candidate_edges)
+    for candidate_index, public_index in enumerate(candidate_to_public):
+        if public_index != -1:
+            public_to_candidate[public_index] = candidate_index
+    if any(candidate_index == -1 for candidate_index in public_to_candidate):
+        return None
+    return tuple(public_to_candidate)
 
 
 def _geometry_candidate_matches(public: RouteOption, candidate: RouteOption) -> bool:

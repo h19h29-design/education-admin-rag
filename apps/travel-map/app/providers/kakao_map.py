@@ -60,6 +60,7 @@ class _KakaoMapProvider:
         self._now = now or (lambda: datetime.now(UTC))
         self._max_routes = max_routes
         self._max_geometry_points = max_geometry_points
+        self._schema_fingerprints: list[str] = []
         self._transport = BoundedHttpClient(
             http=http,
             timeout_seconds=timeout_seconds,
@@ -73,6 +74,25 @@ class _KakaoMapProvider:
     @property
     def last_status_code(self) -> int | None:
         return self._transport.last_status_code
+
+    @property
+    def last_schema_fingerprint(self) -> str | None:
+        if not self._schema_fingerprints:
+            return None
+        encoded = json.dumps(
+            self._schema_fingerprints,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _reset_schema_fingerprints(self) -> None:
+        self._schema_fingerprints.clear()
+
+    def _record_schema_fingerprint(self) -> None:
+        fingerprint = self._transport.last_schema_fingerprint
+        if fingerprint is not None:
+            self._schema_fingerprints.append(fingerprint)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Self:
@@ -137,12 +157,14 @@ class KakaoTransitProvider(_KakaoMapProvider):
             raise TypeError("query must be an exact RouteQuery")
         if query.mode is not TravelMode.TRANSIT:
             return self._unsupported()
+        self._reset_schema_fingerprints()
         try:
             payload = await self._transport.get_json(
                 url=_TRANSIT_URL,
                 params=_coordinate_params(query),
                 header_secret=self._rest_key,
             )
+            self._record_schema_fingerprint()
             source_time = self._source_time()
             routes = _parse_transit(
                 payload,
@@ -180,6 +202,7 @@ class KakaoWalkProvider(_KakaoMapProvider):
             raise TypeError("query must be an exact RouteQuery")
         if query.mode is not TravelMode.WALK:
             return self._unsupported()
+        self._reset_schema_fingerprints()
         routes: list[RouteOption] = []
         try:
             source_time = self._source_time()
@@ -191,6 +214,7 @@ class KakaoWalkProvider(_KakaoMapProvider):
                     params=params,
                     header_secret=self._rest_key,
                 )
+                self._record_schema_fingerprint()
                 route = _parse_walk(
                     payload,
                     route_mode=route_mode,
@@ -286,7 +310,7 @@ def _parse_walk(
     source_time: datetime,
     max_geometry_points: int,
 ) -> RouteOption | None:
-    if payload.get("status") == "NO_RESULTS":
+    if payload.get("status") in {"NO_RESULTS", "ROUTE_RESULT_NOT_FOUND"}:
         return None
     if payload.get("status") != "OK":
         raise ValueError

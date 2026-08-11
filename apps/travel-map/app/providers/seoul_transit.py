@@ -1,11 +1,13 @@
 import hashlib
-import re
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from math import isfinite
-from xml.etree import ElementTree
+from xml.etree.ElementTree import Element, ParseError
 
 import httpx
+from defusedxml import ElementTree
+from defusedxml.common import DefusedXmlException
 from pydantic import SecretStr
 
 from app.providers.http import BoundedHttpClient, ProviderRequestError
@@ -57,6 +59,7 @@ class SeoulTransitProvider:
         self._now = now or (lambda: datetime.now(UTC))
         self._max_routes = max_routes
         self._max_path_items = max_path_items
+        self._last_schema_fingerprint: str | None = None
         self._transport = BoundedHttpClient(
             http=http,
             timeout_seconds=timeout_seconds,
@@ -77,6 +80,7 @@ class SeoulTransitProvider:
                 "MISSING_CREDENTIAL", "Provider credential is unavailable"
             )
         try:
+            self._last_schema_fingerprint = None
             raw = await self._transport.get_xml(
                 url=_PATH_URL,
                 params={
@@ -89,7 +93,7 @@ class SeoulTransitProvider:
                 query_secret=("serviceKey", self._service_key),
             )
             source_time = self._source_time()
-            routes = _parse_routes(
+            routes, self._last_schema_fingerprint = _parse_routes(
                 raw,
                 query=query,
                 source_time=source_time,
@@ -111,7 +115,13 @@ class SeoulTransitProvider:
                 routes=(),
                 warnings=(exc.warning(self.name),),
             )
-        except (ElementTree.ParseError, TypeError, ValueError, OverflowError):
+        except (
+            DefusedXmlException,
+            ParseError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
             return self._failure(
                 "SCHEMA_MISMATCH",
                 "Public transit response did not match the documented XML schema",
@@ -136,6 +146,10 @@ class SeoulTransitProvider:
     @property
     def last_status_code(self) -> int | None:
         return self._transport.last_status_code
+
+    @property
+    def last_schema_fingerprint(self) -> str | None:
+        return self._last_schema_fingerprint
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "SeoulTransitProvider":
@@ -169,10 +183,13 @@ def _parse_routes(
     source_time: datetime,
     max_routes: int,
     max_path_items: int,
-) -> tuple[RouteOption, ...]:
-    if re.search(rb"<!\s*(?:doctype|entity)\b", raw, flags=re.IGNORECASE):
-        raise ValueError
-    root = ElementTree.fromstring(raw)
+) -> tuple[tuple[RouteOption, ...], str]:
+    root = ElementTree.fromstring(
+        raw,
+        forbid_dtd=True,
+        forbid_entities=True,
+        forbid_external=True,
+    )
     if root.tag != "ServiceResult" or sum(1 for _ in root.iter()) > 50_000:
         raise ValueError
     header = root.find("msgHeader")
@@ -223,10 +240,38 @@ def _parse_routes(
                 warnings=("GEOMETRY_MISSING", "FARE_MISSING"),
             )
         )
-    return tuple(routes)
+    return tuple(routes), _xml_schema_fingerprint(root)
 
 
-def _element_text(parent: ElementTree.Element, name: str) -> str:
+def _xml_schema_fingerprint(root: Element) -> str:
+    encoded = json.dumps(
+        _xml_schema_shape(root),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _xml_schema_shape(element: Element) -> dict[str, object]:
+    child_shapes = {
+        json.dumps(
+            _xml_schema_shape(child),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for child in element
+    }
+    return {
+        "tag": element.tag,
+        "attributeNames": sorted(element.attrib),
+        "hasText": bool(element.text and element.text.strip()),
+        "childShapes": sorted(child_shapes),
+    }
+
+
+def _element_text(parent: Element, name: str) -> str:
     child = parent.find(name)
     if child is None or child.text is None:
         raise ValueError
@@ -246,7 +291,7 @@ def _nonnegative_int(value: str) -> int:
 
 
 def _path_coordinate(
-    path: ElementTree.Element,
+    path: Element,
     longitude_name: str,
     latitude_name: str,
 ) -> None:

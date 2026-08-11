@@ -200,6 +200,10 @@ class KakaoCarProvider:
     def last_status_code(self) -> int | None:
         return self._transport.last_status_code
 
+    @property
+    def last_schema_fingerprint(self) -> str | None:
+        return self._transport.last_schema_fingerprint
+
     @classmethod
     def from_settings(
         cls,

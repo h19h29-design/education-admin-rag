@@ -32,6 +32,16 @@ class _TupleNormalizingSettingsSource(PydanticBaseSettingsSource):
 
     def __call__(self) -> dict[str, Any]:
         values = self._source()
+        for name in (
+            "kakao_rest_api_key",
+            "seoul_transit_service_key",
+            "opinet_cert_key",
+        ):
+            value = values.get(name)
+            if value == "" or (
+                type(value) is SecretStr and value.get_secret_value() == ""
+            ):
+                values[name] = None
         for name in ("allowed_hosts", "allowed_origins"):
             value = values.get(name)
             if type(value) is list:

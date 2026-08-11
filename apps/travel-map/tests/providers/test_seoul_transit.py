@@ -143,6 +143,31 @@ async def test_seoul_transit_rejects_dtd_and_entity_after_large_prefix() -> None
     assert [warning.code for warning in result.warnings] == ["SCHEMA_MISMATCH"]
 
 
+# Break caught: a byte-pattern scan cannot see DTD/entity tokens encoded as UTF-16.
+@pytest.mark.asyncio
+async def test_seoul_transit_rejects_utf16_encoded_dtd_and_entity() -> None:
+    raw = """<?xml version="1.0" encoding="UTF-16"?>
+<!DOCTYPE ServiceResult [<!ENTITY injected "expanded">]>
+<ServiceResult><msgHeader><headerCd>0</headerCd><headerMsg>&injected;</headerMsg>
+<itemCount>0</itemCount></msgHeader><msgBody /></ServiceResult>""".encode("utf-16")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/xml"},
+            content=raw,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await SeoulTransitProvider(
+            http=http,
+            service_key=SecretStr("key"),
+        ).get_routes(route_query(TravelMode.TRANSIT))
+
+    assert result.routes == ()
+    assert [warning.code for warning in result.warnings] == ["SCHEMA_MISMATCH"]
+
+
 @pytest.mark.asyncio
 async def test_seoul_transit_rejects_oversized_response_without_parsing() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from collections.abc import Coroutine, Mapping
 from math import isfinite
@@ -60,6 +61,7 @@ class BoundedHttpClient:
         self.max_response_bytes = max_response_bytes
         self.max_attempts = max_attempts
         self.last_status_code: int | None = None
+        self.last_schema_fingerprint: str | None = None
         self._closed = False
         self._close_lock = asyncio.Lock()
 
@@ -80,6 +82,13 @@ class BoundedHttpClient:
         query_secret: tuple[str, SecretStr | None] | None = None,
     ) -> Coroutine[Any, Any, dict[str, Any]]:
         self.last_status_code = None
+        self.last_schema_fingerprint = None
+        accepted_content_types = frozenset({"application/json"})
+        _validate_request_fields(
+            url=url,
+            params=params,
+            accepted_content_types=accepted_content_types,
+        )
         credential_kind, credential_name, credential = _extract_credential(
             header_secret=header_secret,
             query_secret=query_secret,
@@ -88,6 +97,7 @@ class BoundedHttpClient:
             self._json_worker(
                 url=url,
                 params=params,
+                accepted_content_types=accepted_content_types,
                 credential_kind=credential_kind,
                 credential_name=credential_name,
                 credential=credential,
@@ -104,6 +114,15 @@ class BoundedHttpClient:
         query_secret: tuple[str, SecretStr | None],
     ) -> Coroutine[Any, Any, bytes]:
         self.last_status_code = None
+        self.last_schema_fingerprint = None
+        accepted_content_types = frozenset(
+            {"application/xml", "text/xml", "application/xhtml+xml"}
+        )
+        _validate_request_fields(
+            url=url,
+            params=params,
+            accepted_content_types=accepted_content_types,
+        )
         credential_kind, credential_name, credential = _extract_credential(
             header_secret=None,
             query_secret=query_secret,
@@ -112,9 +131,7 @@ class BoundedHttpClient:
             self._request_worker(
                 url=url,
                 params=params,
-                accepted_content_types=frozenset(
-                    {"application/xml", "text/xml", "application/xhtml+xml"}
-                ),
+                accepted_content_types=accepted_content_types,
                 credential_kind=credential_kind,
                 credential_name=credential_name,
                 credential=credential,
@@ -128,6 +145,7 @@ class BoundedHttpClient:
         *,
         url: str,
         params: Mapping[str, str],
+        accepted_content_types: frozenset[str],
         credential_kind: str,
         credential_name: str,
         credential: str,
@@ -135,7 +153,7 @@ class BoundedHttpClient:
         raw = await self._request_worker(
             url=url,
             params=params,
-            accepted_content_types=frozenset({"application/json"}),
+            accepted_content_types=accepted_content_types,
             credential_kind=credential_kind,
             credential_name=credential_name,
             credential=credential,
@@ -161,6 +179,7 @@ class BoundedHttpClient:
                 "SCHEMA_MISMATCH",
                 "Provider response did not match the documented JSON schema",
             ) from None
+        self.last_schema_fingerprint = _schema_fingerprint(value)
         return value
 
     async def _await_task(self, task: asyncio.Task[_T]) -> _T:
@@ -199,20 +218,6 @@ class BoundedHttpClient:
         credential_name: str,
         credential: str,
     ) -> bytes:
-        if type(url) is not str or not url.startswith(("https://", "http://")):
-            raise ValueError("provider URL must be absolute HTTP(S)")
-        if type(params) is not dict or any(
-            type(key) is not str or type(value) is not str
-            for key, value in params.items()
-        ):
-            raise TypeError("provider params must be an exact string mapping")
-        if type(accepted_content_types) is not frozenset or not accepted_content_types:
-            raise TypeError("accepted content types must be a nonempty frozenset")
-        if credential_kind not in {"header", "query"}:
-            raise TypeError("credential kind is invalid")
-        if type(credential_name) is not str or not credential_name:
-            raise TypeError("credential name is invalid")
-
         params_buffer = dict(params)
         headers: dict[str, str] = {}
         body = bytearray()
@@ -354,6 +359,8 @@ def _extract_credential(
         type(query_secret) is not tuple
         or len(query_secret) != 2
         or type(query_secret[0]) is not str
+        or not query_secret[0].strip()
+        or query_secret[0] != query_secret[0].strip()
     ):
         raise TypeError("query_secret must be a (name, SecretStr) tuple")
     secret = query_secret[1]
@@ -374,6 +381,22 @@ def _extract_credential(
     return "query", query_secret[0], credential
 
 
+def _validate_request_fields(
+    *,
+    url: str,
+    params: Mapping[str, str],
+    accepted_content_types: frozenset[str],
+) -> None:
+    if type(url) is not str or not url.startswith(("https://", "http://")):
+        raise ValueError("provider URL must be absolute HTTP(S)")
+    if type(params) is not dict or any(
+        type(key) is not str or type(value) is not str for key, value in params.items()
+    ):
+        raise TypeError("provider params must be an exact string mapping")
+    if type(accepted_content_types) is not frozenset or not accepted_content_types:
+        raise TypeError("accepted content types must be a nonempty frozenset")
+
+
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -385,3 +408,36 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _schema_fingerprint(value: object) -> str:
+    encoded = json.dumps(
+        _schema_shape(value),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _schema_shape(value: object) -> object:
+    if type(value) is dict:
+        return {
+            key: _schema_shape(item)
+            for key, item in sorted(value.items())
+            if type(key) is str
+        }
+    if type(value) is list:
+        item_shapes = {
+            json.dumps(
+                _schema_shape(item),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for item in value
+        }
+        return {"arrayItemShapes": sorted(item_shapes)}
+    if value is None:
+        return "null"
+    return type(value).__name__

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "서울교육기관 관내출장 지도"
 requires-python = ">=3.12"
 dependencies = [
+    "defusedxml>=0.7.1",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "orjson>=3.11.9",
@@ -34,4 +35,5 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "respx>=0.23.1",
     "ruff>=0.16.2",
+    "types-defusedxml>=0.7.0.20250822",
 ]

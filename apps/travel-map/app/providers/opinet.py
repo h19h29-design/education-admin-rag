@@ -122,6 +122,10 @@ class OpinetClient:
     def last_status_code(self) -> int | None:
         return self._transport.last_status_code
 
+    @property
+    def last_schema_fingerprint(self) -> str | None:
+        return self._transport.last_schema_fingerprint
+
     def _current_time(self) -> datetime:
         value = self._now()
         if type(value) is not datetime or value.tzinfo is None:

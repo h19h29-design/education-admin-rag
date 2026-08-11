@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 from datetime import UTC, datetime
@@ -112,6 +111,7 @@ async def _probe(
                 "KAKAO_LOCAL_SEARCH",
                 places,
                 http_status=local.last_status_code,
+                schema_fingerprint=local.last_schema_fingerprint,
                 warnings=local.last_warnings,
             )
         )
@@ -121,6 +121,7 @@ async def _probe(
                 "KAKAO_LOCAL_REVERSE",
                 (() if reverse is None else (reverse,)),
                 http_status=local.last_status_code,
+                schema_fingerprint=local.last_schema_fingerprint,
                 warnings=local.last_warnings,
             )
         )
@@ -144,53 +145,47 @@ async def _probe(
                     _route_observation(
                         result,
                         http_status=provider.last_status_code,
+                        schema_fingerprint=provider.last_schema_fingerprint,
                     )
                 )
             except Exception:  # noqa: BLE001
                 operations.append(
-                    _finalize_observation(
-                        {
-                            "operation": provider.name,
-                            "status": "FAILED_CLOSED",
-                            "httpStatus": provider.last_status_code,
-                            "routeCount": 0,
-                            "routes": [],
-                            "warnings": ["UNEXPECTED_PROVIDER_FAILURE"],
-                        }
-                    )
+                    {
+                        "operation": provider.name,
+                        "status": "FAILED_CLOSED",
+                        "httpStatus": provider.last_status_code,
+                        "routeCount": 0,
+                        "schemaFingerprint": provider.last_schema_fingerprint,
+                        "warnings": ["UNEXPECTED_PROVIDER_FAILURE"],
+                    }
                 )
 
         try:
             fuel = await opinet.average_price(FuelType.GASOLINE)
             operations.append(
-                _finalize_observation(
-                    {
-                        "operation": "OPINET",
-                        "status": "NORMALIZED",
-                        "httpStatus": opinet.last_status_code,
-                        "fuelType": fuel.fuel_type.value,
-                        "krwPerLiter": fuel.krw_per_liter,
-                        "tradeDate": fuel.trade_date.isoformat(),
-                        "source": fuel.source,
-                    }
-                )
+                {
+                    "operation": "OPINET",
+                    "status": "NORMALIZED",
+                    "httpStatus": opinet.last_status_code,
+                    "resultCount": 1,
+                    "hasPrice": fuel.krw_per_liter > 0.0,
+                    "hasTradeDate": fuel.trade_date is not None,
+                    "schemaFingerprint": opinet.last_schema_fingerprint,
+                }
             )
         except ProviderRequestError as exc:
             operations.append(
-                _finalize_observation(
-                    {
-                        "operation": "OPINET",
-                        "status": "FAILED_CLOSED",
-                        "httpStatus": opinet.last_status_code,
-                        "warning": exc.code,
-                    }
-                )
+                {
+                    "operation": "OPINET",
+                    "status": "FAILED_CLOSED",
+                    "httpStatus": opinet.last_status_code,
+                    "resultCount": 0,
+                    "schemaFingerprint": opinet.last_schema_fingerprint,
+                    "warnings": [exc.code],
+                }
             )
     finally:
-        await local.aclose()
-        for provider in providers:
-            await provider.aclose()
-        await opinet.aclose()
+        await _close_all((local, *providers, opinet))
     return {
         "status": "PROBED",
         "generatedAt": departure.isoformat(),
@@ -204,65 +199,55 @@ def _place_observation(
     places: tuple[PlaceCandidate, ...],
     *,
     http_status: int | None,
+    schema_fingerprint: str | None,
     warnings: tuple[str, ...],
 ) -> dict[str, object]:
-    observed_places = [
-        {
-            "placeIdPresent": bool(place.place_id),
-            "namePresent": bool(place.name),
-            "hasRoadAddress": bool(place.road_address),
-            "hasLotAddress": bool(place.lot_address),
-            "coordinateValid": (
-                -90.0 <= place.latitude <= 90.0 and -180.0 <= place.longitude <= 180.0
-            ),
-        }
-        for place in places
-    ]
-    return _finalize_observation(
-        {
-            "operation": operation,
-            "status": _operation_status(http_status, len(places), warnings),
-            "httpStatus": http_status,
-            "placeCount": len(places),
-            "places": observed_places,
-            "warnings": list(warnings),
-        }
-    )
+    return {
+        "operation": operation,
+        "status": _operation_status(http_status, len(places), warnings),
+        "httpStatus": http_status,
+        "placeCount": len(places),
+        "hasStableIds": bool(places) and all(bool(place.place_id) for place in places),
+        "hasNames": bool(places) and all(bool(place.name) for place in places),
+        "hasAddresses": bool(places)
+        and all(bool(place.road_address or place.lot_address) for place in places),
+        "coordinatesValid": bool(places)
+        and all(
+            -90.0 <= place.latitude <= 90.0 and -180.0 <= place.longitude <= 180.0
+            for place in places
+        ),
+        "schemaFingerprint": schema_fingerprint,
+        "warnings": list(warnings),
+    }
 
 
 def _route_observation(
     result: ProviderResult,
     *,
     http_status: int | None,
+    schema_fingerprint: str | None,
 ) -> dict[str, object]:
-    routes = [
-        {
-            "mode": route.mode.value,
-            "durationSeconds": route.duration_seconds,
-            "distanceMeters": route.distance_meters,
-            "costStatus": route.cost_status.value,
-            "mobilityCostKrw": route.mobility_cost_krw,
-            "geometryPointCount": len(route.geometry),
-            "source": route.source,
-            "sourceAsOf": route.source_as_of.isoformat(),
-        }
-        for route in result.routes
-    ]
     warning_codes = [warning.code for warning in result.warnings]
-    return _finalize_observation(
-        {
-            "operation": result.provider,
-            "status": _operation_status(
-                http_status,
-                len(result.routes),
-                tuple(warning_codes),
-            ),
-            "httpStatus": http_status,
-            "routeCount": len(result.routes),
-            "routes": routes,
-            "warnings": warning_codes,
-        }
-    )
+    return {
+        "operation": result.provider,
+        "status": _operation_status(
+            http_status,
+            len(result.routes),
+            tuple(warning_codes),
+        ),
+        "httpStatus": http_status,
+        "routeCount": len(result.routes),
+        "hasDuration": bool(result.routes)
+        and all(route.duration_seconds >= 0 for route in result.routes),
+        "hasDistance": bool(result.routes)
+        and all(route.distance_meters >= 0 for route in result.routes),
+        "hasCostCapability": bool(result.routes)
+        and any(route.mobility_cost_krw is not None for route in result.routes),
+        "hasGeometry": bool(result.routes)
+        and all(len(route.geometry) >= 2 for route in result.routes),
+        "schemaFingerprint": schema_fingerprint,
+        "warnings": warning_codes,
+    }
 
 
 def _operation_status(
@@ -270,46 +255,34 @@ def _operation_status(
     result_count: int,
     warnings: tuple[str, ...],
 ) -> str:
+    nonfailure_warnings = {
+        "NO_RESULTS",
+        "GEOMETRY_MISSING",
+        "FARE_MISSING",
+        "DUPLICATE_PLACE_ID",
+        "OUT_OF_BOUNDS_RESULT",
+    }
+    if any(warning not in nonfailure_warnings for warning in warnings):
+        return "FAILED_CLOSED"
     if http_status is not None and 200 <= http_status < 300:
         return "NORMALIZED" if result_count else "NO_RESULTS"
     return "FAILED_CLOSED" if warnings or http_status is not None else "NOT_CALLED"
 
 
-def _finalize_observation(value: dict[str, object]) -> dict[str, object]:
-    encoded_shape = json.dumps(
-        _observed_shape(value),
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    value["schemaFingerprint"] = hashlib.sha256(encoded_shape).hexdigest()
-    return value
-
-
-def _observed_shape(value: object) -> object:
-    if type(value) is dict:
-        return {
-            key: _observed_shape(item)
-            for key, item in sorted(value.items())
-            if type(key) is str
-        }
-    if type(value) is list:
-        unique_items = {
-            json.dumps(
-                _observed_shape(item),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            for item in value
-        }
-        return {
-            "type": "array",
-            "observedItemShapes": sorted(unique_items),
-        }
-    if value is None:
-        return "null"
-    return type(value).__name__
+async def _close_all(resources: tuple[object, ...]) -> bool:
+    succeeded = True
+    cancelled = False
+    for resource in resources:
+        try:
+            await resource.aclose()  # type: ignore[attr-defined]
+        except asyncio.CancelledError:
+            cancelled = True
+            succeeded = False
+        except Exception:  # noqa: BLE001
+            succeeded = False
+    if cancelled:
+        raise asyncio.CancelledError from None
+    return succeeded
 
 
 def _write_atomic(output: Path, report: dict[str, object]) -> None:

@@ -175,7 +175,53 @@ def test_live_probe_calls_every_integration_and_records_observed_counts() -> Non
     operations = {item["operation"]: item for item in report["operations"]}  # type: ignore[index]
     assert operations["KAKAO_LOCAL_SEARCH"]["placeCount"] == 2
     assert operations["KAKAO_TRANSIT"]["routeCount"] == 3
-    assert len(operations["KAKAO_TRANSIT"]["routes"]) == 3
     assert operations["KAKAO_CAR"]["routeCount"] == 2
     assert operations["OPINET"]["httpStatus"] == 200
     assert all(len(item["schemaFingerprint"]) == 64 for item in operations.values())
+    encoded = json.dumps(report, sort_keys=True)
+    for forbidden in (
+        "routes",
+        "places",
+        "durationSeconds",
+        "distanceMeters",
+        "mobilityCostKrw",
+        "geometryPointCount",
+        "krwPerLiter",
+        "tradeDate",
+        "sourceAsOf",
+    ):
+        assert f'"{forbidden}"' not in encoded
+
+
+# Break caught: a successful HTTP status masks a provider schema warning as NO_RESULTS.
+def test_probe_failure_warning_takes_precedence_over_success_http_status() -> None:
+    module = runpy.run_path(str(SCRIPT), run_name="provider_probe_status_test")
+    operation_status = module["_operation_status"]
+
+    assert operation_status(200, 0, ("SCHEMA_MISMATCH",)) == "FAILED_CLOSED"
+    assert operation_status(200, 1, ("SCHEMA_MISMATCH",)) == "FAILED_CLOSED"
+    assert operation_status(200, 0, ("NO_RESULTS",)) == "NO_RESULTS"
+
+
+# Break caught: the first close failure prevents later provider resources from closing.
+def test_probe_cleanup_isolates_failures_and_attempts_every_resource() -> None:
+    module = runpy.run_path(str(SCRIPT), run_name="provider_probe_cleanup_test")
+    close_all = module["_close_all"]
+    calls: list[str] = []
+
+    class Resource:
+        def __init__(self, name: str, *, fail: bool = False) -> None:
+            self.name = name
+            self.fail = fail
+
+        async def aclose(self) -> None:
+            calls.append(self.name)
+            if self.fail:
+                raise RuntimeError("safe cleanup failure")
+
+    succeeded = asyncio.run(
+        close_all((Resource("first", fail=True), Resource("second")))
+    )
+
+    assert succeeded is False
+    assert calls == ["first", "second"]

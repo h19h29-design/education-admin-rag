@@ -108,6 +108,76 @@ async def test_query_credential_cancellation_exposes_only_sanitized_boundary() -
     _assert_provider_traceback_is_credential_free(raised.tb, secret)
 
 
+# Break caught: extracting a credential before rejecting malformed public params.
+@pytest.mark.asyncio
+async def test_nonsecret_request_fields_are_validated_before_credentials() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json={},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        boundary = BoundedHttpClient(
+            http=http,
+            timeout_seconds=5.0,
+            max_response_bytes=1_000,
+        )
+        with pytest.raises(TypeError, match="params"):
+            boundary.get_json(
+                url="https://example.invalid/data",
+                params={"page": 1},  # type: ignore[dict-item]
+                header_secret=object(),  # type: ignore[arg-type]
+            )
+        with pytest.raises(TypeError, match="query_secret"):
+            await boundary.get_json(
+                url="https://example.invalid/data",
+                params={},
+                query_secret=("", SecretStr("secret")),
+            )
+
+
+# Break caught: a nested upstream field drifts without changing the schema fingerprint.
+@pytest.mark.asyncio
+async def test_schema_fingerprint_tracks_nested_upstream_shape_without_values() -> None:
+    payloads = [
+        {"routes": [{"summary": {"distance": 10}}]},
+        {"routes": [{"summary": {"distance": 99, "duration": 20}}]},
+    ]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json=payloads.pop(0),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        boundary = BoundedHttpClient(
+            http=http,
+            timeout_seconds=5.0,
+            max_response_bytes=1_000,
+        )
+        await boundary.get_json(
+            url="https://example.invalid/data",
+            params={},
+            header_secret=SecretStr("secret"),
+        )
+        first = boundary.last_schema_fingerprint
+        await boundary.get_json(
+            url="https://example.invalid/data",
+            params={},
+            header_secret=SecretStr("secret"),
+        )
+        second = boundary.last_schema_fingerprint
+
+    assert type(first) is str and len(first) == 64
+    assert type(second) is str and len(second) == 64
+    assert first != second
+    assert "10" not in first and "99" not in second
+
+
 @pytest.mark.asyncio
 async def test_owned_close_can_retry_after_failure(
     monkeypatch: pytest.MonkeyPatch,

@@ -255,6 +255,10 @@ class KakaoLocalClient:
     def last_status_code(self) -> int | None:
         return self._transport.last_status_code
 
+    @property
+    def last_schema_fingerprint(self) -> str | None:
+        return self._transport.last_schema_fingerprint
+
     def provenance(self) -> EnrichmentProvenance:
         fetched_at = utc_now()
         normalized = json.dumps(
