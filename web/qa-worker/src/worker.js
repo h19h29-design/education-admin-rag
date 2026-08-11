@@ -6,7 +6,27 @@ const FIRST_PARTY_CHALLENGE_TTL_SECONDS = 300;
 const FIRST_PARTY_CHALLENGE_RE = /^pow:(senqa-pow-[0-9a-f]{32}):([0-9]{1,7})$/u;
 const REQUEST_RE = /^senqa-[0-9a-f]{32}$/;
 const POLL_TOKEN_RE = /^[A-Za-z0-9_-]{40,64}$/;
-const ANSWER_PREFIX = "<!-- senqa-answer:v1 request_id=";
+const ANSWER_V2_PREFIX = "<!-- senqa-answer:v2 request_id=";
+const ANSWER_V1_PREFIX = "<!-- senqa-answer:v1 request_id=";
+const PUBLIC_SCHEMA = "senqa-public-answer/v1";
+const NO_EVIDENCE_TEXT =
+  "등록된 사례집에서 이 질문과 관련된 내용을 찾지 못했습니다. 다른 표현이나 핵심어로 다시 검색해 주세요.";
+const CASES_ONLY_TEXT =
+  "답변을 정리하지 못했습니다. 관련 사례는 아래 목록에서 직접 확인해 주세요.";
+const LEGACY_TEXT =
+  "이전 형식의 답변입니다. 같은 질문을 다시 검색해 관련 사례를 확인해 주세요.";
+const PUBLIC_CASE_RE = /^senqa-20(?:20|21|22|23|24|25)-[a-z0-9-]{1,160}$/u;
+const FORBIDDEN_PUBLIC_TERMS = [
+  "gitlab",
+  "webhook",
+  "hermes",
+  "rag",
+  "production_eligible",
+  "warning_code",
+  "complete_corpus",
+  "review_status",
+];
+const MAX_ANSWER_NOTE_CHARACTERS = 192 * 1024;
 
 function jsonResponse(value, status, origin) {
   return new Response(JSON.stringify(value), {
@@ -79,6 +99,120 @@ function safeEqual(left, right) {
     difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
   }
   return difference === 0;
+}
+
+function exactObject(value, keys) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    value.constructor === Object &&
+    Object.keys(value).sort().join(",") === [...keys].sort().join(",")
+  );
+}
+
+function boundedPublicText(value, maximum) {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.length <= maximum &&
+    ![...value].some((character) => {
+      const code = character.codePointAt(0);
+      return (code < 32 || code === 127) && !"\n\r\t".includes(character);
+    })
+  );
+}
+
+function parsePublicCase(value) {
+  if (
+    !exactObject(value, [
+      "answer",
+      "case_id",
+      "edition_year",
+      "pdf_pages",
+      "question",
+      "title",
+    ]) ||
+    typeof value.case_id !== "string" ||
+    !PUBLIC_CASE_RE.test(value.case_id) ||
+    !Number.isInteger(value.edition_year) ||
+    value.edition_year < 2020 ||
+    value.edition_year > 2025 ||
+    !Array.isArray(value.pdf_pages) ||
+    value.pdf_pages.length === 0 ||
+    value.pdf_pages.length > 100 ||
+    value.pdf_pages.some((page) => !Number.isInteger(page) || page < 1 || page > 10_000) ||
+    value.pdf_pages.some((page, index) => index > 0 && page <= value.pdf_pages[index - 1]) ||
+    !boundedPublicText(value.title, 2_000) ||
+    !boundedPublicText(value.question, 24_000) ||
+    !boundedPublicText(value.answer, 24_000)
+  ) {
+    return null;
+  }
+  return {
+    answer: value.answer,
+    case_id: value.case_id,
+    edition_year: value.edition_year,
+    pdf_pages: [...value.pdf_pages],
+    question: value.question,
+    title: value.title,
+  };
+}
+
+function groundedAnswerIsValid(answer, cases) {
+  const folded = answer.toLocaleLowerCase("en-US");
+  if (FORBIDDEN_PUBLIC_TERMS.some((term) => folded.includes(term))) return false;
+  const allowedIds = new Set(cases.map((item) => item.case_id));
+  const mentionedIds = answer.match(/senqa-20(?:20|21|22|23|24|25)-[a-z0-9-]{1,160}/gu) ?? [];
+  if (mentionedIds.some((caseId) => !allowedIds.has(caseId))) return false;
+  const paragraphs = answer.split(/\n\s*\n|\n/gu).map((item) => item.trim()).filter(Boolean);
+  return paragraphs.every((paragraph) =>
+    cases.some((item) =>
+      item.pdf_pages.some((page) =>
+        paragraph.includes(
+          `[${item.case_id} · ${item.edition_year}년 · PDF ${page}쪽]`,
+        ),
+      ),
+    ),
+  );
+}
+
+function parsePublicAnswerPayload(raw) {
+  if (typeof raw !== "string" || !raw || raw.length > MAX_ANSWER_NOTE_CHARACTERS) return null;
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (
+    !exactObject(value, ["answer", "answer_kind", "cases", "schema_version"]) ||
+    value.schema_version !== PUBLIC_SCHEMA ||
+    !["grounded", "no_evidence", "cases_only"].includes(value.answer_kind) ||
+    !boundedPublicText(value.answer, 32_000) ||
+    !Array.isArray(value.cases) ||
+    value.cases.length > 5
+  ) {
+    return null;
+  }
+  const cases = value.cases.map(parsePublicCase);
+  if (cases.some((item) => item === null)) return null;
+  const checkedCases = cases;
+  if (new Set(checkedCases.map((item) => item.case_id)).size !== checkedCases.length) return null;
+  if (
+    (value.answer_kind === "no_evidence" &&
+      (value.answer !== NO_EVIDENCE_TEXT || checkedCases.length !== 0)) ||
+    (value.answer_kind === "cases_only" &&
+      (value.answer !== CASES_ONLY_TEXT || checkedCases.length === 0)) ||
+    (value.answer_kind === "grounded" &&
+      (checkedCases.length === 0 || !groundedAnswerIsValid(value.answer, checkedCases)))
+  ) {
+    return null;
+  }
+  return {
+    answer: value.answer,
+    answer_kind: value.answer_kind,
+    cases: checkedCases,
+  };
 }
 
 async function parseBody(request) {
@@ -339,14 +473,33 @@ async function pollQuestion(request, env, origin, requestId) {
     return errorResponse("queue_unavailable", 503, origin);
   }
   if (!Array.isArray(notes)) return errorResponse("queue_unavailable", 503, origin);
-  const marker = `${ANSWER_PREFIX}${requestId} -->\n`;
+  const v2Marker = `${ANSWER_V2_PREFIX}${requestId} -->\n`;
   const answerNote = notes.find(
-    (note) => note && typeof note.body === "string" && note.body.startsWith(marker),
+    (note) => note && typeof note.body === "string" && note.body.startsWith(v2Marker),
   );
-  if (!answerNote) return jsonResponse({ request_id: requestId, status: "pending" }, 200, origin);
-  const answer = answerNote.body.slice(marker.length);
-  if (!answer || answer.length > 32_500) return errorResponse("answer_invalid", 503, origin);
-  return jsonResponse({ answer, request_id: requestId, status: "complete" }, 200, origin);
+  if (answerNote) {
+    const parsed = parsePublicAnswerPayload(answerNote.body.slice(v2Marker.length));
+    if (!parsed) return errorResponse("answer_invalid", 503, origin);
+    return jsonResponse({ ...parsed, request_id: requestId, status: "complete" }, 200, origin);
+  }
+  const v1Marker = `${ANSWER_V1_PREFIX}${requestId} -->\n`;
+  const legacyNote = notes.find(
+    (note) => note && typeof note.body === "string" && note.body.startsWith(v1Marker),
+  );
+  if (legacyNote) {
+    return jsonResponse(
+      {
+        answer: LEGACY_TEXT,
+        answer_kind: "cases_only",
+        cases: [],
+        request_id: requestId,
+        status: "complete",
+      },
+      200,
+      origin,
+    );
+  }
+  return jsonResponse({ request_id: requestId, status: "pending" }, 200, origin);
 }
 
 async function handleApi(request, env) {
@@ -372,7 +525,6 @@ async function handleApi(request, env) {
     return jsonResponse(
       {
         max_question_characters: MAX_QUESTION_CHARACTERS,
-        preview_warning: "unreviewed_incomplete_preview",
         turnstile_site_key: siteKey,
       },
       200,

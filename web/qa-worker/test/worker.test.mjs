@@ -156,14 +156,32 @@ test("limits first-party challenge issuance per client and minute", async () => 
   assert.deepEqual(statuses, [...Array(10).fill(200), 429]);
 });
 
-test("poll returns only the matching machine-marked answer", async () => {
+const PUBLIC_CASE = {
+  answer: "관련 기준을 확인합니다.",
+  case_id: "senqa-2022-case-a",
+  edition_year: 2022,
+  pdf_pages: [4],
+  question: "수의계약이 가능한가요?",
+  title: "계약 사례",
+};
+
+function answerNote(requestId, overrides = {}) {
+  const payload = {
+    answer: "계약 기준입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]",
+    answer_kind: "grounded",
+    cases: [PUBLIC_CASE],
+    schema_version: "senqa-public-answer/v1",
+    ...overrides,
+  };
+  return `<!-- senqa-answer:v2 request_id=${requestId} -->\n${JSON.stringify(payload)}\n`;
+}
+
+test("poll returns only the matching structured public answer", async () => {
   const runtime = env(async () =>
     Response.json([
       { body: "ordinary comment" },
       {
-        body:
-          "<!-- senqa-answer:v1 request_id=senqa-07070707070707070707070707070707 -->\n" +
-          "> **미검수 프리뷰** · `production_eligible=false`\n\n근거 답변",
+        body: answerNote("senqa-07070707070707070707070707070707"),
       },
     ]),
   );
@@ -188,8 +206,70 @@ test("poll returns only the matching machine-marked answer", async () => {
 
   assert.equal(response.status, 200);
   assert.equal(body.status, "complete");
-  assert.equal(body.answer, "> **미검수 프리뷰** · `production_eligible=false`\n\n근거 답변");
+  assert.equal(body.answer, "계약 기준입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]");
+  assert.equal(body.answer_kind, "grounded");
+  assert.deepEqual(body.cases, [PUBLIC_CASE]);
   assert.equal(JSON.stringify(body).includes("issue_iid"), false);
+  assert.equal(JSON.stringify(body).includes("production_eligible"), false);
+});
+
+test("poll rejects a structured answer with internal or extra fields", async () => {
+  const requestId = "senqa-0123456789abcdef0123456789abcdef";
+  const pollToken = "A".repeat(43);
+  const runtime = env(async () =>
+    Response.json([{ body: answerNote(requestId, { warning_code: "hidden" }) }]),
+  );
+  await runtime.QUESTIONS.put(
+    `question:${requestId}`,
+    JSON.stringify({
+      issue_iid: 73,
+      poll_token_sha256: createHash("sha256").update(pollToken).digest("hex"),
+    }),
+  );
+
+  const response = await worker.fetch(
+    new Request(`${ORIGIN}/api/questions/${requestId}?token=${pollToken}`, {
+      headers: { origin: ORIGIN },
+    }),
+    runtime,
+  );
+
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { error_code: "answer_invalid" });
+});
+
+test("legacy completion never returns its internal banner", async () => {
+  const requestId = "senqa-0123456789abcdef0123456789abcdef";
+  const pollToken = "B".repeat(43);
+  const runtime = env(async () =>
+    Response.json([
+      {
+        body:
+          `<!-- senqa-answer:v1 request_id=${requestId} -->\n` +
+          "> **미검수 프리뷰** · `production_eligible=false`",
+      },
+    ]),
+  );
+  await runtime.QUESTIONS.put(
+    `question:${requestId}`,
+    JSON.stringify({
+      issue_iid: 73,
+      poll_token_sha256: createHash("sha256").update(pollToken).digest("hex"),
+    }),
+  );
+
+  const response = await worker.fetch(
+    new Request(`${ORIGIN}/api/questions/${requestId}?token=${pollToken}`, {
+      headers: { origin: ORIGIN },
+    }),
+    runtime,
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.answer_kind, "cases_only");
+  assert.deepEqual(body.cases, []);
+  assert.equal(JSON.stringify(body).includes("production_eligible"), false);
 });
 
 test("rejects cross-origin, missing turnstile, and invalid poll token", async () => {

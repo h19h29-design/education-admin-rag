@@ -11,6 +11,7 @@ from src.integrations.gitlab_qa_delivery import (
     build_answer_comment,
     post_answer_comment,
 )
+from src.integrations.gitlab_qa_public import PublicAnswer, PublicCase
 
 REQUEST_ID = "senqa-0123456789abcdef0123456789abcdef"
 
@@ -29,16 +30,39 @@ class _Response:
         return b'{"id":91}'
 
 
-def test_comment_has_machine_marker_and_nonproduction_warning() -> None:
-    comment = build_answer_comment(
-        REQUEST_ID,
-        "근거 답변\n\nsenqa-2022-case-a · 2022년 · PDF 4쪽",
+def _answer() -> PublicAnswer:
+    return PublicAnswer(
+        answer="근거 답변입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]",
+        answer_kind="grounded",
+        cases=(
+            PublicCase(
+                case_id="senqa-2022-case-a",
+                edition_year=2022,
+                pdf_pages=(4,),
+                title="계약 사례",
+                question="수의계약이 가능한가요?",
+                answer="관련 기준을 확인합니다.",
+            ),
+        ),
     )
 
-    assert comment.startswith(f"<!-- senqa-answer:v1 request_id={REQUEST_ID} -->\n")
-    assert "미검수 프리뷰" in comment
-    assert "production_eligible=false" in comment
-    assert "senqa-2022-case-a" in comment
+
+def test_comment_has_v2_machine_marker_and_only_public_payload() -> None:
+    comment = build_answer_comment(REQUEST_ID, _answer())
+
+    marker, payload_text = comment.split("\n", 1)
+    assert marker == f"<!-- senqa-answer:v2 request_id={REQUEST_ID} -->"
+    payload = json.loads(payload_text)
+    assert payload["answer_kind"] == "grounded"
+    assert payload["cases"][0]["pdf_pages"] == [4]
+    for forbidden in (
+        "production_eligible",
+        "warning_code",
+        "complete_corpus",
+        "review_status",
+        "Hermes",
+    ):
+        assert forbidden not in comment
 
 
 def test_post_uses_exact_gitlab_issue_notes_endpoint_and_private_token(
@@ -56,7 +80,7 @@ def test_post_uses_exact_gitlab_issue_notes_endpoint_and_private_token(
     note_id = post_answer_comment(
         issue_iid=73,
         request_id=REQUEST_ID,
-        content="근거 답변",
+        answer=_answer(),
         token="secret-token",
     )
 
@@ -70,25 +94,24 @@ def test_post_uses_exact_gitlab_issue_notes_endpoint_and_private_token(
     assert request.get_method() == "POST"
     payload = json.loads(request.data)
     assert payload["body"].startswith(
-        f"<!-- senqa-answer:v1 request_id={REQUEST_ID} -->"
+        f"<!-- senqa-answer:v2 request_id={REQUEST_ID} -->"
     )
 
 
 @pytest.mark.parametrize(
-    ("issue_iid", "request_id", "content", "token"),
+    ("issue_iid", "request_id", "answer", "token"),
     (
-        (True, REQUEST_ID, "answer", "token"),
-        (0, REQUEST_ID, "answer", "token"),
-        (1, "bad", "answer", "token"),
-        (1, REQUEST_ID, "", "token"),
-        (1, REQUEST_ID, "answer", ""),
-        (1, REQUEST_ID, "A" * 32_001, "token"),
+        (True, REQUEST_ID, _answer(), "token"),
+        (0, REQUEST_ID, _answer(), "token"),
+        (1, "bad", _answer(), "token"),
+        (1, REQUEST_ID, "not-an-answer", "token"),
+        (1, REQUEST_ID, _answer(), ""),
     ),
 )
 def test_invalid_delivery_fields_fail_value_free(
     issue_iid: object,
     request_id: object,
-    content: object,
+    answer: object,
     token: object,
 ) -> None:
     marker = "PRIVATE_DELIVERY_SENTINEL"
@@ -96,7 +119,7 @@ def test_invalid_delivery_fields_fail_value_free(
         post_answer_comment(
             issue_iid=issue_iid,
             request_id=request_id,
-            content=f"{content}{marker}" if content else content,
+            answer=answer,
             token=token,
         )
 
