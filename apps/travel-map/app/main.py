@@ -1,4 +1,5 @@
 import logging
+from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -8,8 +9,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api import router as api_router
 from app.dependencies import AppDependencies, build_production_dependencies
@@ -23,47 +26,119 @@ class RequestTooLargeError(Exception):
     pass
 
 
+class JsonTrustedHostMiddleware(TrustedHostMiddleware):
+    """Keep exact host validation while returning the API's JSON error contract."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if self.allow_any or scope["type"] not in {"http", "websocket"}:
+            await self.app(scope, receive, send)
+            return
+        host = Headers(scope=scope).get("host", "").split(":")[0]
+        if any(
+            host == pattern or (pattern.startswith("*") and host.endswith(pattern[1:]))
+            for pattern in self.allowed_hosts
+        ):
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] == "http":
+            await _json_error(scope, receive, send, 400, "INVALID_HOST")
+            return
+        await send({"type": "websocket.close", "code": 1008})
+
+
+class _UvicornQueryRedactionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if type(record.args) is tuple and len(record.args) >= 3:
+            request_target = record.args[2]
+            if type(request_target) is str:
+                record.args = (
+                    *record.args[:2],
+                    request_target.split("?", maxsplit=1)[0],
+                    *record.args[3:],
+                )
+        return True
+
+
+def _configure_production_access_log() -> None:
+    logger = logging.getLogger("uvicorn.access")
+    if not any(type(item) is _UvicornQueryRedactionFilter for item in logger.filters):
+        logger.addFilter(_UvicornQueryRedactionFilter())
+
+
 class RequestSizeLimitMiddleware:
-    def __init__(self, app: object, *, max_bytes: int) -> None:
+    def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
         self.app = app
         self.max_bytes = max_bytes
 
-    async def __call__(self, scope: object, receive: object, send: object) -> None:
-        if not isinstance(scope, dict) or scope.get("type") != "http":
-            await self.app(scope, receive, send)  # type: ignore[operator]
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
             return
-        headers = dict(scope.get("headers", ()))
-        content_length = headers.get(b"content-length")
-        if content_length is not None:
-            try:
-                if int(content_length) > self.max_bytes:
-                    await _json_error(send, 413, "REQUEST_TOO_LARGE")
-                    return
-            except ValueError:
-                await _json_error(send, 400, "INVALID_CONTENT_LENGTH")
-                return
-        received = 0
-
-        async def limited_receive() -> object:
-            nonlocal received
-            event = await receive()  # type: ignore[operator]
-            if isinstance(event, dict) and event.get("type") == "http.request":
-                body = event.get("body", b"")
-                if isinstance(body, bytes):
-                    received += len(body)
-                    if received > self.max_bytes:
-                        raise RequestTooLargeError
-            return event
-
         try:
-            await self.app(scope, limited_receive, send)  # type: ignore[operator]
+            content_length = _content_length(scope)
         except RequestTooLargeError:
-            await _json_error(send, 413, "REQUEST_TOO_LARGE")
+            await _json_error(scope, receive, send, 400, "INVALID_CONTENT_LENGTH")
+            return
+        if content_length is not None and content_length > self.max_bytes:
+            await _json_error(scope, receive, send, 413, "REQUEST_TOO_LARGE")
+            return
+        try:
+            events = await _buffer_request_events(receive, self.max_bytes)
+        except RequestTooLargeError:
+            await _json_error(scope, receive, send, 413, "REQUEST_TOO_LARGE")
+            return
+
+        async def replay_receive() -> Message:
+            if events:
+                return events.popleft()
+            return {"type": "http.disconnect"}
+
+        await self.app(scope, replay_receive, send)
 
 
-async def _json_error(send: object, status_code: int, code: str) -> None:
+def _content_length(scope: Scope) -> int | None:
+    values = [
+        value for name, value in scope["headers"] if name.lower() == b"content-length"
+    ]
+    if not values:
+        return None
+    if len(values) != 1 or not values[0].isdigit():
+        raise RequestTooLargeError
+    return int(values[0])
+
+
+async def _buffer_request_events(
+    receive: Receive,
+    max_bytes: int,
+) -> deque[Message]:
+    events: deque[Message] = deque()
+    received = 0
+    while True:
+        event = await receive()
+        events.append(event)
+        if event["type"] == "http.disconnect":
+            return events
+        if event["type"] != "http.request":
+            raise RequestTooLargeError
+        body = event.get("body", b"")
+        if not isinstance(body, bytes):
+            raise RequestTooLargeError
+        received += len(body)
+        if received > max_bytes:
+            raise RequestTooLargeError
+        if not event.get("more_body", False):
+            return events
+
+
+async def _json_error(
+    scope: Scope,
+    receive: Receive,
+    send: Send,
+    status_code: int,
+    code: str,
+) -> None:
     response = JSONResponse({"error": {"code": code}}, status_code=status_code)
-    await response(None, None, send)  # type: ignore[arg-type]
+    await response(scope, receive, send)
 
 
 def create_app(
@@ -71,6 +146,8 @@ def create_app(
     dependencies: AppDependencies | None = None,
 ) -> FastAPI:
     active_settings = settings or Settings()
+    if active_settings.environment == "production":
+        _configure_production_access_log()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -93,7 +170,11 @@ def create_app(
     allowed_hosts = list(active_settings.allowed_hosts)
     if active_settings.environment != "production":
         allowed_hosts.append("testserver")
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+    app.add_middleware(
+        JsonTrustedHostMiddleware,
+        allowed_hosts=allowed_hosts,
+        www_redirect=False,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(active_settings.allowed_origins),

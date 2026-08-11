@@ -1,9 +1,10 @@
 """Trip-preview orchestration that keeps legal classification independent of display routes."""
 
+import asyncio
 from dataclasses import replace
 from typing import Literal
 
-from app.cache import CAR_AND_TRANSIT_TTL_SECONDS
+from app.cache import CAR_AND_TRANSIT_TTL_SECONDS, WALK_TTL_SECONDS
 from app.contracts import (
     AllowanceResponse,
     AmountResponse,
@@ -125,42 +126,61 @@ class TripPreviewService:
         )
 
     async def _display_routes(self, query: RouteQuery) -> RouteCollection:
+        collections = await asyncio.gather(
+            *(self._display_mode_routes(query, mode) for mode in TravelMode)
+        )
+        return self._dependencies.route_orchestrator.combine_collections(
+            dict(zip(TravelMode, collections, strict=True))
+        )
+
+    async def _display_mode_routes(
+        self,
+        query: RouteQuery,
+        mode: TravelMode,
+    ) -> RouteCollection:
         key = self._dependencies.cache.route_key(
             provider="ROUTE_ORCHESTRATOR",
-            mode=TravelMode.CAR,
+            mode=mode,
             origin=query.origin,
             destination=query.destination,
             depart_at=query.depart_at,
-            options={
-                "modes": tuple(mode.value for mode in TravelMode),
-                "fuelType": (
-                    query.car_assumptions.fuel_type.value
-                    if query.car_assumptions is not None
-                    else None
-                ),
-                "efficiencyKmPerLiter": (
-                    query.car_assumptions.efficiency_km_per_liter
-                    if query.car_assumptions is not None
-                    else None
-                ),
-                "parkingCostKrw": (
-                    query.car_assumptions.parking_cost_krw
-                    if query.car_assumptions is not None
-                    else None
-                ),
-            },
+            options=(
+                {
+                    "fuelType": (
+                        query.car_assumptions.fuel_type.value
+                        if query.car_assumptions is not None
+                        else None
+                    ),
+                    "efficiencyKmPerLiter": (
+                        query.car_assumptions.efficiency_km_per_liter
+                        if query.car_assumptions is not None
+                        else None
+                    ),
+                    "parkingCostKrw": (
+                        query.car_assumptions.parking_cost_krw
+                        if query.car_assumptions is not None
+                        else None
+                    ),
+                }
+                if mode is TravelMode.CAR
+                else {}
+            ),
         )
         cached = self._dependencies.cache.get(key)
         if type(cached) is RouteCollection:
             return cached
         collected = await self._dependencies.route_orchestrator.collect(
             query,
-            set(TravelMode),
+            {mode},
         )
         return self._dependencies.cache.set(
             key,
             collected,
-            ttl_seconds=CAR_AND_TRANSIT_TTL_SECONDS,
+            ttl_seconds=(
+                WALK_TTL_SECONDS
+                if mode is TravelMode.WALK
+                else CAR_AND_TRANSIT_TTL_SECONDS
+            ),
         )
 
     async def _classification_route(self, query: RouteQuery) -> RouteOption | None:

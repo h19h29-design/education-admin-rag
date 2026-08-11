@@ -77,6 +77,37 @@ async def test_opinet_requires_certkey_uses_official_codes_and_caches() -> None:
     assert secret not in repr(client)
 
 
+# Break caught: the production-default fuel cache refreshing before the required
+# one-day TTL has elapsed.
+@pytest.mark.asyncio
+async def test_opinet_default_cache_ttl_is_exactly_one_day() -> None:
+    current = [NOW]
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json=load_json("opinet-average.json"),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = OpinetClient(
+            http=http,
+            cert_key=SecretStr("test-key"),
+            now=lambda: current[0],
+        )
+        await client.average_price(FuelType.GASOLINE)
+        current[0] += timedelta(seconds=3_601)
+        await client.average_price(FuelType.GASOLINE)
+        current[0] += timedelta(seconds=82_799)
+        await client.average_price(FuelType.GASOLINE)
+
+    assert requests == 2
+
+
 @pytest.mark.asyncio
 async def test_opinet_expired_cache_does_not_fabricate_price_on_failure() -> None:
     current = [NOW]

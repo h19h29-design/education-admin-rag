@@ -44,13 +44,25 @@ async def reverse_places(
     dependencies = dependencies_for(request)
     _check_places_limit(request)
     coordinate = Coordinate(latitude=latitude, longitude=longitude)
+    key = dependencies.cache.key(
+        "places-reverse",
+        {"latitude": latitude, "longitude": longitude},
+    )
+    cached = dependencies.cache.get(key)
+    if type(cached) is ReversePlaceResponse:
+        return cached
     candidate = await dependencies.place_client.reverse_geocode(coordinate)  # type: ignore[attr-defined]
     warnings = tuple(getattr(dependencies.place_client, "last_warnings", ()))
     if candidate is None and warnings:
         raise HTTPException(status_code=503, detail="PLACE_PROVIDER_UNAVAILABLE")
-    return ReversePlaceResponse(
+    response = ReversePlaceResponse(
         item=_place_response(candidate) if candidate is not None else None,
         warnings=warnings,
+    )
+    return dependencies.cache.set(
+        key,
+        response,
+        ttl_seconds=PLACES_TTL_SECONDS,
     )
 
 

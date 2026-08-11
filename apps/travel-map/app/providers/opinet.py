@@ -7,6 +7,7 @@ from math import isfinite
 import httpx
 from pydantic import SecretStr
 
+from app.cache import FUEL_TTL_SECONDS
 from app.providers.http import BoundedHttpClient, ProviderRequestError
 from app.routing.models import (
     CarAssumptions,
@@ -51,7 +52,7 @@ class OpinetClient:
         http: httpx.AsyncClient | None = None,
         cert_key: SecretStr | None = None,
         now: Callable[[], datetime] | None = None,
-        cache_ttl_seconds: float = 3_600.0,
+        cache_ttl_seconds: float = FUEL_TTL_SECONDS,
         timeout_seconds: float = 5.0,
         max_response_bytes: int = 300_000,
     ) -> None:

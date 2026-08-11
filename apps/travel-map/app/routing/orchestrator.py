@@ -64,6 +64,30 @@ class RouteOrchestrator:
         outcomes = await asyncio.gather(
             *(self._collect_mode(query_base, mode) for mode in ordered_modes)
         )
+        return self._build_collection(ordered_modes, outcomes)
+
+    def combine_collections(
+        self,
+        collections: Mapping[TravelMode, RouteCollection],
+    ) -> RouteCollection:
+        """Apply the normal cross-mode ranking to independently collected modes."""
+
+        ordered_modes = tuple(mode for mode in TravelMode if mode in collections)
+        if any(type(mode) is not TravelMode for mode in collections):
+            raise TypeError("collection keys must be TravelMode")
+        outcomes: list[tuple[tuple[RouteOption, ...], tuple[ProviderWarning, ...]]] = []
+        for mode in ordered_modes:
+            collection = collections[mode]
+            if type(collection) is not RouteCollection:
+                raise TypeError("collections must contain RouteCollection values")
+            outcomes.append((collection.routes, collection.warnings))
+        return self._build_collection(ordered_modes, outcomes)
+
+    def _build_collection(
+        self,
+        ordered_modes: tuple[TravelMode, ...],
+        outcomes: Iterable[tuple[tuple[RouteOption, ...], tuple[ProviderWarning, ...]]],
+    ) -> RouteCollection:
 
         routes: list[RouteOption] = []
         warnings: list[ProviderWarning] = []

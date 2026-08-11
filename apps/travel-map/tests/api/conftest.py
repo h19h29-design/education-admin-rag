@@ -154,6 +154,22 @@ def fake_place_client() -> FakePlaceClient:
 
 
 @pytest.fixture
+def fake_route_providers(
+    fake_provider: FakeRouteProvider,
+) -> dict[TravelMode, FakeRouteProvider]:
+    return {
+        TravelMode.TRANSIT: fake_provider,
+        TravelMode.CAR: FakeRouteProvider("FAKE_CAR", TravelMode.CAR),
+        TravelMode.WALK: FakeRouteProvider("FAKE_WALK", TravelMode.WALK),
+    }
+
+
+@pytest.fixture
+def cache_clock() -> list[float]:
+    return [0.0]
+
+
+@pytest.fixture
 def settings() -> Settings:
     return Settings(
         environment="test",
@@ -169,13 +185,12 @@ def settings() -> Settings:
 @pytest.fixture
 def client(
     settings: Settings,
-    fake_provider: FakeRouteProvider,
+    fake_route_providers: dict[TravelMode, FakeRouteProvider],
     fake_classification_provider: FakeClassificationProvider,
     fake_place_client: FakePlaceClient,
+    cache_clock: list[float],
 ) -> Iterator[TestClient]:
     store = InstitutionStore.load(FIXTURES / "institutions/snapshot")
-    car_provider = FakeRouteProvider("FAKE_CAR", TravelMode.CAR)
-    walk_provider = FakeRouteProvider("FAKE_WALK", TravelMode.WALK)
     coverage = CoverageService.from_geojson(
         seoul_path=FIXTURES / "geodata/seoul-square.geojson",
         buffer_distance_m=12_000,
@@ -188,16 +203,12 @@ def client(
             RuleRepository.from_directory("apps/travel-map/resources/rules")
         ),
         route_orchestrator=RouteOrchestrator(
-            {
-                TravelMode.TRANSIT: (fake_provider,),
-                TravelMode.CAR: (car_provider,),
-                TravelMode.WALK: (walk_provider,),
-            },
+            {mode: (provider,) for mode, provider in fake_route_providers.items()},
             max_concurrency=4,
         ),
         classification_provider=fake_classification_provider,
         place_client=fake_place_client,
-        cache=TtlLruCache(max_entries=100),
+        cache=TtlLruCache(max_entries=100, now=lambda: cache_clock[0]),
         rate_limiter=FixedWindowRateLimiter(
             limits={"places": (10, 60.0), "preview": (20, 60.0)}
         ),

@@ -8,6 +8,7 @@ from typing import cast
 import httpx
 from pydantic import SecretStr
 
+from app.cache import FUEL_TTL_SECONDS
 from app.providers.http import BoundedHttpClient, ProviderRequestError
 from app.providers.opinet import OpinetClient, estimate_car_cost
 from app.routing.models import (
@@ -216,6 +217,7 @@ class KakaoCarProvider:
             raise TypeError("settings must be an exact Settings")
         opinet = OpinetClient(
             cert_key=settings.opinet_cert_key,
+            cache_ttl_seconds=FUEL_TTL_SECONDS,
             timeout_seconds=settings.provider_timeout_seconds,
         )
         provider = cls(

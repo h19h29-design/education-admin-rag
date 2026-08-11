@@ -1,3 +1,4 @@
+from app.cache import WALK_TTL_SECONDS
 from tests.api.conftest import trip_payload
 
 
@@ -62,6 +63,29 @@ def test_trip_preview_caches_display_routes(client, fake_provider) -> None:
 
     assert first.status_code == second.status_code == 200
     assert fake_provider.call_count == 1
+
+
+# Break caught: a combined five-minute display cache expiring walk results with
+# car/transit, instead of retaining the walk mode for its seven-day policy.
+def test_trip_preview_keeps_walk_cached_after_car_and_transit_expire(
+    client, cache_clock
+) -> None:
+    first = client.post("/api/v1/trips/preview", json=trip_payload())
+    cache_clock[0] += 301.0
+    second = client.post("/api/v1/trips/preview", json=trip_payload())
+
+    assert first.status_code == second.status_code == 200
+    first_ids = {route["mode"]: route["id"] for route in first.json()["routes"]}
+    second_ids = {route["mode"]: route["id"] for route in second.json()["routes"]}
+    assert second_ids["WALK"] == first_ids["WALK"]
+    assert second_ids["CAR"] != first_ids["CAR"]
+    assert second_ids["TRANSIT"] != first_ids["TRANSIT"]
+
+    cache_clock[0] = WALK_TTL_SECONDS + 1.0
+    expired = client.post("/api/v1/trips/preview", json=trip_payload())
+    expired_ids = {route["mode"]: route["id"] for route in expired.json()["routes"]}
+    assert expired.status_code == 200
+    assert expired_ids["WALK"] != first_ids["WALK"]
 
 
 # Break caught: using the displayed route or one-way distance for the legal two-kilometre branch.
