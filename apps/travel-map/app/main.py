@@ -21,6 +21,21 @@ from app.settings import Settings
 _ACCESS_LOG = logging.getLogger("travel_map.access")
 _MAX_REQUEST_BYTES = 32 * 1024
 _MAX_CONTENT_LENGTH_DIGITS = 20
+# Kakao Maps loads the SDK bootstrap/API from dapi.kakao.com, its runtime from
+# t1.daumcdn.net, and map tile images from Daum CDN subdomains. These are the
+# only third-party origins required by the public map; no inline code is allowed.
+_PUBLIC_CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self' https://dapi.kakao.com https://t1.daumcdn.net; "
+    "style-src 'self'; "
+    "img-src 'self' data: https://*.daumcdn.net; "
+    "connect-src 'self' https://dapi.kakao.com; "
+    "font-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "frame-ancestors 'none'"
+)
 
 
 class RequestTooLargeError(Exception):
@@ -200,6 +215,12 @@ def create_app(
             response.status_code,
             int((perf_counter() - started) * 1000),
         )
+        return response
+
+    @app.middleware("http")
+    async def content_security_policy(request: Request, call_next: object) -> object:
+        response = await call_next(request)  # type: ignore[operator]
+        response.headers.setdefault("Content-Security-Policy", _PUBLIC_CONTENT_SECURITY_POLICY)
         return response
 
     @app.exception_handler(RequestValidationError)

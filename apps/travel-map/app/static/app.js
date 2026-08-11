@@ -15,6 +15,7 @@ const controls = {
   results: $("#results"),
   routeList: $("#route-list"),
   routeCount: $("#route-count"),
+  calculateButton: $("#calculate-button"),
   mapCollapse: $("#map-collapse"),
   filtersToggle: $("#institution-filters-toggle"),
 };
@@ -61,6 +62,12 @@ function errorMessage(error) {
 function setFormError(message = "") {
   controls.formError.textContent = message;
   controls.formError.hidden = !message;
+}
+
+function updateCalculateAvailability() {
+  controls.calculateButton.disabled = !(
+    state.origin && state.destination && controls.policy.value
+  );
 }
 
 function setDefaultDates() {
@@ -125,6 +132,7 @@ function selectSuggestion(kind, item) {
     controls.destinationNote.textContent = item.roadAddress || item.lotAddress;
   }
   hideSuggestions(kind);
+  updateCalculateAvailability();
   setFormError();
 }
 
@@ -147,6 +155,7 @@ function bindCombobox(kind, getItems) {
     const query = input.value.trim();
     if (kind === "origin") state.origin = null;
     else state.destination = null;
+    updateCalculateAvailability();
     if (query.length < 2) return hideSuggestions(kind);
     const currentRequest = ++requestId;
     try {
@@ -184,6 +193,12 @@ function originFilters() {
 }
 
 async function reverseDestination(point) {
+  state.destination = null;
+  controls.destination.value = "";
+  controls.destinationNote.textContent = "지도에서 선택한 위치의 주소를 확인하고 선택하세요.";
+  hideSuggestions("destination");
+  updateCalculateAvailability();
+  setFormError();
   try {
     const response = await api.reversePlace(point);
     if (!response.item) {
@@ -235,11 +250,10 @@ function sortRoutes(routes) {
   });
 }
 
-function badgesFor(route) {
+function bestLabelsFor(route) {
   return Object.entries(bestName)
     .filter(([key]) => state.preview.best[key] === route.id)
-    .map(([, label]) => `<span class="route-badge">${label}</span>`)
-    .join("");
+    .map(([, label]) => label);
 }
 
 function warningText(warning) {
@@ -257,14 +271,51 @@ function renderRoutes() {
     const card = document.createElement("button");
     const selected = route.id === state.activeRouteId;
     card.type = "button";
-    card.className = `route-card mode-${route.mode.toLowerCase()}`;
+    const routeMode = { TRANSIT: "transit", CAR: "car", WALK: "walk" }[route.mode] || "unknown";
+    card.className = `route-card mode-${routeMode}`;
     card.dataset.routeId = route.id;
     card.setAttribute("aria-current", String(selected));
-    card.innerHTML = `
-      <span class="route-top"><strong>${modeName[route.mode]} · ${formatDuration(route.durationSeconds)}</strong><span class="route-badges">${badgesFor(route)}</span></span>
-      <span class="route-metrics"><span>소요시간 <b>${formatDuration(route.durationSeconds)}</b></span><span>거리 <b>${formatDistance(route.distanceMeters)}</b></span><span>예상 이동비 <b>${formatMoney(route.mobilityCostKrw)}</b></span></span>
-      ${route.warnings.length ? `<span class="route-warning">⚠ ${route.warnings.map(warningText).join(" · ")}</span>` : ""}
-      <span class="route-source">${route.source} 기준</span>`;
+    const top = document.createElement("span");
+    top.className = "route-top";
+    const title = document.createElement("strong");
+    title.textContent = `${modeName[route.mode] || "이동 경로"} · ${formatDuration(route.durationSeconds)}`;
+    const badges = document.createElement("span");
+    badges.className = "route-badges";
+    bestLabelsFor(route).forEach((label) => {
+      const badge = document.createElement("span");
+      badge.className = "route-badge";
+      badge.textContent = label;
+      badges.append(badge);
+    });
+    top.append(title, badges);
+
+    const metrics = document.createElement("span");
+    metrics.className = "route-metrics";
+    [
+      ["소요시간", formatDuration(route.durationSeconds)],
+      ["거리", formatDistance(route.distanceMeters)],
+      ["예상 이동비", formatMoney(route.mobilityCostKrw)],
+    ].forEach(([label, value]) => {
+      const metric = document.createElement("span");
+      const metricLabel = document.createElement("span");
+      const metricValue = document.createElement("b");
+      metricLabel.textContent = label;
+      metricValue.textContent = value;
+      metric.append(metricLabel, metricValue);
+      metrics.append(metric);
+    });
+
+    card.append(top, metrics);
+    if (route.warnings.length) {
+      const warning = document.createElement("span");
+      warning.className = "route-warning";
+      warning.textContent = `⚠ ${route.warnings.map(warningText).join(" · ")}`;
+      card.append(warning);
+    }
+    const source = document.createElement("span");
+    source.className = "route-source";
+    source.textContent = `${route.source} 기준`;
+    card.append(source);
     card.addEventListener("click", () => selectRoute(route.id));
     controls.routeList.append(card);
   });
@@ -313,7 +364,7 @@ async function calculate(event) {
     setFormError("출발·복귀 일시와 자동차 이용 가정을 확인하세요.");
     return;
   }
-  const button = $("#calculate-button");
+  const button = controls.calculateButton;
   button.disabled = true;
   button.textContent = "경로를 계산하고 있습니다";
   setFormError();
@@ -323,7 +374,7 @@ async function calculate(event) {
   } catch (error) {
     setFormError(errorMessage(error));
   } finally {
-    button.disabled = false;
+    updateCalculateAvailability();
     button.textContent = "▣ 경로 계산";
   }
 }
@@ -369,6 +420,8 @@ async function initialize() {
   controls.form.addEventListener("submit", calculate);
   bindSortTabs();
   bindMapControls();
+  controls.policy.addEventListener("change", updateCalculateAvailability);
+  updateCalculateAvailability();
   try {
     const bootstrap = await api.bootstrap();
     await map.initialize(bootstrap.map.javascriptKey);

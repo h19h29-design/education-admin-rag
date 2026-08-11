@@ -5,51 +5,182 @@ import type { Page, Route } from "@playwright/test";
 
 const fixtureDir = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
-function fixture(name: string): object {
-  return JSON.parse(readFileSync(join(fixtureDir, name), "utf8"));
+export type MockApiOptions = {
+  preview?: object;
+  reverse?: object;
+};
+
+type MapEvent = {
+  kind: string;
+  map?: "map" | null;
+  options?: Record<string, unknown>;
+  type: string;
+};
+
+type MapState = {
+  created: Array<{ kind: string; options: Record<string, unknown> }>;
+  events: MapEvent[];
+};
+
+export function readFixture<T extends object>(name: string): T {
+  return JSON.parse(readFileSync(join(fixtureDir, name), "utf8")) as T;
 }
 
-async function json(route: Route, name: string): Promise<void> {
+async function json(route: Route, payload: object): Promise<void> {
   await route.fulfill({
     status: 200,
     contentType: "application/json",
-    body: JSON.stringify(fixture(name)),
+    body: JSON.stringify(payload),
   });
 }
 
-export async function installMockApi(page: Page): Promise<void> {
+export async function installMockApi(
+  page: Page,
+  options: MockApiOptions = {},
+): Promise<void> {
   await page.addInitScript(() => {
+    const state = {
+      created: [] as Array<{ kind: string; options: Record<string, unknown> }>,
+      events: [] as Array<{
+        kind: string;
+        map?: "map" | null;
+        options?: Record<string, unknown>;
+        type: string;
+      }>,
+      clickHandler: null as ((event: { latLng: LatLngFake }) => Promise<void> | void) | null,
+      async triggerClick(latitude: number, longitude: number): Promise<void> {
+        await this.clickHandler?.({ latLng: new LatLngFake(latitude, longitude) });
+      },
+    };
+
     class MapFake {
-      setBounds(): void {}
+      setBounds(): void {
+        state.events.push({ kind: "Map", type: "setBounds" });
+      }
     }
+
     class OverlayFake {
-      setMap(): void {}
+      kind: string;
+
+      constructor(options: Record<string, unknown> = {}) {
+        this.kind = this.constructor.name;
+        state.created.push({ kind: this.kind, options });
+      }
+
+      setMap(map: unknown): void {
+        state.events.push({
+          kind: this.kind,
+          map: map === null ? null : "map",
+          type: "setMap",
+        });
+      }
+
+      setOptions(options: Record<string, unknown>): void {
+        state.events.push({ kind: this.kind, options, type: "setOptions" });
+      }
     }
+
+    class MarkerFake extends OverlayFake {}
+    class PolylineFake extends OverlayFake {}
+    class PolygonFake extends OverlayFake {}
+
     class LatLngFake {
-      constructor(public lat: number, public lng: number) {}
+      constructor(
+        public lat: number,
+        public lng: number,
+      ) {}
+
+      getLat(): number {
+        return this.lat;
+      }
+
+      getLng(): number {
+        return this.lng;
+      }
     }
+
     class BoundsFake {
-      extend(): void {}
+      extend(): void {
+        state.events.push({ kind: "LatLngBounds", type: "extend" });
+      }
     }
+
     Object.assign(window, {
+      __task8Map: state,
       kakao: {
         maps: {
           load: (callback: () => void) => callback(),
           Map: MapFake,
-          Marker: OverlayFake,
-          Polyline: OverlayFake,
-          Polygon: OverlayFake,
+          Marker: MarkerFake,
+          Polyline: PolylineFake,
+          Polygon: PolygonFake,
           LatLng: LatLngFake,
           LatLngBounds: BoundsFake,
           MapTypeId: { ROADMAP: "ROADMAP" },
+          event: {
+            addListener: (
+              _map: MapFake,
+              eventName: string,
+              callback: (event: { latLng: LatLngFake }) => Promise<void> | void,
+            ) => {
+              if (eventName === "click") state.clickHandler = callback;
+            },
+          },
         },
       },
     });
   });
-  await page.route("**/api/v1/bootstrap", (route) => json(route, "bootstrap.json"));
-  await page.route("**/api/v1/institutions**", (route) => json(route, "institutions.json"));
-  await page.route("**/api/v1/places**", (route) => json(route, "places.json"));
-  await page.route("**/api/v1/trips/preview", (route) => json(route, "preview.json"));
+  await page.route("**/api/v1/bootstrap", (route) =>
+    json(route, readFixture("bootstrap.json")),
+  );
+  await page.route("**/api/v1/institutions**", (route) =>
+    json(route, readFixture("institutions.json")),
+  );
+  await page.route("**/api/v1/places**", (route) =>
+    json(route, readFixture("places.json")),
+  );
+  await page.route("**/api/v1/places/reverse**", (route) =>
+    json(route, options.reverse ?? readFixture("reverse.json")),
+  );
+  await page.route("**/api/v1/geodata/seoul", (route) =>
+    json(route, readFixture("seoul.geojson")),
+  );
+  await page.route("**/api/v1/geodata/support", (route) =>
+    json(route, readFixture("support.geojson")),
+  );
+  await page.route("**/api/v1/trips/preview", (route) =>
+    json(route, options.preview ?? readFixture("preview.json")),
+  );
+}
+
+export async function mapState(page: Page): Promise<MapState> {
+  return page.evaluate(() => {
+    const task8Window = window as typeof window & {
+      __task8Map: MapState;
+    };
+    return {
+      created: task8Window.__task8Map.created,
+      events: task8Window.__task8Map.events,
+    };
+  });
+}
+
+export async function triggerMapClick(
+  page: Page,
+  latitude = 37.5663,
+  longitude = 126.9779,
+): Promise<void> {
+  await page.evaluate(
+    async ({ latitude: pointLatitude, longitude: pointLongitude }) => {
+      const task8Window = window as typeof window & {
+        __task8Map: {
+          triggerClick(latitude: number, longitude: number): Promise<void>;
+        };
+      };
+      await task8Window.__task8Map.triggerClick(pointLatitude, pointLongitude);
+    },
+    { latitude, longitude },
+  );
 }
 
 export async function completePublicOfficialTrip(page: Page): Promise<void> {

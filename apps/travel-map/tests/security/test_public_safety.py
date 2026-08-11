@@ -5,6 +5,7 @@ import httpx
 import pytest
 from app.main import _MAX_REQUEST_BYTES, app, create_app
 from app.settings import Settings
+from fastapi.testclient import TestClient
 
 pytest_plugins = ("tests.api.conftest",)
 
@@ -46,6 +47,28 @@ def test_invalid_host_uses_json_error_envelope(client) -> None:
 
     assert response.status_code == 400
     assert response.json() == {"error": {"code": "INVALID_HOST"}}
+
+
+# Break caught: serving the public UI without a browser-enforced policy left
+# response-backed map labels able to execute through an HTML rendering sink.
+def test_public_ui_has_strict_kakao_compatible_content_security_policy() -> None:
+    with TestClient(create_app()) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.headers["content-security-policy"] == (
+        "default-src 'self'; "
+        "script-src 'self' https://dapi.kakao.com https://t1.daumcdn.net; "
+        "style-src 'self'; "
+        "img-src 'self' data: https://*.daumcdn.net; "
+        "connect-src 'self' https://dapi.kakao.com; "
+        "font-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'"
+    )
+    assert "unsafe-inline" not in response.headers["content-security-policy"]
 
 
 # Break caught: CORS preflight short-circuiting before exact Host validation and

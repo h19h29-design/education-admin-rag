@@ -1,0 +1,11 @@
+{
+  "item": {
+    "placeId": "fixture-map-click-city-hall",
+    "name": "서울특별시청 지도 선택",
+    "roadAddress": "서울특별시 중구 세종대로 110",
+    "lotAddress": "서울특별시 중구 태평로1가 31",
+    "latitude": 37.5663,
+    "longitude": 126.9779
+  },
+  "warnings": []
+}
