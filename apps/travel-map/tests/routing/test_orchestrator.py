@@ -1,0 +1,252 @@
+import pytest
+from app.routing.models import ProviderResult, TravelMode
+from app.routing.orchestrator import RouteOrchestrator
+from tests.routing.fakes import (
+    ConcurrencyTracker,
+    FakeProvider,
+    RaisingProvider,
+    TrackingProvider,
+    base_query,
+    failed_result,
+    result_with,
+    route,
+)
+
+
+class InvalidProvider:
+    def __init__(self, name: str, supported_modes: object) -> None:
+        self.name = name
+        self.supported_modes = supported_modes
+
+    async def get_routes(self, query: object) -> ProviderResult:
+        return ProviderResult(provider="INVALID", routes=())
+
+
+# Break caught: a malformed provider registry failing only after request fan-out.
+@pytest.mark.parametrize(
+    "provider",
+    [
+        InvalidProvider(" ", frozenset({TravelMode.TRANSIT})),
+        InvalidProvider("INVALID", {TravelMode.TRANSIT}),
+        InvalidProvider("INVALID", frozenset({"TRANSIT"})),
+    ],
+)
+def test_orchestrator_rejects_invalid_provider_contract(provider: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        RouteOrchestrator(
+            {TravelMode.TRANSIT: (provider,)},  # type: ignore[arg-type]
+            max_concurrency=1,
+        )
+
+
+# Break caught: abandoning a mode when its primary provider partially fails.
+@pytest.mark.asyncio
+async def test_orchestrator_uses_second_provider_after_primary_failure() -> None:
+    primary = FakeProvider(
+        "public",
+        failed_result("UPSTREAM_TIMEOUT", provider="public"),
+    )
+    fallback = FakeProvider(
+        "kakao",
+        result_with(route("fallback", 700, 4_000, 1_500, source="kakao")),
+    )
+    orchestrator = RouteOrchestrator(
+        {TravelMode.TRANSIT: (primary, fallback)},
+        max_concurrency=3,
+    )
+
+    collection = await orchestrator.collect(base_query(), {TravelMode.TRANSIT})
+
+    assert [item.id for item in collection.routes] == ["fallback"]
+    assert [warning.code for warning in collection.warnings] == ["UPSTREAM_TIMEOUT"]
+
+
+# Break caught: spending quota on fallback after a valid primary response.
+@pytest.mark.asyncio
+async def test_orchestrator_stops_chain_after_valid_primary_routes() -> None:
+    primary = FakeProvider(
+        "public",
+        result_with(route("primary", source="public")),
+    )
+    fallback = FakeProvider(
+        "kakao",
+        result_with(route("fallback", source="kakao")),
+    )
+    orchestrator = RouteOrchestrator(
+        {TravelMode.TRANSIT: (primary, fallback)},
+        max_concurrency=3,
+    )
+
+    collection = await orchestrator.collect(base_query(), {TravelMode.TRANSIT})
+
+    assert [item.id for item in collection.routes] == ["primary"]
+    assert fallback.call_count == 0
+
+
+# Break caught: invoking a provider for a mode it does not advertise.
+@pytest.mark.asyncio
+async def test_orchestrator_falls_back_on_missing_capability() -> None:
+    wrong_mode = FakeProvider(
+        "transit-only",
+        result_with(route("wrong", source="transit-only")),
+    )
+    car = FakeProvider(
+        "car",
+        result_with(
+            route("car", mode=TravelMode.CAR, source="car"),
+        ),
+        supported_modes=frozenset({TravelMode.CAR}),
+    )
+    orchestrator = RouteOrchestrator(
+        {TravelMode.CAR: (wrong_mode, car)},
+        max_concurrency=1,
+    )
+
+    collection = await orchestrator.collect(base_query(), {TravelMode.CAR})
+
+    assert [item.id for item in collection.routes] == ["car"]
+    assert [warning.code for warning in collection.warnings] == ["CAPABILITY_MISSING"]
+    assert wrong_mode.call_count == 0
+
+
+# Break caught: one hung upstream preventing fallback indefinitely.
+@pytest.mark.asyncio
+async def test_orchestrator_times_out_then_uses_fallback() -> None:
+    slow = FakeProvider(
+        "slow",
+        result_with(route("slow", source="slow")),
+        delay_seconds=0.05,
+    )
+    fallback = FakeProvider(
+        "fallback",
+        result_with(route("fallback", source="fallback")),
+    )
+    orchestrator = RouteOrchestrator(
+        {TravelMode.TRANSIT: (slow, fallback)},
+        max_concurrency=1,
+        provider_timeout_seconds=0.005,
+    )
+
+    collection = await orchestrator.collect(base_query(), {TravelMode.TRANSIT})
+
+    assert [item.id for item in collection.routes] == ["fallback"]
+    assert [warning.code for warning in collection.warnings] == ["UPSTREAM_TIMEOUT"]
+
+
+# Break caught: synthesizing a misleading zero route when every provider fails.
+@pytest.mark.asyncio
+async def test_orchestrator_all_provider_failure_returns_no_route() -> None:
+    empty = FakeProvider("empty", ProviderResult(provider="empty", routes=()))
+    broken = RaisingProvider("broken")
+    orchestrator = RouteOrchestrator(
+        {TravelMode.TRANSIT: (empty, broken)},
+        max_concurrency=1,
+    )
+
+    collection = await orchestrator.collect(base_query(), {TravelMode.TRANSIT})
+
+    assert collection.routes == ()
+    assert collection.best.fastest_route_id is None
+    assert collection.best.shortest_route_id is None
+    assert collection.best.cheapest_route_id is None
+    assert [warning.code for warning in collection.warnings] == [
+        "NO_ROUTES",
+        "UPSTREAM_ERROR",
+    ]
+    assert "secret detail" not in collection.warnings[-1].message
+
+
+# Break caught: unbounded mode fan-out overrunning upstream limits.
+@pytest.mark.asyncio
+async def test_orchestrator_enforces_global_concurrency_limit() -> None:
+    tracker = ConcurrencyTracker()
+    providers = {
+        mode: (TrackingProvider(mode.value, mode, tracker),) for mode in TravelMode
+    }
+    orchestrator = RouteOrchestrator(providers, max_concurrency=2)
+
+    collection = await orchestrator.collect(base_query(), set(TravelMode))
+
+    assert len(collection.routes) == 3
+    assert tracker.peak == 2
+
+
+# Break caught: asynchronous completion making warning order nondeterministic.
+@pytest.mark.asyncio
+async def test_orchestrator_warning_order_is_stable_by_mode_and_chain() -> None:
+    transit = FakeProvider(
+        "transit",
+        failed_result("TRANSIT_FAIL", provider="transit"),
+        delay_seconds=0.02,
+    )
+    car = FakeProvider(
+        "car",
+        failed_result("CAR_FAIL", provider="car"),
+        supported_modes=frozenset({TravelMode.CAR}),
+    )
+    orchestrator = RouteOrchestrator(
+        {
+            TravelMode.TRANSIT: (transit,),
+            TravelMode.CAR: (car,),
+        },
+        max_concurrency=2,
+    )
+
+    collection = await orchestrator.collect(
+        base_query(),
+        {TravelMode.CAR, TravelMode.TRANSIT},
+    )
+
+    assert [warning.code for warning in collection.warnings] == [
+        "TRANSIT_FAIL",
+        "CAR_FAIL",
+    ]
+
+
+# Break caught: accepting a provider response under another provider's identity.
+@pytest.mark.asyncio
+async def test_orchestrator_rejects_provider_name_mismatch_and_falls_back() -> None:
+    mismatched = FakeProvider(
+        "expected",
+        result_with(route("wrong", source="actual")),
+    )
+    fallback = FakeProvider(
+        "fallback",
+        result_with(route("right", source="fallback")),
+    )
+    orchestrator = RouteOrchestrator(
+        {TravelMode.TRANSIT: (mismatched, fallback)},
+        max_concurrency=1,
+    )
+
+    collection = await orchestrator.collect(base_query(), {TravelMode.TRANSIT})
+
+    assert [item.id for item in collection.routes] == ["right"]
+    assert [warning.code for warning in collection.warnings] == [
+        "PROVIDER_IDENTITY_MISMATCH"
+    ]
+
+
+# Break caught: returning a route for a different requested transport mode.
+@pytest.mark.asyncio
+async def test_orchestrator_rejects_route_mode_mismatch_and_falls_back() -> None:
+    wrong = FakeProvider(
+        "wrong",
+        result_with(
+            route("wrong-mode", mode=TravelMode.CAR, source="wrong"),
+        ),
+        supported_modes=frozenset({TravelMode.TRANSIT}),
+    )
+    fallback = FakeProvider(
+        "fallback",
+        result_with(route("right", source="fallback")),
+    )
+    orchestrator = RouteOrchestrator(
+        {TravelMode.TRANSIT: (wrong, fallback)},
+        max_concurrency=1,
+    )
+
+    collection = await orchestrator.collect(base_query(), {TravelMode.TRANSIT})
+
+    assert [item.id for item in collection.routes] == ["right"]
+    assert [warning.code for warning in collection.warnings] == ["MODE_MISMATCH"]
