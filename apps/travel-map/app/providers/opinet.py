@@ -118,6 +118,10 @@ class OpinetClient:
     async def aclose(self) -> None:
         await self._transport.aclose()
 
+    @property
+    def last_status_code(self) -> int | None:
+        return self._transport.last_status_code
+
     def _current_time(self) -> datetime:
         value = self._now()
         if type(value) is not datetime or value.tzinfo is None:

@@ -1,3 +1,4 @@
+import re
 from math import isfinite
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -45,7 +46,7 @@ class Settings(BaseSettings):
         extra="ignore",
         frozen=True,
         strict=True,
-        env_ignore_empty=True,
+        env_ignore_empty=False,
     )
 
     environment: Literal["development", "test", "production"] = "development"
@@ -122,7 +123,7 @@ class Settings(BaseSettings):
         for host in value:
             if type(host) is not str or not host.strip() or host != host.strip():
                 raise ValueError("allowed hosts must be canonical strings")
-            if host == "*" or "://" in host or any(mark in host for mark in "/?#@"):
+            if not _is_canonical_host(host):
                 raise ValueError("allowed hosts must be exact host names")
         if len(value) != len(set(value)):
             raise ValueError("allowed hosts must be unique")
@@ -143,15 +144,32 @@ class Settings(BaseSettings):
             ):
                 raise ValueError("allowed origins must be canonical strings")
             parsed = urlsplit(origin)
+            try:
+                port = parsed.port
+            except ValueError:
+                raise ValueError(
+                    "allowed origins must use a valid numeric port"
+                ) from None
+            hostname = parsed.hostname
+            canonical_netloc = (
+                f"{hostname}:{port}"
+                if hostname is not None and port is not None
+                else hostname
+            )
             if (
                 origin == "*"
                 or parsed.scheme not in {"http", "https"}
-                or not parsed.hostname
+                or hostname is None
+                or not _is_canonical_host(hostname)
                 or parsed.username is not None
                 or parsed.password is not None
                 or parsed.path != ""
                 or parsed.query
                 or parsed.fragment
+                or parsed.netloc != canonical_netloc
+                or origin != f"{parsed.scheme}://{canonical_netloc}"
+                or (parsed.scheme == "http" and port == 80)
+                or (parsed.scheme == "https" and port == 443)
             ):
                 raise ValueError("allowed origins must be exact HTTP origins")
         if len(value) != len(set(value)):
@@ -162,6 +180,8 @@ class Settings(BaseSettings):
     def validate_production(self) -> "Settings":
         if self.environment != "production":
             return self
+        if not {"allowed_hosts", "allowed_origins"}.issubset(self.model_fields_set):
+            raise ValueError("production host and origin allowlists must be explicit")
         missing = tuple(
             name
             for name, value in (
@@ -176,3 +196,20 @@ class Settings(BaseSettings):
         if any(urlsplit(origin).scheme != "https" for origin in self.allowed_origins):
             raise ValueError("production origins must use HTTPS")
         return self
+
+
+def _is_canonical_host(value: str) -> bool:
+    if (
+        type(value) is not str
+        or value != value.lower()
+        or len(value) > 253
+        or value.startswith(".")
+        or value.endswith(".")
+        or ":" in value
+    ):
+        return False
+    labels = value.split(".")
+    return all(
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) is not None
+        for label in labels
+    )

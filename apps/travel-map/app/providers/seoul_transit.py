@@ -1,4 +1,5 @@
 import hashlib
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from math import isfinite
@@ -132,6 +133,10 @@ class SeoulTransitProvider:
     async def aclose(self) -> None:
         await self._transport.aclose()
 
+    @property
+    def last_status_code(self) -> int | None:
+        return self._transport.last_status_code
+
     @classmethod
     def from_settings(cls, settings: Settings) -> "SeoulTransitProvider":
         if type(settings) is not Settings:
@@ -165,8 +170,7 @@ def _parse_routes(
     max_routes: int,
     max_path_items: int,
 ) -> tuple[RouteOption, ...]:
-    lowered = raw[:4096].lower()
-    if b"<!doctype" in lowered or b"<!entity" in lowered:
+    if re.search(rb"<!\s*(?:doctype|entity)\b", raw, flags=re.IGNORECASE):
         raise ValueError
     root = ElementTree.fromstring(raw)
     if root.tag != "ServiceResult" or sum(1 for _ in root.iter()) > 50_000:

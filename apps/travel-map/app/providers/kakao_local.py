@@ -222,11 +222,11 @@ class KakaoLocalClient:
                 },
                 header_secret=self._rest_key,
             )
-            places = _parse_places(payload)
+            places, parse_warnings = _parse_places(payload, bounds)
         except ProviderRequestError as exc:
             self.last_warnings = (exc.code,)
             return ()
-        self.last_warnings = ()
+        self.last_warnings = parse_warnings
         return places
 
     async def reverse_geocode(self, coordinate: Coordinate) -> PlaceCandidate | None:
@@ -250,6 +250,10 @@ class KakaoLocalClient:
 
     async def aclose(self) -> None:
         await self._transport.aclose()
+
+    @property
+    def last_status_code(self) -> int | None:
+        return self._transport.last_status_code
 
     def provenance(self) -> EnrichmentProvenance:
         fetched_at = utc_now()
@@ -312,7 +316,10 @@ def _require_coordinate(value: Coordinate) -> None:
             raise ValueError("coordinate is invalid")
 
 
-def _parse_places(payload: dict[str, object]) -> tuple[PlaceCandidate, ...]:
+def _parse_places(
+    payload: dict[str, object],
+    bounds: BoundingBox,
+) -> tuple[tuple[PlaceCandidate, ...], tuple[str, ...]]:
     documents = payload.get("documents")
     if type(documents) is not list:
         raise ProviderRequestError(
@@ -323,25 +330,38 @@ def _parse_places(payload: dict[str, object]) -> tuple[PlaceCandidate, ...]:
             "RESPONSE_LIMIT_EXCEEDED", "Kakao Local place result limit exceeded"
         )
     places: list[PlaceCandidate] = []
+    seen_ids: set[str] = set()
+    warnings: list[str] = []
     try:
         for document in documents:
             if type(document) is not dict:
                 raise ValueError
-            places.append(
-                PlaceCandidate(
-                    place_id=_text(document, "id", required=True),
-                    name=_text(document, "place_name", required=True),
-                    road_address=_text(document, "road_address_name"),
-                    lot_address=_text(document, "address_name"),
-                    latitude=_number(document, "y"),
-                    longitude=_number(document, "x"),
-                )
+            place = PlaceCandidate(
+                place_id=_text(document, "id", required=True),
+                name=_text(document, "place_name", required=True),
+                road_address=_text(document, "road_address_name"),
+                lot_address=_text(document, "address_name"),
+                latitude=_number(document, "y"),
+                longitude=_number(document, "x"),
             )
+            if not (
+                bounds.west <= place.longitude <= bounds.east
+                and bounds.south <= place.latitude <= bounds.north
+            ):
+                if "OUT_OF_BOUNDS_RESULT" not in warnings:
+                    warnings.append("OUT_OF_BOUNDS_RESULT")
+                continue
+            if place.place_id in seen_ids:
+                if "DUPLICATE_PLACE_ID" not in warnings:
+                    warnings.append("DUPLICATE_PLACE_ID")
+                continue
+            seen_ids.add(place.place_id)
+            places.append(place)
     except (TypeError, ValueError):
         raise ProviderRequestError(
             "SCHEMA_MISMATCH", "Kakao Local place schema mismatch"
         ) from None
-    return tuple(places)
+    return tuple(places), tuple(warnings)
 
 
 def _parse_reverse(

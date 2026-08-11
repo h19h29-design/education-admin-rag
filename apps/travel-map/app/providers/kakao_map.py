@@ -22,7 +22,7 @@ from app.routing.models import (
 from app.settings import Settings
 
 _TRANSIT_URL = "https://dapi.kakao.com/v2/routing/publictraffic"
-_WALK_URL = "https://dapi.kakao.com/v2/routing/walking"
+_WALK_URL = "https://dapi.kakao.com/v2/routing/walk"
 _WALK_MODES = ("BROAD_FIRST", "SHORTEST", "ACCESSIBLE")
 
 
@@ -70,6 +70,10 @@ class _KakaoMapProvider:
     async def aclose(self) -> None:
         await self._transport.aclose()
 
+    @property
+    def last_status_code(self) -> int | None:
+        return self._transport.last_status_code
+
     @classmethod
     def from_settings(cls, settings: Settings) -> Self:
         if type(settings) is not Settings:
@@ -97,6 +101,19 @@ class _KakaoMapProvider:
             provider=self.name,
             routes=(),
             warnings=(exc.warning(self.name),),
+        )
+
+    def _no_results(self) -> ProviderResult:
+        return ProviderResult(
+            provider=self.name,
+            routes=(),
+            warnings=(
+                ProviderWarning(
+                    code="NO_RESULTS",
+                    message="Provider returned no routes for the requested trip",
+                    source=self.name,
+                ),
+            ),
         )
 
     def _source_time(self) -> datetime:
@@ -149,6 +166,8 @@ class KakaoTransitProvider(_KakaoMapProvider):
                     "Kakao transit response did not match the documented schema",
                 )
             )
+        if not routes:
+            return self._no_results()
         return ProviderResult(provider=self.name, routes=routes)
 
 
@@ -172,14 +191,14 @@ class KakaoWalkProvider(_KakaoMapProvider):
                     params=params,
                     header_secret=self._rest_key,
                 )
-                routes.append(
-                    _parse_walk(
-                        payload,
-                        route_mode=route_mode,
-                        source_time=source_time,
-                        max_geometry_points=self._max_geometry_points,
-                    )
+                route = _parse_walk(
+                    payload,
+                    route_mode=route_mode,
+                    source_time=source_time,
+                    max_geometry_points=self._max_geometry_points,
                 )
+                if route is not None:
+                    routes.append(route)
             if len(routes) > self._max_routes:
                 raise _LimitExceeded
         except _LimitExceeded:
@@ -198,6 +217,8 @@ class KakaoWalkProvider(_KakaoMapProvider):
                     "Kakao walk response did not match the documented schema",
                 )
             )
+        if not routes:
+            return self._no_results()
         return ProviderResult(provider=self.name, routes=tuple(routes))
 
 
@@ -219,6 +240,8 @@ def _parse_transit(
     max_routes: int,
     max_geometry_points: int,
 ) -> tuple[RouteOption, ...]:
+    if payload.get("status") == "NO_RESULTS":
+        return ()
     if payload.get("status") != "OK":
         raise ValueError
     raw_routes = payload.get("routes")
@@ -262,7 +285,9 @@ def _parse_walk(
     route_mode: str,
     source_time: datetime,
     max_geometry_points: int,
-) -> RouteOption:
+) -> RouteOption | None:
+    if payload.get("status") == "NO_RESULTS":
+        return None
     if payload.get("status") != "OK":
         raise ValueError
     route = _object(payload, "route")

@@ -112,6 +112,38 @@ async def test_seoul_transit_rejects_doctype_bad_header_and_route_limit() -> Non
 
 
 @pytest.mark.asyncio
+async def test_seoul_transit_rejects_dtd_and_entity_after_large_prefix() -> None:
+    fixture = (FIXTURES / "seoul-transit.xml").read_bytes()
+    declaration, document = fixture.split(b"?>", 1)
+    raw = (
+        declaration
+        + b"?>"
+        + b" " * 5_000
+        + b'<!DOCTYPE ServiceResult [<!ENTITY injected "expanded">]>'
+        + document.replace(
+            "정상적으로 처리되었습니다.".encode(),
+            b"&injected;",
+        )
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/xml"},
+            content=raw,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await SeoulTransitProvider(
+            http=http,
+            service_key=SecretStr("key"),
+        ).get_routes(route_query(TravelMode.TRANSIT))
+
+    assert result.routes == ()
+    assert [warning.code for warning in result.warnings] == ["SCHEMA_MISMATCH"]
+
+
+@pytest.mark.asyncio
 async def test_seoul_transit_rejects_oversized_response_without_parsing() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(

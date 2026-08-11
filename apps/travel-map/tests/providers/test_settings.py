@@ -3,6 +3,7 @@ import math
 import pytest
 from app.settings import Settings
 from pydantic import SecretStr, ValidationError
+from pydantic_settings import SettingsError
 
 
 def production_values() -> dict[str, object]:
@@ -122,3 +123,34 @@ def test_environment_json_lists_become_exact_host_and_origin_tuples(
     assert settings.allowed_hosts == ("travel.example.kr",)
     assert type(settings.allowed_origins) is tuple
     assert settings.allowed_origins == ("https://travel.example.kr",)
+
+
+def test_production_rejects_empty_environment_host_instead_of_using_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("KAKAO_REST_API_KEY", "kakao")
+    monkeypatch.setenv("SEOUL_TRANSIT_SERVICE_KEY", "seoul")
+    monkeypatch.setenv("OPINET_CERT_KEY", "opinet")
+    monkeypatch.setenv("ALLOWED_HOSTS", "")
+    monkeypatch.setenv("ALLOWED_ORIGINS", '["https://travel.example.kr"]')
+
+    with pytest.raises((SettingsError, ValidationError)):
+        Settings(_env_file=None)
+
+
+def test_production_requires_explicit_host_and_origin_allowlists() -> None:
+    values = production_values()
+    values.pop("allowed_hosts")
+
+    with pytest.raises(ValidationError):
+        Settings(**values, _env_file=None)
+
+
+@pytest.mark.parametrize(
+    "host",
+    ("*.example.kr", "Travel.Example.Kr", "example.kr:bad"),
+)
+def test_allowed_hosts_are_exact_canonical_names(host: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(allowed_hosts=(host,), _env_file=None)

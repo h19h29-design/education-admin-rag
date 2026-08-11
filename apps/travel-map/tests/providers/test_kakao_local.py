@@ -1,3 +1,5 @@
+import copy
+
 import httpx
 import pytest
 from app.providers.kakao_local import BoundingBox, KakaoLocalClient, PlaceCandidate
@@ -78,6 +80,36 @@ async def test_place_search_rejects_blank_short_and_long_without_request() -> No
         assert await client.search("가" * 81, bounds=bounds) == ()
 
     assert requests == 0
+
+
+@pytest.mark.asyncio
+async def test_place_search_excludes_out_of_rect_and_duplicate_ids() -> None:
+    payload = load_json("kakao-keyword.json")
+    duplicate = copy.deepcopy(payload["documents"][1])  # type: ignore[index]
+    duplicate["id"] = "kakao-place-1"
+    outside = copy.deepcopy(payload["documents"][0])  # type: ignore[index]
+    outside.update({"id": "busan-place", "x": "129.0756", "y": "35.1796"})
+    payload["documents"] = [payload["documents"][0], duplicate, outside]  # type: ignore[index]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = KakaoLocalClient(http=http, rest_key=SecretStr("key"))
+        places = await client.search(
+            "서울시청",
+            bounds=BoundingBox(126.7, 37.4, 127.3, 37.75),
+        )
+
+    assert [place.place_id for place in places] == ["kakao-place-1"]
+    assert client.last_warnings == (
+        "DUPLICATE_PLACE_ID",
+        "OUT_OF_BOUNDS_RESULT",
+    )
 
 
 @pytest.mark.asyncio

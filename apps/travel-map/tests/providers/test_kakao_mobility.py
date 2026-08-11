@@ -206,6 +206,28 @@ async def test_kakao_car_geometry_limit_counts_raw_vertices_across_roads() -> No
     assert [warning.code for warning in result.warnings] == ["RESPONSE_LIMIT_EXCEEDED"]
 
 
+@pytest.mark.asyncio
+async def test_kakao_car_normalizes_out_of_range_vertex_to_schema_warning() -> None:
+    payload = load_json("kakao-car.json")
+    payload["routes"][0]["sections"][0]["roads"][0]["vertexes"][0] = 181.0  # type: ignore[index]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await KakaoCarProvider(
+            http=http,
+            rest_key=SecretStr("key"),
+        ).get_routes(route_query(TravelMode.CAR))
+
+    assert result.routes == ()
+    assert [warning.code for warning in result.warnings] == ["SCHEMA_MISMATCH"]
+
+
 def test_kakao_car_rejects_invalid_priority_and_alternatives_types() -> None:
     with pytest.raises(ValueError):
         KakaoCarProvider(rest_key=SecretStr("key"), priority="FASTEST")

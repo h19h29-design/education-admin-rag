@@ -64,6 +64,7 @@ async def test_kakao_walk_calls_three_modes_and_returns_distinct_deterministic_i
     modes: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v2/routing/walk"
         modes.append(request.url.params["route_mode"])
         return httpx.Response(
             200,
@@ -110,6 +111,41 @@ async def test_kakao_map_rejects_wrong_mode_without_network() -> None:
     assert result.routes == ()
     assert [warning.code for warning in result.warnings] == ["UNSUPPORTED_MODE"]
     assert requests == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_type", "mode", "expected_requests"),
+    [
+        (KakaoTransitProvider, TravelMode.TRANSIT, 1),
+        (KakaoWalkProvider, TravelMode.WALK, 3),
+    ],
+)
+async def test_kakao_map_classifies_official_no_results_as_empty_not_schema_error(
+    provider_type: type[KakaoTransitProvider] | type[KakaoWalkProvider],
+    mode: TravelMode,
+    expected_requests: int,
+) -> None:
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json={"status": "NO_RESULTS"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await provider_type(
+            http=http,
+            rest_key=SecretStr("key"),
+        ).get_routes(route_query(mode))
+
+    assert result.routes == ()
+    assert [warning.code for warning in result.warnings] == ["NO_RESULTS"]
+    assert requests == expected_requests
 
 
 @pytest.mark.asyncio

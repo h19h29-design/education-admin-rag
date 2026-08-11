@@ -196,6 +196,10 @@ class KakaoCarProvider:
             await self._opinet.aclose()
         await self._transport.aclose()
 
+    @property
+    def last_status_code(self) -> int | None:
+        return self._transport.last_status_code
+
     @classmethod
     def from_settings(
         cls,
@@ -289,9 +293,9 @@ def _parse_payload(
                 if raw_points_seen > max_geometry_points:
                     raise _LimitExceeded
                 for offset in range(0, len(vertexes), 2):
-                    coordinate = Coordinate(
-                        latitude=_number(vertexes[offset + 1]),
-                        longitude=_number(vertexes[offset]),
+                    coordinate = _coordinate(
+                        longitude_value=vertexes[offset],
+                        latitude_value=vertexes[offset + 1],
                     )
                     if not points or points[-1] != coordinate:
                         points.append(coordinate)
@@ -324,6 +328,18 @@ def _number(value: object) -> float:
     if not isfinite(selected):
         raise ValueError
     return selected
+
+
+def _coordinate(
+    *,
+    longitude_value: object,
+    latitude_value: object,
+) -> Coordinate:
+    longitude = _number(longitude_value)
+    latitude = _number(latitude_value)
+    if not -180.0 <= longitude <= 180.0 or not -90.0 <= latitude <= 90.0:
+        raise ValueError
+    return Coordinate(latitude=latitude, longitude=longitude)
 
 
 def _pair(coordinate: Coordinate) -> str:

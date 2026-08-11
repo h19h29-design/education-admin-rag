@@ -1,13 +1,16 @@
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Coroutine, Mapping
 from math import isfinite
-from typing import Any
+from typing import Any, TypeVar, cast
 
 import httpx
 from pydantic import SecretStr
 
 from app.routing.models import ProviderWarning
+
+_T = TypeVar("_T")
+_UNSET = object()
 
 
 class ProviderRequestError(RuntimeError):
@@ -56,30 +59,88 @@ class BoundedHttpClient:
         self.timeout_seconds = timeout_seconds
         self.max_response_bytes = max_response_bytes
         self.max_attempts = max_attempts
+        self.last_status_code: int | None = None
         self._closed = False
+        self._close_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self.owns_http:
-            await self.http.aclose()
+        async with self._close_lock:
+            if self._closed:
+                return
+            if self.owns_http:
+                await self.http.aclose()
+            self._closed = True
 
-    async def get_json(
+    def get_json(
         self,
         *,
         url: str,
         params: Mapping[str, str],
         header_secret: SecretStr | None = None,
         query_secret: tuple[str, SecretStr | None] | None = None,
-    ) -> dict[str, Any]:
-        raw = await self._get_bytes(
-            url=url,
-            params=params,
-            accepted_content_types=frozenset({"application/json"}),
+    ) -> Coroutine[Any, Any, dict[str, Any]]:
+        self.last_status_code = None
+        credential_kind, credential_name, credential = _extract_credential(
             header_secret=header_secret,
             query_secret=query_secret,
         )
+        task = asyncio.create_task(
+            self._json_worker(
+                url=url,
+                params=params,
+                credential_kind=credential_kind,
+                credential_name=credential_name,
+                credential=credential,
+            )
+        )
+        credential = ""
+        return cast("Coroutine[Any, Any, dict[str, Any]]", self._await_task(task))
+
+    def get_xml(
+        self,
+        *,
+        url: str,
+        params: Mapping[str, str],
+        query_secret: tuple[str, SecretStr | None],
+    ) -> Coroutine[Any, Any, bytes]:
+        self.last_status_code = None
+        credential_kind, credential_name, credential = _extract_credential(
+            header_secret=None,
+            query_secret=query_secret,
+        )
+        task = asyncio.create_task(
+            self._request_worker(
+                url=url,
+                params=params,
+                accepted_content_types=frozenset(
+                    {"application/xml", "text/xml", "application/xhtml+xml"}
+                ),
+                credential_kind=credential_kind,
+                credential_name=credential_name,
+                credential=credential,
+            )
+        )
+        credential = ""
+        return self._await_task(task)
+
+    async def _json_worker(
+        self,
+        *,
+        url: str,
+        params: Mapping[str, str],
+        credential_kind: str,
+        credential_name: str,
+        credential: str,
+    ) -> dict[str, Any]:
+        raw = await self._request_worker(
+            url=url,
+            params=params,
+            accepted_content_types=frozenset({"application/json"}),
+            credential_kind=credential_kind,
+            credential_name=credential_name,
+            credential=credential,
+        )
+        credential = ""
         failure = False
         value: object | None = None
         try:
@@ -102,30 +163,41 @@ class BoundedHttpClient:
             ) from None
         return value
 
-    async def get_xml(
-        self,
-        *,
-        url: str,
-        params: Mapping[str, str],
-        query_secret: tuple[str, SecretStr | None],
-    ) -> bytes:
-        return await self._get_bytes(
-            url=url,
-            params=params,
-            accepted_content_types=frozenset(
-                {"application/xml", "text/xml", "application/xhtml+xml"}
-            ),
-            query_secret=query_secret,
-        )
+    async def _await_task(self, task: asyncio.Task[_T]) -> _T:
+        result: _T | object = _UNSET
+        failure: tuple[str, str] | None = None
+        cancelled = False
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except ProviderRequestError as exc:
+            failure = (exc.code, str(exc))
+            exc.__traceback__ = None
+            exc.__context__ = None
+            exc.__cause__ = None
 
-    async def _get_bytes(
+        if cancelled:
+            task.cancel()
+            await _consume_task(task)
+            task = cast("asyncio.Task[_T]", None)
+            raise asyncio.CancelledError from None
+        if failure is not None:
+            task = cast("asyncio.Task[_T]", None)
+            raise ProviderRequestError(*failure) from None
+        if result is _UNSET:
+            raise RuntimeError("provider task completed without a result")
+        return cast("_T", result)
+
+    async def _request_worker(
         self,
         *,
         url: str,
         params: Mapping[str, str],
         accepted_content_types: frozenset[str],
-        header_secret: SecretStr | None = None,
-        query_secret: tuple[str, SecretStr | None] | None = None,
+        credential_kind: str,
+        credential_name: str,
+        credential: str,
     ) -> bytes:
         if type(url) is not str or not url.startswith(("https://", "http://")):
             raise ValueError("provider URL must be absolute HTTP(S)")
@@ -136,140 +208,107 @@ class BoundedHttpClient:
             raise TypeError("provider params must be an exact string mapping")
         if type(accepted_content_types) is not frozenset or not accepted_content_types:
             raise TypeError("accepted content types must be a nonempty frozenset")
-        if header_secret is None and query_secret is None:
-            raise ProviderRequestError(
-                "MISSING_CREDENTIAL",
-                "Provider credential is unavailable",
-            )
-        if header_secret is not None and type(header_secret) is not SecretStr:
-            raise TypeError("header_secret must be an exact SecretStr or None")
-        if query_secret is not None:
-            if (
-                type(query_secret) is not tuple
-                or len(query_secret) != 2
-                or type(query_secret[0]) is not str
-            ):
-                raise TypeError("query_secret must be a (name, SecretStr) tuple")
-            if query_secret[1] is not None and type(query_secret[1]) is not SecretStr:
-                raise TypeError("query credential must be an exact SecretStr or None")
+        if credential_kind not in {"header", "query"}:
+            raise TypeError("credential kind is invalid")
+        if type(credential_name) is not str or not credential_name:
+            raise TypeError("credential name is invalid")
 
         params_buffer = dict(params)
         headers: dict[str, str] = {}
-        credential = ""
         body = bytearray()
         failure: tuple[str, str] | None = None
         try:
-            if header_secret is not None:
-                credential = header_secret.get_secret_value()
-                if not credential.strip():
-                    failure = (
-                        "MISSING_CREDENTIAL",
-                        "Provider credential is unavailable",
-                    )
-                else:
-                    headers["Authorization"] = f"KakaoAK {credential}"
-            elif query_secret is not None:
-                secret = query_secret[1]
-                if secret is None:
-                    failure = (
-                        "MISSING_CREDENTIAL",
-                        "Provider credential is unavailable",
-                    )
-                else:
-                    credential = secret.get_secret_value()
-                    if not credential.strip():
-                        failure = (
-                            "MISSING_CREDENTIAL",
-                            "Provider credential is unavailable",
-                        )
-                    else:
-                        params_buffer[query_secret[0]] = credential
+            if credential_kind == "header":
+                headers[credential_name] = f"KakaoAK {credential}"
+            else:
+                params_buffer[credential_name] = credential
+            credential = ""
 
-            if failure is None:
-                for attempt in range(self.max_attempts):
-                    body.clear()
-                    try:
-                        async with self.http.stream(
-                            "GET",
-                            url,
-                            params=params_buffer,
-                            headers=headers,
-                            timeout=httpx.Timeout(self.timeout_seconds),
-                            follow_redirects=False,
-                        ) as response:
-                            status = response.status_code
-                            if status == 429:
-                                if attempt + 1 < self.max_attempts:
-                                    continue
-                                failure = (
-                                    "UPSTREAM_RATE_LIMIT",
-                                    "Provider rate limit was reached",
-                                )
-                                break
-                            if status >= 500:
-                                if attempt + 1 < self.max_attempts:
-                                    continue
-                                failure = (
-                                    "UPSTREAM_UNAVAILABLE",
-                                    "Provider service is temporarily unavailable",
-                                )
-                                break
-                            if status >= 400:
-                                failure = (
-                                    "UPSTREAM_REJECTED",
-                                    "Provider rejected the request",
-                                )
-                                break
-                            content_type = response.headers.get("Content-Type", "")
-                            media_type = content_type.split(";", 1)[0].strip().lower()
-                            if media_type not in accepted_content_types:
+            for attempt in range(self.max_attempts):
+                body.clear()
+                try:
+                    async with self.http.stream(
+                        "GET",
+                        url,
+                        params=params_buffer,
+                        headers=headers,
+                        timeout=httpx.Timeout(self.timeout_seconds),
+                        follow_redirects=False,
+                    ) as response:
+                        status = response.status_code
+                        self.last_status_code = status
+                        if status == 429:
+                            if attempt + 1 < self.max_attempts:
+                                continue
+                            failure = (
+                                "UPSTREAM_RATE_LIMIT",
+                                "Provider rate limit was reached",
+                            )
+                            break
+                        if status >= 500:
+                            if attempt + 1 < self.max_attempts:
+                                continue
+                            failure = (
+                                "UPSTREAM_UNAVAILABLE",
+                                "Provider service is temporarily unavailable",
+                            )
+                            break
+                        if status >= 400:
+                            failure = (
+                                "UPSTREAM_REJECTED",
+                                "Provider rejected the request",
+                            )
+                            break
+                        content_type = response.headers.get("Content-Type", "")
+                        media_type = content_type.split(";", 1)[0].strip().lower()
+                        if media_type not in accepted_content_types:
+                            failure = (
+                                "SCHEMA_MISMATCH",
+                                "Provider response content type was unexpected",
+                            )
+                            break
+                        length = response.headers.get("Content-Length")
+                        if length is not None:
+                            try:
+                                declared_length = int(length)
+                            except ValueError:
                                 failure = (
                                     "SCHEMA_MISMATCH",
-                                    "Provider response content type was unexpected",
+                                    "Provider response length was invalid",
                                 )
                                 break
-                            length = response.headers.get("Content-Length")
-                            if length is not None:
-                                try:
-                                    declared_length = int(length)
-                                except ValueError:
-                                    failure = (
-                                        "SCHEMA_MISMATCH",
-                                        "Provider response length was invalid",
-                                    )
-                                    break
-                                if declared_length < 0:
-                                    failure = (
-                                        "SCHEMA_MISMATCH",
-                                        "Provider response length was invalid",
-                                    )
-                                    break
-                                if declared_length > self.max_response_bytes:
-                                    failure = (
-                                        "RESPONSE_TOO_LARGE",
-                                        "Provider response exceeded the byte limit",
-                                    )
-                                    break
-                            async for chunk in response.aiter_bytes():
-                                if len(body) + len(chunk) > self.max_response_bytes:
-                                    failure = (
-                                        "RESPONSE_TOO_LARGE",
-                                        "Provider response exceeded the byte limit",
-                                    )
-                                    break
-                                body.extend(chunk)
-                            break
-                    except asyncio.CancelledError:
-                        raise
-                    except httpx.TimeoutException:
-                        if attempt + 1 == self.max_attempts:
-                            failure = ("UPSTREAM_TIMEOUT", "Provider request timed out")
-                    except httpx.RequestError:
-                        if attempt + 1 == self.max_attempts:
-                            failure = ("UPSTREAM_ERROR", "Provider request failed")
-                    except Exception:  # noqa: BLE001
-                        failure = ("UPSTREAM_ERROR", "Provider request failed")
+                            if declared_length < 0:
+                                failure = (
+                                    "SCHEMA_MISMATCH",
+                                    "Provider response length was invalid",
+                                )
+                                break
+                            if declared_length > self.max_response_bytes:
+                                failure = (
+                                    "RESPONSE_TOO_LARGE",
+                                    "Provider response exceeded the byte limit",
+                                )
+                                break
+                        async for chunk in response.aiter_bytes():
+                            if len(body) + len(chunk) > self.max_response_bytes:
+                                failure = (
+                                    "RESPONSE_TOO_LARGE",
+                                    "Provider response exceeded the byte limit",
+                                )
+                                break
+                            body.extend(chunk)
                         break
+                except asyncio.CancelledError:
+                    raise
+                except httpx.TimeoutException:
+                    if attempt + 1 == self.max_attempts:
+                        failure = ("UPSTREAM_TIMEOUT", "Provider request timed out")
+                except httpx.RequestError:
+                    if attempt + 1 == self.max_attempts:
+                        failure = ("UPSTREAM_ERROR", "Provider request failed")
+                except Exception:  # noqa: BLE001
+                    failure = ("UPSTREAM_ERROR", "Provider request failed")
+                    break
         finally:
             credential = ""
             params_buffer.clear()
@@ -279,6 +318,60 @@ class BoundedHttpClient:
             body.clear()
             raise ProviderRequestError(*failure) from None
         return bytes(body)
+
+
+async def _consume_task(task: asyncio.Task[object]) -> None:
+    try:
+        await task
+    except BaseException as exc:  # noqa: BLE001
+        exc.__traceback__ = None
+        exc.__context__ = None
+        exc.__cause__ = None
+
+
+def _extract_credential(
+    *,
+    header_secret: SecretStr | None,
+    query_secret: tuple[str, SecretStr | None] | None,
+) -> tuple[str, str, str]:
+    if header_secret is None and query_secret is None:
+        raise ProviderRequestError(
+            "MISSING_CREDENTIAL",
+            "Provider credential is unavailable",
+        )
+    if header_secret is not None:
+        if type(header_secret) is not SecretStr or query_secret is not None:
+            raise TypeError("exactly one exact provider credential is required")
+        credential = header_secret.get_secret_value()
+        if not credential.strip():
+            credential = ""
+            raise ProviderRequestError(
+                "MISSING_CREDENTIAL",
+                "Provider credential is unavailable",
+            )
+        return "header", "Authorization", credential
+    if (
+        type(query_secret) is not tuple
+        or len(query_secret) != 2
+        or type(query_secret[0]) is not str
+    ):
+        raise TypeError("query_secret must be a (name, SecretStr) tuple")
+    secret = query_secret[1]
+    if secret is None:
+        raise ProviderRequestError(
+            "MISSING_CREDENTIAL",
+            "Provider credential is unavailable",
+        )
+    if type(secret) is not SecretStr:
+        raise TypeError("query credential must be an exact SecretStr or None")
+    credential = secret.get_secret_value()
+    if not credential.strip():
+        credential = ""
+        raise ProviderRequestError(
+            "MISSING_CREDENTIAL",
+            "Provider credential is unavailable",
+        )
+    return "query", query_secret[0], credential
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
