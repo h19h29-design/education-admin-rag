@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from app.routing.models import ProviderResult, TravelMode
 from app.routing.orchestrator import RouteOrchestrator
@@ -22,6 +24,35 @@ class InvalidProvider:
         return ProviderResult(provider="INVALID", routes=())
 
 
+class SyncProvider:
+    name = "SYNC"
+    supported_modes = frozenset({TravelMode.TRANSIT})
+
+    def get_routes(self, query: object) -> ProviderResult:
+        return ProviderResult(provider=self.name, routes=())
+
+
+class AsyncRouteCallable:
+    async def __call__(self, query: object) -> ProviderResult:
+        return result_with(route("callable", source="CALLABLE"))
+
+
+class AsyncCallableProvider:
+    name = "CALLABLE"
+    supported_modes = frozenset({TravelMode.TRANSIT})
+
+    def __init__(self) -> None:
+        self.get_routes = AsyncRouteCallable()
+
+
+class CancellingProvider:
+    name = "CANCELLING"
+    supported_modes = frozenset({TravelMode.TRANSIT})
+
+    async def get_routes(self, query: object) -> ProviderResult:
+        raise asyncio.CancelledError
+
+
 # Break caught: a malformed provider registry failing only after request fan-out.
 @pytest.mark.parametrize(
     "provider",
@@ -37,6 +68,114 @@ def test_orchestrator_rejects_invalid_provider_contract(provider: object) -> Non
             {TravelMode.TRANSIT: (provider,)},  # type: ignore[arg-type]
             max_concurrency=1,
         )
+
+
+# Break caught: a synchronous boundary becoming a sanitized runtime warning.
+def test_orchestrator_rejects_sync_get_routes_during_registration() -> None:
+    with pytest.raises(TypeError, match="get_routes must be async"):
+        RouteOrchestrator(
+            {TravelMode.TRANSIT: (SyncProvider(),)},  # type: ignore[dict-item]
+            max_concurrency=1,
+        )
+
+
+# Break caught: rejecting a valid async callable object used as the protocol method.
+@pytest.mark.asyncio
+async def test_orchestrator_accepts_async_callable_get_routes_object() -> None:
+    orchestrator = RouteOrchestrator(
+        {TravelMode.TRANSIT: (AsyncCallableProvider(),)},  # type: ignore[dict-item]
+        max_concurrency=1,
+    )
+
+    collection = await orchestrator.collect(base_query(), {TravelMode.TRANSIT})
+
+    assert [item.id for item in collection.routes] == ["callable"]
+
+
+# Break caught: treating cooperative task cancellation as an upstream fallback.
+@pytest.mark.asyncio
+async def test_orchestrator_does_not_swallow_cancellation() -> None:
+    orchestrator = RouteOrchestrator(
+        {TravelMode.TRANSIT: (CancellingProvider(),)},
+        max_concurrency=1,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await orchestrator.collect(base_query(), {TravelMode.TRANSIT})
+
+
+# Break caught: one name collapsing two same-mode chain positions to one priority.
+def test_orchestrator_rejects_duplicate_provider_names_in_same_chain() -> None:
+    first = FakeProvider(
+        "duplicate",
+        result_with(route("first", source="duplicate")),
+    )
+    second = FakeProvider(
+        "duplicate",
+        result_with(route("second", source="duplicate")),
+    )
+
+    with pytest.raises(ValueError, match="provider names must be globally unique"):
+        RouteOrchestrator(
+            {TravelMode.TRANSIT: (first, second)},
+            max_concurrency=1,
+        )
+
+
+# Break caught: a name collision across modes changing representative tie order.
+def test_orchestrator_rejects_duplicate_provider_names_across_modes() -> None:
+    transit = FakeProvider(
+        "duplicate",
+        result_with(route("transit", source="duplicate")),
+    )
+    car = FakeProvider(
+        "duplicate",
+        result_with(
+            route("car", mode=TravelMode.CAR, source="duplicate"),
+        ),
+        supported_modes=frozenset({TravelMode.CAR}),
+    )
+
+    with pytest.raises(ValueError, match="provider names must be globally unique"):
+        RouteOrchestrator(
+            {
+                TravelMode.TRANSIT: (transit,),
+                TravelMode.CAR: (car,),
+            },
+            max_concurrency=2,
+        )
+
+
+# Break caught: route ID lexical order replacing registry order in cross-mode ties.
+@pytest.mark.asyncio
+async def test_orchestrator_uses_unique_registry_order_for_cross_mode_ties() -> None:
+    transit = FakeProvider(
+        "z-provider",
+        result_with(route("z-route", source="z-provider")),
+    )
+    car = FakeProvider(
+        "a-provider",
+        result_with(
+            route("a-route", mode=TravelMode.CAR, source="a-provider"),
+        ),
+        supported_modes=frozenset({TravelMode.CAR}),
+    )
+    orchestrator = RouteOrchestrator(
+        {
+            TravelMode.TRANSIT: (transit,),
+            TravelMode.CAR: (car,),
+        },
+        max_concurrency=2,
+    )
+
+    collection = await orchestrator.collect(
+        base_query(),
+        {TravelMode.CAR, TravelMode.TRANSIT},
+    )
+
+    assert collection.best.fastest_route_id == "z-route"
+    assert collection.best.shortest_route_id == "z-route"
+    assert collection.best.cheapest_route_id == "z-route"
 
 
 # Break caught: abandoning a mode when its primary provider partially fails.

@@ -180,6 +180,16 @@ class BestRouteIds:
     shortest_route_id: str | None
     cheapest_route_id: str | None
 
+    def __post_init__(self) -> None:
+        for field in (
+            "fastest_route_id",
+            "shortest_route_id",
+            "cheapest_route_id",
+        ):
+            value = getattr(self, field)
+            if value is not None:
+                _require_nonblank_string(value, field)
+
 
 @dataclass(frozen=True)
 class RouteCollection:
@@ -194,6 +204,12 @@ class RouteCollection:
             raise TypeError("best must be BestRouteIds")
         if type(self.warnings) is not tuple:
             raise TypeError("warnings must be a tuple")
+        for route in self.routes:
+            if type(route) is not RouteOption:
+                raise TypeError("routes must contain exact RouteOption values")
+        for warning in self.warnings:
+            if type(warning) is not ProviderWarning:
+                raise TypeError("warnings must contain exact ProviderWarning values")
         route_ids = [route.id for route in self.routes]
         if len(route_ids) != len(set(route_ids)):
             raise ValueError("route collection ids must be unique")
@@ -205,6 +221,65 @@ class RouteCollection:
         ):
             if route_id is not None and route_id not in known_ids:
                 raise ValueError("best route ids must refer to collection routes")
+        self._validate_best_routes()
+
+    def _validate_best_routes(self) -> None:
+        if not self.routes:
+            if self.best != BestRouteIds(None, None, None):
+                raise ValueError("an empty collection must have no best route ids")
+            return
+
+        routes_by_id = {route.id: route for route in self.routes}
+        if self.best.fastest_route_id is None:
+            raise ValueError("a nonempty collection requires a fastest route")
+        fastest = routes_by_id[self.best.fastest_route_id]
+        fastest_key = (fastest.duration_seconds, fastest.distance_meters)
+        if fastest_key != min(
+            (route.duration_seconds, route.distance_meters) for route in self.routes
+        ):
+            raise ValueError("fastest route id is not metric-compatible")
+
+        if self.best.shortest_route_id is None:
+            raise ValueError("a nonempty collection requires a shortest route")
+        shortest = routes_by_id[self.best.shortest_route_id]
+        shortest_key = (shortest.distance_meters, shortest.duration_seconds)
+        if shortest_key != min(
+            (route.distance_meters, route.duration_seconds) for route in self.routes
+        ):
+            raise ValueError("shortest route id is not metric-compatible")
+
+        known_cost_routes = tuple(
+            route
+            for route in self.routes
+            if route.cost_status is not CostStatus.UNKNOWN
+            and route.mobility_cost_krw is not None
+        )
+        if not known_cost_routes:
+            if self.best.cheapest_route_id is not None:
+                raise ValueError("an all-unknown collection has no cheapest route")
+            return
+        if self.best.cheapest_route_id is None:
+            raise ValueError("known costs require a cheapest route")
+        cheapest = routes_by_id[self.best.cheapest_route_id]
+        if (
+            cheapest.cost_status is CostStatus.UNKNOWN
+            or cheapest.mobility_cost_krw is None
+        ):
+            raise ValueError("cheapest route cannot have unknown cost")
+        cheapest_key = (
+            cheapest.mobility_cost_krw,
+            cheapest.duration_seconds,
+            cheapest.distance_meters,
+        )
+        if cheapest_key != min(
+            (
+                route.mobility_cost_krw,
+                route.duration_seconds,
+                route.distance_meters,
+            )
+            for route in known_cost_routes
+        ):
+            raise ValueError("cheapest route id is not metric-compatible")
 
 
 def _validate_cost_contract(route: RouteOption) -> None:

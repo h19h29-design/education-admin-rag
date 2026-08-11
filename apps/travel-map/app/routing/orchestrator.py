@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
+from inspect import iscoroutinefunction
 from math import isfinite
 
 from app.routing.models import (
@@ -32,6 +33,7 @@ class RouteOrchestrator:
         ):
             raise ValueError("provider_timeout_seconds must be a positive finite float")
         normalized: dict[TravelMode, tuple[RouteProvider, ...]] = {}
+        provider_names: set[str] = set()
         for mode, chain in providers.items():
             if type(mode) is not TravelMode:
                 raise TypeError("provider registry keys must be TravelMode")
@@ -39,6 +41,9 @@ class RouteOrchestrator:
                 raise TypeError("provider chains must be tuples")
             for provider in chain:
                 _validate_provider(provider)
+                if provider.name in provider_names:
+                    raise ValueError("provider names must be globally unique")
+                provider_names.add(provider.name)
             normalized[mode] = chain
         self._providers = normalized
         self._provider_timeout_seconds = provider_timeout_seconds
@@ -216,5 +221,10 @@ def _validate_provider(provider: object) -> None:
         raise TypeError("provider supported_modes must be frozenset")
     if any(type(mode) is not TravelMode for mode in supported_modes):
         raise TypeError("provider supported_modes must contain TravelMode values")
-    if not callable(getattr(provider, "get_routes", None)):
+    get_routes = getattr(provider, "get_routes", None)
+    if not callable(get_routes):
         raise TypeError("provider get_routes must be callable")
+    if not iscoroutinefunction(get_routes) and not iscoroutinefunction(
+        type(get_routes).__call__
+    ):
+        raise TypeError("provider get_routes must be async")

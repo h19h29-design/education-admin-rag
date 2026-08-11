@@ -1,11 +1,13 @@
 import pytest
 from app.routing.models import (
+    BestRouteIds,
     CarAssumptions,
     Coordinate,
     CostStatus,
     FuelType,
     ProviderResult,
     ProviderWarning,
+    RouteCollection,
     RouteCostBreakdown,
     RouteOption,
     RouteQuery,
@@ -13,6 +15,18 @@ from app.routing.models import (
 )
 from app.routing.ranking import deduplicate_routes, rank_routes
 from tests.routing.fakes import NOW, route
+
+
+class StringSubclass(str):
+    pass
+
+
+class RouteOptionSubclass(RouteOption):
+    pass
+
+
+class ProviderWarningSubclass(ProviderWarning):
+    pass
 
 
 # Break caught: allowing unknown costs to masquerade as zero in cheapest ranking.
@@ -224,3 +238,106 @@ def test_coordinate_constructor_keeps_task2_projection_semantics() -> None:
 
     assert coordinate.latitude == 8_585.0
     assert coordinate.longitude == 8_585.0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("fastest_route_id", True),
+        ("fastest_route_id", 1),
+        ("shortest_route_id", StringSubclass("route")),
+        ("cheapest_route_id", "   "),
+    ],
+)
+def test_best_route_ids_reject_noncanonical_public_values(
+    field: str,
+    value: object,
+) -> None:
+    values: dict[str, object] = {
+        "fastest_route_id": None,
+        "shortest_route_id": None,
+        "cheapest_route_id": None,
+    }
+    values[field] = value
+
+    with pytest.raises((TypeError, ValueError)):
+        BestRouteIds(**values)  # type: ignore[arg-type]
+
+
+def test_route_collection_rejects_noncanonical_route_and_warning_elements() -> None:
+    valid = route("valid")
+    route_subclass = RouteOptionSubclass(
+        id="subclass",
+        mode=valid.mode,
+        duration_seconds=valid.duration_seconds,
+        distance_meters=valid.distance_meters,
+        mobility_cost_krw=valid.mobility_cost_krw,
+        cost_status=valid.cost_status,
+        cost_breakdown=valid.cost_breakdown,
+        geometry=valid.geometry,
+        source=valid.source,
+        source_as_of=valid.source_as_of,
+    )
+    warning_subclass = ProviderWarningSubclass(
+        code="CODE",
+        message="message",
+        source="FAKE",
+    )
+    valid_best = BestRouteIds("valid", "valid", "valid")
+
+    with pytest.raises(TypeError):
+        RouteCollection(
+            routes=(route_subclass,),
+            best=BestRouteIds("subclass", "subclass", "subclass"),
+            warnings=(),
+        )
+    with pytest.raises(TypeError):
+        RouteCollection(routes=(valid,), best=valid_best, warnings=(warning_subclass,))
+
+
+def test_route_collection_rejects_inconsistent_best_references() -> None:
+    known = route("known", seconds=600, meters=5_000, cost=100)
+    slower = route("slower", seconds=700, meters=6_000, cost=200)
+    unknown = route("unknown", seconds=500, meters=4_000, cost=None)
+
+    with pytest.raises(ValueError, match="fastest"):
+        RouteCollection(
+            routes=(known, slower),
+            best=BestRouteIds("slower", "known", "known"),
+            warnings=(),
+        )
+    with pytest.raises(ValueError, match="shortest"):
+        RouteCollection(
+            routes=(known, slower),
+            best=BestRouteIds("known", "slower", "known"),
+            warnings=(),
+        )
+    with pytest.raises(ValueError, match="cheapest"):
+        RouteCollection(
+            routes=(known, unknown),
+            best=BestRouteIds("unknown", "unknown", "unknown"),
+            warnings=(),
+        )
+    with pytest.raises(ValueError, match="cheapest"):
+        RouteCollection(
+            routes=(known, slower),
+            best=BestRouteIds("known", "known", None),
+            warnings=(),
+        )
+
+
+def test_route_collection_accepts_legitimate_empty_and_all_unknown_results() -> None:
+    empty = RouteCollection(
+        routes=(),
+        best=BestRouteIds(None, None, None),
+        warnings=(),
+    )
+    unknown = route("unknown", cost=None)
+    all_unknown = RouteCollection(
+        routes=(unknown,),
+        best=BestRouteIds("unknown", "unknown", None),
+        warnings=(),
+    )
+
+    assert empty.routes == ()
+    assert all_unknown.best.cheapest_route_id is None
