@@ -132,12 +132,19 @@ def test_grounded_answer_requires_allowed_case_year_and_page_per_paragraph() -> 
     assert validate_grounded_answer("계약 기준입니다.", (case,)) is None
     assert (
         validate_grounded_answer(
-            "계약 기준입니다. [senqa-2022-case-a · 2022년 · PDF 999쪽]",
+            "계약 기준입니다. [2022년 · PDF 999쪽]",
             (case,),
         )
         is None
     )
-    valid = "계약 기준입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]"
+    assert (
+        validate_grounded_answer(
+            "계약 기준입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]",
+            (case,),
+        )
+        is None
+    )
+    valid = "계약 기준입니다. [2022년 · PDF 4쪽]"
     assert validate_grounded_answer(valid, (case,)) == valid
 
 
@@ -157,7 +164,7 @@ def test_fixed_fallback_answers_are_exact() -> None:
 def test_canonical_json_has_only_public_fields() -> None:
     encoded = canonical_public_answer_json(
         PublicAnswer(
-            answer="계약 기준입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]",
+            answer="계약 기준입니다. [2022년 · PDF 4쪽]",
             answer_kind="grounded",
             cases=(_case(),),
         )

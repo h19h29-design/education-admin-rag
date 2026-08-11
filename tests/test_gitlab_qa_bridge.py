@@ -106,7 +106,8 @@ def test_prompt_treats_question_as_data_and_requires_grounded_preview_answer() -
     assert '"question":"수의계약이 가능한 경우를 알려줘"' in prompt
     assert "PDF 4쪽" in prompt
     assert "제목, 인사말, 목록, 표, 코드블록을 쓰지 마세요" in prompt
-    assert "허용 근거 표기: [senqa-2022-case-a · 2022년 · PDF 4쪽]" in prompt
+    assert "허용 근거 표기: [2022년 · PDF 4쪽]" in prompt
+    assert "허용 근거 표기: [senqa-2022-case-a" not in prompt
     for forbidden in (
         "gitlab",
         "webhook",
@@ -236,7 +237,7 @@ def test_answer_job_runs_hermes_without_tools_then_delivers() -> None:
         return subprocess.CompletedProcess(
             command,
             0,
-            "수의계약 기준입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]\n".encode(),
+            "수의계약 기준입니다. [2022년 · PDF 4쪽]\n".encode(),
             b"",
         )
 
@@ -261,7 +262,7 @@ def test_answer_job_runs_hermes_without_tools_then_delivers() -> None:
     assert delivered[0:2] == (73, REQUEST_ID)
     assert delivered[3] == "response-token"
     assert delivered[2] == PublicAnswer(
-        answer="수의계약 기준입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]",
+        answer="수의계약 기준입니다. [2022년 · PDF 4쪽]",
         answer_kind="grounded",
         cases=public_cases_from_evidence(_request().question, _request().evidence),
     )

@@ -2,6 +2,7 @@ import { solveFirstPartyChallenge } from "./challenge.js";
 import {
   normalizeCompletion,
   normalizeHistory,
+  publicSourceLabel,
   resolveTheme,
 } from "./view-model.js";
 
@@ -115,10 +116,6 @@ function renderHistory() {
   }
 }
 
-function pageText(pages) {
-  return `PDF ${pages.join(", ")}쪽`;
-}
-
 function renderRelatedCases(cases) {
   elements.relatedCases.replaceChildren();
   for (const [index, item] of cases.entries()) {
@@ -139,7 +136,7 @@ function renderRelatedCases(cases) {
     copy.append(title, preview);
     const meta = document.createElement("span");
     meta.className = "case-meta";
-    meta.textContent = `${item.edition_year}년 · ${pageText(item.pdf_pages)}`;
+    meta.textContent = publicSourceLabel(item);
     const chevron = document.createElement("span");
     chevron.className = "case-chevron";
     chevron.setAttribute("aria-hidden", "true");
@@ -169,13 +166,10 @@ function renderEvidence(cases) {
   for (const item of cases) {
     const row = document.createElement("li");
     row.className = "evidence-item";
-    const caseId = document.createElement("span");
-    caseId.className = "evidence-id";
-    caseId.textContent = item.case_id;
     const location = document.createElement("span");
     location.className = "evidence-location";
-    location.textContent = `${item.edition_year}년 · ${pageText(item.pdf_pages)}`;
-    row.append(caseId, location);
+    location.textContent = publicSourceLabel(item);
+    row.append(location);
     elements.evidenceList.append(row);
   }
 }

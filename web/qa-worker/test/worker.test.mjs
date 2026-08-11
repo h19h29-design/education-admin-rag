@@ -167,7 +167,7 @@ const PUBLIC_CASE = {
 
 function answerNote(requestId, overrides = {}) {
   const payload = {
-    answer: "계약 기준입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]",
+    answer: "계약 기준입니다. [2022년 · PDF 4쪽]",
     answer_kind: "grounded",
     cases: [PUBLIC_CASE],
     schema_version: "senqa-public-answer/v1",
@@ -206,7 +206,7 @@ test("poll returns only the matching structured public answer", async () => {
 
   assert.equal(response.status, 200);
   assert.equal(body.status, "complete");
-  assert.equal(body.answer, "계약 기준입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]");
+  assert.equal(body.answer, "계약 기준입니다. [2022년 · PDF 4쪽]");
   assert.equal(body.answer_kind, "grounded");
   assert.deepEqual(body.cases, [PUBLIC_CASE]);
   assert.equal(JSON.stringify(body).includes("issue_iid"), false);

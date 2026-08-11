@@ -248,10 +248,7 @@ def validate_grounded_answer(content: object, cases: object) -> str | None:
     folded = checked.casefold()
     if any(term in folded for term in _FORBIDDEN_PUBLIC_TERMS):
         return None
-    allowed_ids = {case.case_id for case in cases}
-    if any(
-        case_id not in allowed_ids for case_id in _CASE_ID_SEARCH_RE.findall(checked)
-    ):
+    if _CASE_ID_SEARCH_RE.search(checked) is not None:
         return None
     paragraphs = [
         paragraph.strip()
@@ -261,7 +258,7 @@ def validate_grounded_answer(content: object, cases: object) -> str | None:
     for paragraph in paragraphs:
         if not any(
             any(
-                f"[{case.case_id} · {case.edition_year}년 · PDF {page}쪽]" in paragraph
+                f"[{case.edition_year}년 · PDF {page}쪽]" in paragraph
                 for page in case.pdf_pages
             )
             for case in cases

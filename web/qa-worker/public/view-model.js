@@ -73,16 +73,21 @@ function normalizeCase(value) {
 }
 
 function groundedAnswerIsValid(answer, cases) {
+  if (/senqa-20(?:20|21|22|23|24|25)-[a-z0-9-]{1,160}/u.test(answer)) return false;
   const paragraphs = answer.split(/\n\s*\n|\n/gu).map((value) => value.trim()).filter(Boolean);
   return paragraphs.every((paragraph) =>
     cases.some((item) =>
       item.pdf_pages.some((page) =>
         paragraph.includes(
-          `[${item.case_id} · ${item.edition_year}년 · PDF ${page}쪽]`,
+          `[${item.edition_year}년 · PDF ${page}쪽]`,
         ),
       ),
     ),
   );
+}
+
+export function publicSourceLabel(item) {
+  return `${item.edition_year}년 · PDF ${item.pdf_pages.join(", ")}쪽`;
 }
 
 export function normalizeCompletion(value) {

@@ -32,7 +32,7 @@ class _Response:
 
 def _answer() -> PublicAnswer:
     return PublicAnswer(
-        answer="근거 답변입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]",
+        answer="근거 답변입니다. [2022년 · PDF 4쪽]",
         answer_kind="grounded",
         cases=(
             PublicCase(

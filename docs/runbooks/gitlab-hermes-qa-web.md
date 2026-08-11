@@ -63,9 +63,9 @@ SENQA_PREVIEW_SEARCH_CONFIG
 1. 별도 test 질문을 공개 웹에서 한 번 제출한다.
 2. GitLab에 confidential issue와 정확한 ask note가 생성됐는지 확인한다.
 3. Webhook delivery가 2xx이고 같은 request ID의 answer note가 한 개뿐인지 확인한다.
-4. 웹 poll이 완료되면 AI 답변, 관련 사례 질의·답변, 사례 ID·연도·PDF 쪽만
+4. 웹 poll이 완료되면 AI 답변, 관련 사례 질의·답변, 연도·PDF 쪽만
    표시하는지 확인한다. GitLab, Webhook, Hermes, RAG, project, bot, model이나
-   내부 상태 코드·필드명은 화면과 답변에 표시하면 안 된다.
+   사례 ID·내부 상태 코드·필드명은 화면과 답변에 표시하면 안 된다.
 5. 근거 사례가 없을 때는 AI 호출 없이 다음 문구만 표시하고 관련 사례와 근거 영역을
    숨기는지 확인한다.
 

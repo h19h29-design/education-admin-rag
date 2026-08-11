@@ -356,8 +356,7 @@ def build_hermes_prompt(request: GitLabQaRequest, cases: tuple[PublicCase, ...])
     ):
         _raise()
     allowed_citations = " / ".join(
-        f"[{case.case_id} · {case.edition_year}년 · PDF {case.pdf_pages[0]}쪽]"
-        for case in cases
+        f"[{case.edition_year}년 · PDF {case.pdf_pages[0]}쪽]" for case in cases
     )
     payload = json.dumps(
         {

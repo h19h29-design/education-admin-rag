@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   normalizeCompletion,
   normalizeHistory,
+  publicSourceLabel,
   resolveTheme,
 } from "../public/view-model.js";
 
@@ -17,12 +18,17 @@ const PUBLIC_CASE = {
 };
 
 const COMPLETION = {
-  answer: "계약 기준입니다. [senqa-2022-case-a · 2022년 · PDF 4쪽]",
+  answer: "계약 기준입니다. [2022년 · PDF 4쪽]",
   answer_kind: "grounded",
   cases: [PUBLIC_CASE],
   request_id: "senqa-0123456789abcdef0123456789abcdef",
   status: "complete",
 };
+
+test("public source label omits internal case identifiers", () => {
+  assert.equal(publicSourceLabel(PUBLIC_CASE), "2022년 · PDF 4쪽");
+  assert.equal(publicSourceLabel({ ...PUBLIC_CASE, pdf_pages: [4, 7] }), "2022년 · PDF 4, 7쪽");
+});
 
 test("theme uses saved value before device preference", () => {
   assert.equal(resolveTheme("light", true), "light");

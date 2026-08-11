@@ -161,15 +161,14 @@ function parsePublicCase(value) {
 function groundedAnswerIsValid(answer, cases) {
   const folded = answer.toLocaleLowerCase("en-US");
   if (FORBIDDEN_PUBLIC_TERMS.some((term) => folded.includes(term))) return false;
-  const allowedIds = new Set(cases.map((item) => item.case_id));
   const mentionedIds = answer.match(/senqa-20(?:20|21|22|23|24|25)-[a-z0-9-]{1,160}/gu) ?? [];
-  if (mentionedIds.some((caseId) => !allowedIds.has(caseId))) return false;
+  if (mentionedIds.length > 0) return false;
   const paragraphs = answer.split(/\n\s*\n|\n/gu).map((item) => item.trim()).filter(Boolean);
   return paragraphs.every((paragraph) =>
     cases.some((item) =>
       item.pdf_pages.some((page) =>
         paragraph.includes(
-          `[${item.case_id} · ${item.edition_year}년 · PDF ${page}쪽]`,
+          `[${item.edition_year}년 · PDF ${page}쪽]`,
         ),
       ),
     ),
