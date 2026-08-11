@@ -1,44 +1,85 @@
 import { solveFirstPartyChallenge } from "./challenge.js";
+import {
+  normalizeCompletion,
+  normalizeHistory,
+  resolveTheme,
+} from "./view-model.js";
 
-const STORAGE_KEY = "senqa-preview-questions-v1";
+const STORAGE_KEY = "senqa-preview-questions-v2";
+const THEME_KEY = "senqa-theme-v1";
 const POLL_INTERVAL_MS = 3_000;
 const MAX_POLL_ATTEMPTS = 100;
 
 const elements = {
+  answerCaseCount: document.querySelector("#answer-case-count"),
   answerPanel: document.querySelector("#answer-panel"),
   answerText: document.querySelector("#answer-text"),
   characterCount: document.querySelector("#character-count"),
   clearHistory: document.querySelector("#clear-history"),
+  evidenceList: document.querySelector("#evidence-list"),
+  evidencePanel: document.querySelector("#evidence-panel"),
   form: document.querySelector("#question-form"),
   formError: document.querySelector("#form-error"),
   historyEmpty: document.querySelector("#history-empty"),
   historyList: document.querySelector("#history-list"),
   progressPanel: document.querySelector("#progress-panel"),
   question: document.querySelector("#question"),
-  sourceList: document.querySelector("#source-list"),
+  relatedCases: document.querySelector("#related-cases"),
+  relatedSection: document.querySelector("#related-section"),
+  reviewWarning: document.querySelector("#review-warning"),
   submitButton: document.querySelector("#submit-button"),
+  themeButtons: [...document.querySelectorAll("[data-theme-choice]")],
   turnstile: document.querySelector("#turnstile"),
 };
 
 let turnstileWidget = null;
 let turnstileToken = "";
+let turnstileSiteKey = "";
 let usingFirstPartyChallenge = false;
+let selectedRequestId = "";
+let currentTheme = resolveTheme(
+  safeStorageGet(THEME_KEY),
+  window.matchMedia("(prefers-color-scheme: dark)").matches,
+);
+
+function safeStorageGet(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function safeStorageSet(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    return;
+  }
+}
+
+function safeStorageRemove(key) {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    return;
+  }
+}
 
 function readHistory() {
   try {
-    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "[]");
-    return Array.isArray(parsed) ? parsed.slice(0, 12) : [];
+    return normalizeHistory(JSON.parse(safeStorageGet(STORAGE_KEY) ?? "[]"));
   } catch {
     return [];
   }
 }
 
 function writeHistory(items) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(items.slice(0, 12)));
+  safeStorageSet(STORAGE_KEY, JSON.stringify(normalizeHistory(items)));
 }
 
 function statusLabel(status) {
-  return status === "complete" ? "답변 완료" : "답변 준비 중";
+  return status === "complete" ? "검색 완료" : "답변 준비 중";
 }
 
 function renderHistory() {
@@ -50,6 +91,7 @@ function renderHistory() {
     row.className = "history-item";
     const button = document.createElement("button");
     button.type = "button";
+    button.setAttribute("aria-current", String(item.requestId === selectedRequestId));
     const question = document.createElement("span");
     question.className = "history-question";
     question.textContent = item.question;
@@ -73,36 +115,87 @@ function renderHistory() {
   }
 }
 
-function sourcesFromAnswer(answer) {
-  const sources = new Set();
-  const pattern = /(senqa-20(?:20|21|22|23|24|25)-[a-z0-9-]+)[^\n]{0,100}?(20(?:20|21|22|23|24|25))[^\n]{0,100}?(?:PDF|pdf|p\.)\s*([0-9,\- ]+)/gu;
-  for (const match of answer.matchAll(pattern)) {
-    sources.add(`${match[1]} · ${match[2]}년 · PDF ${match[3].trim()}쪽`);
-  }
-  return [...sources];
+function pageText(pages) {
+  return `PDF ${pages.join(", ")}쪽`;
 }
 
-function showAnswer(answer) {
+function renderRelatedCases(cases) {
+  elements.relatedCases.replaceChildren();
+  for (const [index, item] of cases.entries()) {
+    const card = document.createElement("details");
+    card.className = "case-card";
+    const summary = document.createElement("summary");
+    const number = document.createElement("span");
+    number.className = "case-index";
+    number.textContent = String(index + 1).padStart(2, "0");
+    const copy = document.createElement("span");
+    copy.className = "case-summary-copy";
+    const title = document.createElement("span");
+    title.className = "case-title";
+    title.textContent = item.title;
+    const preview = document.createElement("span");
+    preview.className = "case-preview";
+    preview.textContent = item.question;
+    copy.append(title, preview);
+    const meta = document.createElement("span");
+    meta.className = "case-meta";
+    meta.textContent = `${item.edition_year}년 · ${pageText(item.pdf_pages)}`;
+    const chevron = document.createElement("span");
+    chevron.className = "case-chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    summary.append(number, copy, meta, chevron);
+
+    const detail = document.createElement("div");
+    detail.className = "case-detail";
+    for (const [heading, content] of [
+      ["질의", item.question],
+      ["답변", item.answer],
+    ]) {
+      const section = document.createElement("section");
+      const label = document.createElement("h4");
+      label.textContent = heading;
+      const paragraph = document.createElement("p");
+      paragraph.textContent = content;
+      section.append(label, paragraph);
+      detail.append(section);
+    }
+    card.append(summary, detail);
+    elements.relatedCases.append(card);
+  }
+}
+
+function renderEvidence(cases) {
+  elements.evidenceList.replaceChildren();
+  for (const item of cases) {
+    const row = document.createElement("li");
+    row.className = "evidence-item";
+    const caseId = document.createElement("span");
+    caseId.className = "evidence-id";
+    caseId.textContent = item.case_id;
+    const location = document.createElement("span");
+    location.className = "evidence-location";
+    location.textContent = `${item.edition_year}년 · ${pageText(item.pdf_pages)}`;
+    row.append(caseId, location);
+    elements.evidenceList.append(row);
+  }
+}
+
+function showResult(result) {
   elements.progressPanel.hidden = true;
   elements.answerPanel.hidden = false;
-  elements.answerText.textContent = answer;
-  elements.sourceList.replaceChildren();
-  const sources = sourcesFromAnswer(answer);
-  if (sources.length === 0) {
-    const item = document.createElement("li");
-    item.textContent = "답변 본문의 사례 ID, 연도, PDF 페이지를 함께 확인하세요.";
-    elements.sourceList.append(item);
-    return;
-  }
-  for (const source of sources) {
-    const item = document.createElement("li");
-    item.textContent = source;
-    elements.sourceList.append(item);
-  }
+  elements.answerText.textContent = result.answer;
+  const hasCases = result.cases.length > 0;
+  elements.answerCaseCount.textContent = hasCases ? `관련 사례 ${result.cases.length}건 기반` : "";
+  elements.reviewWarning.hidden = !hasCases;
+  elements.relatedSection.hidden = !hasCases;
+  elements.evidencePanel.hidden = !hasCases;
+  renderRelatedCases(result.cases);
+  renderEvidence(result.cases);
 }
 
 function showPending() {
   elements.answerPanel.hidden = true;
+  elements.evidencePanel.hidden = true;
   elements.progressPanel.hidden = false;
 }
 
@@ -140,12 +233,14 @@ async function poll(item, attempt = 0) {
     return;
   }
   try {
-    const result = await api(
+    const value = await api(
       `/api/questions/${item.requestId}?token=${encodeURIComponent(item.pollToken)}`,
     );
-    if (result.status === "complete") {
-      updateHistory(item.requestId, { answer: result.answer, status: "complete" });
-      showAnswer(result.answer);
+    if (value.status === "complete") {
+      const result = normalizeCompletion(value);
+      if (!result) throw new Error("response_invalid");
+      updateHistory(item.requestId, { result, status: "complete" });
+      showResult(result);
       return;
     }
   } catch {
@@ -159,10 +254,12 @@ async function poll(item, attempt = 0) {
 
 function restoreQuestion(item) {
   clearError();
+  selectedRequestId = item.requestId;
   elements.question.value = item.question;
   updateCount();
-  if (item.status === "complete" && item.answer) {
-    showAnswer(item.answer);
+  renderHistory();
+  if (item.status === "complete" && item.result) {
+    showResult(item.result);
   } else {
     showPending();
     poll(item);
@@ -172,6 +269,37 @@ function restoreQuestion(item) {
 function updateCount() {
   elements.characterCount.textContent = `${elements.question.value.length.toLocaleString("ko-KR")} / 1,000`;
   elements.submitButton.disabled = !elements.question.value.trim() || !turnstileToken;
+}
+
+function renderTurnstile() {
+  if (!window.turnstile || !turnstileSiteKey) return;
+  if (turnstileWidget !== null) window.turnstile.remove(turnstileWidget);
+  elements.turnstile.replaceChildren();
+  turnstileToken = "";
+  turnstileWidget = window.turnstile.render(elements.turnstile, {
+    sitekey: turnstileSiteKey,
+    callback(token) {
+      turnstileToken = token;
+      updateCount();
+    },
+    "expired-callback"() {
+      turnstileToken = "";
+      updateCount();
+    },
+    theme: currentTheme,
+  });
+  updateCount();
+}
+
+function applyTheme(theme, { persist = true, rerenderChallenge = true } = {}) {
+  currentTheme = resolveTheme(theme, false);
+  document.documentElement.dataset.theme = currentTheme;
+  document.documentElement.style.colorScheme = currentTheme;
+  for (const button of elements.themeButtons) {
+    button.setAttribute("aria-pressed", String(button.dataset.themeChoice === currentTheme));
+  }
+  if (persist) safeStorageSet(THEME_KEY, currentTheme);
+  if (rerenderChallenge && window.turnstile && turnstileSiteKey) renderTurnstile();
 }
 
 async function initializeTurnstile() {
@@ -184,26 +312,16 @@ async function initializeTurnstile() {
           attempts += 1;
           if (window.turnstile) {
             window.clearInterval(timer);
-            resolve(window.turnstile);
+            resolve();
           } else if (attempts > 40) {
             window.clearInterval(timer);
-            reject(new Error("turnstile_unavailable"));
+            reject(new Error("challenge_unavailable"));
           }
         }, 50);
       });
-    const turnstile = await waitForTurnstile();
-    turnstileWidget = turnstile.render(elements.turnstile, {
-      sitekey: config.turnstile_site_key,
-      callback(token) {
-        turnstileToken = token;
-        updateCount();
-      },
-      "expired-callback"() {
-        turnstileToken = "";
-        updateCount();
-      },
-      theme: "light",
-    });
+    await waitForTurnstile();
+    turnstileSiteKey = config.turnstile_site_key;
+    renderTurnstile();
   } catch {
     try {
       elements.turnstile.textContent = "접속 확인 중…";
@@ -221,33 +339,46 @@ async function initializeTurnstile() {
 
 elements.question.addEventListener("input", updateCount);
 elements.clearHistory.addEventListener("click", () => {
-  localStorage.removeItem(STORAGE_KEY);
+  safeStorageRemove(STORAGE_KEY);
+  selectedRequestId = "";
   renderHistory();
 });
+
+for (const button of elements.themeButtons) {
+  button.addEventListener("click", () => applyTheme(button.dataset.themeChoice));
+}
+
+for (const button of document.querySelectorAll("[data-suggestion]")) {
+  button.addEventListener("click", () => {
+    elements.question.value = button.dataset.suggestion;
+    elements.question.focus();
+    updateCount();
+  });
+}
 
 elements.form.addEventListener("submit", async (event) => {
   event.preventDefault();
   clearError();
   const question = elements.question.value.trim().replace(/\s+/gu, " ");
-  if (!question || question.length > 1000 || !turnstileToken) {
-    showError("질문과 로봇 확인을 완료해 주세요.");
+  if (!question || question.length > 1_000 || !turnstileToken) {
+    showError("질문과 접속 확인을 완료해 주세요.");
     return;
   }
   elements.submitButton.disabled = true;
   showPending();
   try {
-    const result = await api("/api/questions", {
+    const value = await api("/api/questions", {
       method: "POST",
       body: JSON.stringify({ question, turnstile_token: turnstileToken }),
     });
     const item = {
-      answer: "",
       createdAt: Date.now(),
-      pollToken: result.poll_token,
+      pollToken: value.poll_token,
       question,
-      requestId: result.request_id,
+      requestId: value.request_id,
       status: "pending",
     };
+    selectedRequestId = item.requestId;
     writeHistory([item, ...readHistory()]);
     renderHistory();
     poll(item);
@@ -266,6 +397,7 @@ elements.form.addEventListener("submit", async (event) => {
   }
 });
 
+applyTheme(currentTheme, { persist: false, rerenderChallenge: false });
 renderHistory();
 updateCount();
 initializeTurnstile();
