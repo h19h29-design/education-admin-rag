@@ -20,6 +20,7 @@ from app.settings import Settings
 
 _ACCESS_LOG = logging.getLogger("travel_map.access")
 _MAX_REQUEST_BYTES = 32 * 1024
+_MAX_CONTENT_LENGTH_DIGITS = 20
 
 
 class RequestTooLargeError(Exception):
@@ -59,7 +60,7 @@ class _UvicornQueryRedactionFilter(logging.Filter):
         return True
 
 
-def _configure_production_access_log() -> None:
+def _configure_uvicorn_access_log() -> None:
     logger = logging.getLogger("uvicorn.access")
     if not any(type(item) is _UvicornQueryRedactionFilter for item in logger.filters):
         logger.addFilter(_UvicornQueryRedactionFilter())
@@ -102,9 +103,16 @@ def _content_length(scope: Scope) -> int | None:
     ]
     if not values:
         return None
-    if len(values) != 1 or not values[0].isdigit():
+    if (
+        len(values) != 1
+        or not values[0].isdigit()
+        or len(values[0]) > _MAX_CONTENT_LENGTH_DIGITS
+    ):
         raise RequestTooLargeError
-    return int(values[0])
+    try:
+        return int(values[0])
+    except ValueError:
+        raise RequestTooLargeError from None
 
 
 async def _buffer_request_events(
@@ -146,8 +154,7 @@ def create_app(
     dependencies: AppDependencies | None = None,
 ) -> FastAPI:
     active_settings = settings or Settings()
-    if active_settings.environment == "production":
-        _configure_production_access_log()
+    _configure_uvicorn_access_log()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -167,6 +174,13 @@ def create_app(
         lifespan=lifespan,
     )
     app.add_middleware(RequestSizeLimitMiddleware, max_bytes=_MAX_REQUEST_BYTES)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(active_settings.allowed_origins),
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type"],
+    )
     allowed_hosts = list(active_settings.allowed_hosts)
     if active_settings.environment != "production":
         allowed_hosts.append("testserver")
@@ -174,13 +188,6 @@ def create_app(
         JsonTrustedHostMiddleware,
         allowed_hosts=allowed_hosts,
         www_redirect=False,
-    )
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=list(active_settings.allowed_origins),
-        allow_credentials=False,
-        allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type"],
     )
 
     @app.middleware("http")

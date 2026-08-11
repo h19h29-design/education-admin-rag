@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 
 import httpx
 import pytest
-from app.main import _MAX_REQUEST_BYTES, create_app
+from app.main import _MAX_REQUEST_BYTES, app, create_app
 from app.settings import Settings
 
 pytest_plugins = ("tests.api.conftest",)
@@ -46,6 +46,69 @@ def test_invalid_host_uses_json_error_envelope(client) -> None:
 
     assert response.status_code == 400
     assert response.json() == {"error": {"code": "INVALID_HOST"}}
+
+
+# Break caught: CORS preflight short-circuiting before exact Host validation and
+# accepting an untrusted host with a configured browser origin.
+def test_invalid_host_is_rejected_before_cors_preflight(client) -> None:
+    response = client.options(
+        "/api/v1/places",
+        headers={
+            "Host": "untrusted.example",
+            "Origin": "https://travel.example.test",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": {"code": "INVALID_HOST"}}
+    assert "access-control-allow-origin" not in response.headers
+
+
+# Break caught: an enormous all-digit Content-Length reaching Python's integer
+# conversion limit and turning a malformed request into a plaintext 500.
+@pytest.mark.anyio
+async def test_request_limit_rejects_enormous_numeric_content_length_as_json() -> None:
+    transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        response = await client.get("/healthz", headers={"Content-Length": "9" * 5_000})
+
+    assert response.status_code == 400
+    assert response.json() == {"error": {"code": "INVALID_CONTENT_LENGTH"}}
+
+
+# Break caught: the Docker/default `app.main:app` module only installing the
+# Uvicorn access-log redaction when a separate production app is constructed.
+def test_default_module_app_redacts_uvicorn_query_string() -> None:
+    logger = logging.getLogger("uvicorn.access")
+    handler = _CollectingHandler()
+    original_level = logger.level
+    original_disabled = logger.disabled
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.disabled = False
+    try:
+        assert app.title == "서울교육기관 관내출장 지도"
+        logger.info(
+            '%s - "%s %s HTTP/%s" %s',
+            "127.0.0.1:12345",
+            "GET",
+            "/healthz?private-query",
+            "1.1",
+            200,
+        )
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(original_level)
+        logger.disabled = original_disabled
+
+    assert len(handler.records) == 1
+    message = handler.records[0].getMessage()
+    assert "/healthz" in message
+    assert "private-query" not in message
+    assert "?" not in message
 
 
 # Break caught: Uvicorn's production access formatter receiving a query-bearing
