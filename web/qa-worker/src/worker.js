@@ -1,6 +1,9 @@
 const MAX_BODY_BYTES = 16_384;
 const MAX_QUESTION_CHARACTERS = 1_000;
 const MAX_TURNSTILE_TOKEN_CHARACTERS = 4_096;
+const FIRST_PARTY_CHALLENGE_BITS = 15;
+const FIRST_PARTY_CHALLENGE_TTL_SECONDS = 300;
+const FIRST_PARTY_CHALLENGE_RE = /^pow:(senqa-pow-[0-9a-f]{32}):([0-9]{1,7})$/u;
 const REQUEST_RE = /^senqa-[0-9a-f]{32}$/;
 const POLL_TOKEN_RE = /^[A-Za-z0-9_-]{40,64}$/;
 const ANSWER_PREFIX = "<!-- senqa-answer:v1 request_id=";
@@ -120,6 +123,61 @@ async function verifyTurnstile(token, request, env) {
   }
 }
 
+function hasLeadingZeroBits(hexDigest, difficultyBits) {
+  const wholeNibbles = Math.floor(difficultyBits / 4);
+  if (!hexDigest.startsWith("0".repeat(wholeNibbles))) return false;
+  const remainingBits = difficultyBits % 4;
+  return (
+    remainingBits === 0 ||
+    Number.parseInt(hexDigest[wholeNibbles], 16) < 2 ** (4 - remainingBits)
+  );
+}
+
+async function clientFingerprint(request) {
+  return sha256(request.headers.get("cf-connecting-ip") ?? "unknown");
+}
+
+async function verifyFirstPartyChallenge(token, request, env) {
+  if (typeof token !== "string" || token.length > MAX_TURNSTILE_TOKEN_CHARACTERS) return false;
+  const matched = FIRST_PARTY_CHALLENGE_RE.exec(token);
+  if (!matched) return false;
+  const nonce = Number.parseInt(matched[2], 10);
+  if (!Number.isSafeInteger(nonce) || nonce < 0 || nonce > 2_000_000) return false;
+  const key = `challenge:${matched[1]}`;
+  const recordText = await env.QUESTIONS.get(key);
+  if (recordText === null) return false;
+  let record;
+  try {
+    record = JSON.parse(recordText);
+  } catch {
+    return false;
+  }
+  const now = typeof env.NOW === "function" ? env.NOW() : Date.now();
+  if (
+    !record ||
+    record.constructor !== Object ||
+    record.difficulty_bits !== FIRST_PARTY_CHALLENGE_BITS ||
+    typeof record.client_sha256 !== "string" ||
+    record.client_sha256 !== (await clientFingerprint(request)) ||
+    !Number.isSafeInteger(record.created_at) ||
+    record.created_at > now ||
+    now - record.created_at > FIRST_PARTY_CHALLENGE_TTL_SECONDS * 1_000
+  ) {
+    return false;
+  }
+  const digest = await sha256(`${matched[1]}:${nonce}`);
+  if (!hasLeadingZeroBits(digest, FIRST_PARTY_CHALLENGE_BITS)) return false;
+  await env.QUESTIONS.delete(key);
+  return true;
+}
+
+async function verifyHumanChallenge(token, request, env) {
+  if (typeof token === "string" && token.startsWith("pow:")) {
+    return verifyFirstPartyChallenge(token, request, env);
+  }
+  return verifyTurnstile(token, request, env);
+}
+
 function gitlabConfig(env) {
   const projectId = typeof env.GITLAB_PROJECT_ID === "string" ? env.GITLAB_PROJECT_ID : "";
   const apiRoot = typeof env.GITLAB_API_ROOT === "string" ? env.GITLAB_API_ROOT : "";
@@ -154,15 +212,19 @@ async function gitlabRequest(env, path, init = {}) {
   }
 }
 
-async function rateAllowed(request, env) {
+async function fixedWindowAllowed(request, env, prefix, limit) {
   const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
   const window = Math.floor((typeof env.NOW === "function" ? env.NOW() : Date.now()) / 60_000);
-  const key = `rate:${await sha256(ip)}:${window}`;
+  const key = `${prefix}:${await sha256(ip)}:${window}`;
   const currentText = await env.QUESTIONS.get(key);
   const current = currentText === null ? 0 : Number.parseInt(currentText, 10);
-  if (!Number.isSafeInteger(current) || current >= 5) return false;
+  if (!Number.isSafeInteger(current) || current >= limit) return false;
   await env.QUESTIONS.put(key, String(current + 1), { expirationTtl: 120 });
   return true;
+}
+
+async function rateAllowed(request, env) {
+  return fixedWindowAllowed(request, env, "rate", 5);
 }
 
 async function createQuestion(request, env, origin) {
@@ -173,7 +235,7 @@ async function createQuestion(request, env, origin) {
   }
   const question = normalizeQuestion(body.question);
   if (!question) return errorResponse("question_invalid", 400, origin);
-  if (!(await verifyTurnstile(body.turnstile_token, request, env))) {
+  if (!(await verifyHumanChallenge(body.turnstile_token, request, env))) {
     return errorResponse("challenge_invalid", 403, origin);
   }
 
@@ -219,6 +281,28 @@ async function createQuestion(request, env, origin) {
   return jsonResponse(
     { request_id: requestId, poll_token: pollToken, status: "pending" },
     202,
+    origin,
+  );
+}
+
+async function issueFirstPartyChallenge(request, env, origin) {
+  if (!(await fixedWindowAllowed(request, env, "challenge-rate", 10))) {
+    return errorResponse("rate_limited", 429, origin);
+  }
+  const challengeId = `senqa-pow-${bytesToHex(randomBytes(env, 16))}`;
+  const createdAt = typeof env.NOW === "function" ? env.NOW() : Date.now();
+  await env.QUESTIONS.put(
+    `challenge:${challengeId}`,
+    JSON.stringify({
+      client_sha256: await clientFingerprint(request),
+      created_at: createdAt,
+      difficulty_bits: FIRST_PARTY_CHALLENGE_BITS,
+    }),
+    { expirationTtl: FIRST_PARTY_CHALLENGE_TTL_SECONDS },
+  );
+  return jsonResponse(
+    { challenge_id: challengeId, difficulty_bits: FIRST_PARTY_CHALLENGE_BITS },
+    200,
     origin,
   );
 }
@@ -294,6 +378,9 @@ async function handleApi(request, env) {
       200,
       origin,
     );
+  }
+  if (request.method === "GET" && url.pathname === "/api/challenge") {
+    return issueFirstPartyChallenge(request, env, origin);
   }
   if (request.method === "POST" && url.pathname === "/api/questions") {
     return createQuestion(request, env, origin);

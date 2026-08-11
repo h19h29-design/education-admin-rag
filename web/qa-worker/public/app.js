@@ -1,3 +1,5 @@
+import { solveFirstPartyChallenge } from "./challenge.js";
+
 const STORAGE_KEY = "senqa-preview-questions-v1";
 const POLL_INTERVAL_MS = 3_000;
 const MAX_POLL_ATTEMPTS = 100;
@@ -20,6 +22,7 @@ const elements = {
 
 let turnstileWidget = null;
 let turnstileToken = "";
+let usingFirstPartyChallenge = false;
 
 function readHistory() {
   try {
@@ -182,7 +185,7 @@ async function initializeTurnstile() {
           if (window.turnstile) {
             window.clearInterval(timer);
             resolve(window.turnstile);
-          } else if (attempts > 100) {
+          } else if (attempts > 40) {
             window.clearInterval(timer);
             reject(new Error("turnstile_unavailable"));
           }
@@ -202,7 +205,17 @@ async function initializeTurnstile() {
       theme: "light",
     });
   } catch {
-    showError("로봇 확인 도구를 불러오지 못했습니다.");
+    try {
+      elements.turnstile.textContent = "접속 확인 중…";
+      const challenge = await api("/api/challenge", { headers: {} });
+      turnstileToken = await solveFirstPartyChallenge(challenge);
+      usingFirstPartyChallenge = true;
+      elements.turnstile.textContent = "접속 확인 완료";
+      clearError();
+      updateCount();
+    } catch {
+      showError("접속 확인을 완료하지 못했습니다. 잠시 후 새로고침해 주세요.");
+    }
   }
 }
 
@@ -243,7 +256,12 @@ elements.form.addEventListener("submit", async (event) => {
     showError("질문을 접수하지 못했습니다. 잠시 후 다시 시도해 주세요.");
   } finally {
     turnstileToken = "";
-    if (window.turnstile && turnstileWidget !== null) window.turnstile.reset(turnstileWidget);
+    if (window.turnstile && turnstileWidget !== null) {
+      window.turnstile.reset(turnstileWidget);
+    } else if (usingFirstPartyChallenge) {
+      usingFirstPartyChallenge = false;
+      initializeTurnstile();
+    }
     updateCount();
   }
 });

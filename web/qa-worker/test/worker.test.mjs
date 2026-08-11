@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import worker, { normalizeQuestion } from "../src/worker.js";
@@ -14,6 +15,10 @@ class MemoryKv {
 
   async put(key, value) {
     this.values.set(key, value);
+  }
+
+  async delete(key) {
+    this.values.delete(key);
   }
 }
 
@@ -38,6 +43,21 @@ function postRequest(payload, origin = ORIGIN) {
     headers: { "content-type": "application/json", origin },
     body: JSON.stringify(payload),
   });
+}
+
+function solveChallenge(challengeId, difficultyBits) {
+  const zeroHexCharacters = Math.floor(difficultyBits / 4);
+  const remainingBits = difficultyBits % 4;
+  for (let nonce = 0; nonce < 2_000_000; nonce += 1) {
+    const digest = createHash("sha256").update(`${challengeId}:${nonce}`).digest("hex");
+    if (
+      digest.startsWith("0".repeat(zeroHexCharacters)) &&
+      (remainingBits === 0 || Number.parseInt(digest[zeroHexCharacters], 16) < 2 ** (4 - remainingBits))
+    ) {
+      return `pow:${challengeId}:${nonce}`;
+    }
+  }
+  throw new Error("test challenge was not solvable within the fixed bound");
 }
 
 test("normalizes a bounded Korean question", () => {
@@ -83,6 +103,57 @@ test("creates a confidential issue then an exact hermes ask note", async () => {
   const stored = JSON.parse(await runtime.QUESTIONS.get(`question:${body.request_id}`));
   assert.equal(stored.issue_iid, 73);
   assert.notEqual(stored.poll_token_sha256, body.poll_token);
+});
+
+test("first-party challenge queues a question when Turnstile is blocked", async () => {
+  const calls = [];
+  const runtime = env(async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+    if (String(url).endsWith("/issues")) {
+      return Response.json({ iid: 74 }, { status: 201 });
+    }
+    return Response.json({ id: 92 }, { status: 201 });
+  });
+  const challengeResponse = await worker.fetch(
+    new Request(`${ORIGIN}/api/challenge`, { headers: { origin: ORIGIN } }),
+    runtime,
+  );
+  const challenge = await challengeResponse.json();
+  assert.equal(challengeResponse.status, 200);
+  const proof = solveChallenge(challenge.challenge_id, challenge.difficulty_bits);
+
+  const response = await worker.fetch(
+    postRequest({ question: "출장비 기준을 알려줘", turnstile_token: proof }),
+    runtime,
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 202);
+  assert.equal(body.status, "pending");
+  assert.equal(calls.some((call) => call.url.includes("turnstile")), false);
+  const replay = await worker.fetch(
+    postRequest({ question: "같은 증명을 재사용", turnstile_token: proof }),
+    runtime,
+  );
+  assert.equal(replay.status, 403);
+});
+
+test("limits first-party challenge issuance per client and minute", async () => {
+  const runtime = env(async () => {
+    throw new Error("must not call network");
+  });
+  const statuses = [];
+  for (let index = 0; index < 11; index += 1) {
+    const response = await worker.fetch(
+      new Request(`${ORIGIN}/api/challenge`, {
+        headers: { "cf-connecting-ip": "192.0.2.10", origin: ORIGIN },
+      }),
+      runtime,
+    );
+    statuses.push(response.status);
+  }
+
+  assert.deepEqual(statuses, [...Array(10).fill(200), 429]);
 });
 
 test("poll returns only the matching machine-marked answer", async () => {
