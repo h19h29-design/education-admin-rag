@@ -1,8 +1,10 @@
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import stat
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
@@ -33,6 +35,7 @@ from app.institutions.sources.common import (
     SourceProvenance,
     normalized_records_sha256,
 )
+from app.institutions.sources.sen_counts import ReviewedSchoolCounts
 from app.institutions.sources.standard_school import (
     DOWNLOAD_URL as STANDARD_LOCATION_ENDPOINT,
 )
@@ -88,6 +91,33 @@ _ALLOWED_COORDINATE_QUALITIES = {
     "GEOCODED",
     "MANUALLY_VERIFIED",
 }
+_SEOUL_DISTRICTS = (
+    "강남구",
+    "강동구",
+    "강북구",
+    "강서구",
+    "관악구",
+    "광진구",
+    "구로구",
+    "금천구",
+    "노원구",
+    "도봉구",
+    "동대문구",
+    "동작구",
+    "마포구",
+    "서대문구",
+    "서초구",
+    "성동구",
+    "성북구",
+    "송파구",
+    "양천구",
+    "영등포구",
+    "용산구",
+    "은평구",
+    "종로구",
+    "중구",
+    "중랑구",
+)
 _SOURCE_ENDPOINTS = {
     "NEIS": "https://open.neis.go.kr/hub/schoolInfo",
     "KINDERGARTEN_INFO": (
@@ -110,18 +140,47 @@ _SOURCE_ATTRIBUTIONS = {
 }
 _PINNED_SOURCE_RAW_SHA256 = {
     "SEN_REVIEWED_CSV": (
-        "9f202202edc653b09b4debb5a0ff939cf9fcdc64dd58174b28f8d009bb1b7424"
+        "69863ac78689fb4b6e9941aabea03c3c1d618ccb26568e844079afd9092eb2c2"
     ),
 }
 _PINNED_SOURCE_NORMALIZED_SHA256 = {
     "SEN_REVIEWED_CSV": (
-        "79f7405bfb90c0848162dd6c9ca22487b10b9375df998efd5ad39ee9244efd9d"
+        "8cd2aa66f3df95a25a2127eaa2791e876f2d21cd7bc47aa700d34be75293b3b3"
     ),
 }
 _STANDARD_LOCATION_NORMALIZED_SHA256 = (
     "ebb2643be10bda983ca9cb81a7ce2820474a53c2f65fc3ac6a7bcc179527cb4a"
 )
 _KAKAO_ENDPOINT = "https://dapi.kakao.com/v2/local/search/address.json"
+_TRANSACTION_KEY_NAME = ".sync-attestation.key"
+_TRANSACTION_DIRECTORY_NAME = ".sync-transactions"
+_TRANSACTION_VERSION = 1
+_TRANSACTION_PHASES = {
+    "BUILT",
+    "MOVED",
+    "APPROVAL_PREPARED",
+    "VERIFIED",
+    "POINTER_PREPARED",
+    "PUBLISHED",
+}
+_TRANSACTION_FIELDS = {
+    "version",
+    "snapshotId",
+    "candidateName",
+    "nonce",
+    "phase",
+    "issues",
+    "manifestSha256",
+    "sourcesSha256",
+    "enrichmentsSha256",
+    "institutionsSha256",
+    "sitesSha256",
+    "previousSnapshotId",
+    "approvedManifestSha256",
+    "approvedAt",
+    "approvedByRole",
+    "signature",
+}
 _INSTITUTION_FIELDS = {
     "institutionId",
     "officialName",
@@ -169,47 +228,167 @@ class SnapshotBuildResult:
     candidate_path: Path
     approved: bool
     issues: tuple[str, ...]
-    source_attestation_sha256: str
-    enrichment_attestation_sha256: str
-    manifest_attestation_sha256: str
 
 
 def reconcile_selectable_school_counts(
     records: tuple[SourceInstitutionRecord, ...],
     *,
-    expected_count: int,
+    benchmark: ReviewedSchoolCounts,
     tolerance: float = 0.01,
 ) -> dict[str, object]:
-    if type(expected_count) is not int or expected_count <= 0:
-        raise SnapshotQualityError("school reconciliation expected count is invalid")
     if not 0.0 <= tolerance <= 0.1:
         raise SnapshotQualityError("school reconciliation tolerance is invalid")
-    compared_types = {
-        "ELEMENTARY_SCHOOL",
-        "MIDDLE_SCHOOL",
-        "HIGH_SCHOOL",
-    }
-    actual_count = sum(
-        record.source == "NEIS" and record.institution_type in compared_types
-        for record in records
-    )
-    delta_count = abs(actual_count - expected_count)
-    delta_ratio = delta_count / expected_count
-    result: dict[str, object] = {
-        "population": "NEIS_ELEMENTARY_MIDDLE_HIGH",
-        "expectedCount": expected_count,
-        "actualCount": actual_count,
-        "deltaCount": delta_count,
-        "deltaRatio": delta_ratio,
-        "threshold": tolerance,
-        "passed": delta_ratio <= tolerance,
-    }
-    if delta_ratio > tolerance:
-        raise SnapshotQualityError(
-            "school reconciliation differs from the official count by more than "
-            "one percent"
+    if not benchmark.counts or any(
+        type(expected) is not int or expected <= 0
+        for expected in benchmark.counts.values()
+    ):
+        raise SnapshotQualityError("school reconciliation expected count is invalid")
+    if (
+        set(benchmark.counts) != set(benchmark.category_evidence)
+        or set(benchmark.counts) != set(benchmark.category_composition)
+    ):
+        raise SnapshotQualityError("school reconciliation evidence is incomplete")
+    actual_counts = Counter(record.institution_type for record in records)
+    categories: dict[str, dict[str, object]] = {}
+    for institution_type, expected_count in sorted(benchmark.counts.items()):
+        expected_source = (
+            "KINDERGARTEN_INFO"
+            if institution_type == "KINDERGARTEN"
+            else "NEIS"
         )
+        matching_records = tuple(
+            record
+            for record in records
+            if record.institution_type == institution_type
+        )
+        actual_count = actual_counts[institution_type]
+        delta_count = abs(actual_count - expected_count)
+        delta_ratio = delta_count / expected_count
+        actual_sources = sorted({record.source for record in matching_records})
+        actual_source_as_of = sorted(
+            {record.source_as_of for record in matching_records}
+        )
+        source_validation_passed = (
+            actual_sources == [expected_source]
+            and len(actual_source_as_of) == 1
+        )
+        evidence = benchmark.category_evidence[institution_type]
+        categories[institution_type] = {
+            "expectedCount": expected_count,
+            "actualCount": actual_count,
+            "deltaCount": delta_count,
+            "deltaRatio": delta_ratio,
+            "threshold": tolerance,
+            "expectedSource": expected_source,
+            "actualSources": actual_sources,
+            "actualSourceAsOf": actual_source_as_of,
+            "sourceValidationPassed": source_validation_passed,
+            "sourceUrl": evidence.source_url,
+            "sourceAsOf": evidence.source_as_of,
+            "sourceSha256": evidence.source_sha256,
+            "evidenceStatus": evidence.status,
+            "composition": benchmark.category_composition[institution_type],
+            "passed": delta_ratio <= tolerance and source_validation_passed,
+        }
+    reported_totals: list[dict[str, object]] = []
+    for total in benchmark.reported_totals:
+        population_types = total.population.split("+")
+        if (
+            total.used_for_gate
+            or not population_types
+            or any(name not in benchmark.counts for name in population_types)
+        ):
+            raise SnapshotQualityError(
+                "school reconciliation reported total is invalid"
+            )
+        reported_totals.append(
+            {
+                "expectedCount": total.expected_count,
+                "actualCount": sum(actual_counts[name] for name in population_types),
+                "population": total.population,
+                "usedForGate": False,
+                "passed": None,
+                "sourceUrl": total.evidence.source_url,
+                "sourceAsOf": total.evidence.source_as_of,
+                "sourceSha256": total.evidence.source_sha256,
+                "evidenceStatus": total.evidence.status,
+            }
+        )
+    result: dict[str, object] = {
+        "normalizedSha256": benchmark.normalized_sha256,
+        "threshold": tolerance,
+        "categories": categories,
+        "reportedTotals": reported_totals,
+        "passed": all(
+            category["passed"] is True for category in categories.values()
+        ),
+    }
     return result
+
+
+def build_sync_preflight_audit(
+    records: tuple[SourceInstitutionRecord, ...],
+    *,
+    source_provenance: Mapping[str, SourceProvenance],
+    reconciliation: Mapping[str, object],
+) -> dict[str, object]:
+    source_record_counts = Counter(record.source for record in records)
+    district_counts = {district: 0 for district in _SEOUL_DISTRICTS}
+    quarantined_institution_ids: list[str] = []
+    quarantined_site_ids: list[str] = []
+    ready_institutions = 0
+    for record in records:
+        if record.district in district_counts:
+            district_counts[record.district] += 1
+        if record.latitude is None:
+            quarantined_institution_ids.append(record.institution_id)
+            quarantined_site_ids.append(f"{record.institution_id}:main")
+        else:
+            ready_institutions += 1
+        for site in record.additional_sites:
+            if site.latitude is None:
+                quarantined_site_ids.append(
+                    f"{record.institution_id}:{site.site_code}"
+                )
+    source_counts = {
+        source: {
+            "fetched": provenance.fetched_row_count,
+            "normalized": source_record_counts[source],
+            "preserved": 0,
+            "output": source_record_counts[source],
+        }
+        for source, provenance in sorted(source_provenance.items())
+    }
+    passed = reconciliation.get("passed") is True
+    return {
+        "auditStage": "PRE_PROMOTION_RECONCILIATION",
+        "passed": passed,
+        "sourceCounts": source_counts,
+        "typeCounts": dict(
+            sorted(Counter(record.institution_type for record in records).items())
+        ),
+        "foundationCounts": dict(
+            sorted(Counter(record.foundation_type for record in records).items())
+        ),
+        "districtCounts": district_counts,
+        "statusCounts": {
+            "PRECHECK_READY_INSTITUTION": ready_institutions,
+            "PRECHECK_REVIEW_REQUIRED_INSTITUTION": (
+                len(records) - ready_institutions
+            ),
+        },
+        "quarantinedInstitutionIds": sorted(quarantined_institution_ids),
+        "quarantinedSiteIds": sorted(quarantined_site_ids),
+        "reconciliation": dict(reconciliation),
+    }
+
+
+def emit_sync_preflight_audit(audit: Mapping[str, object]) -> None:
+    print(json.dumps(dict(audit), ensure_ascii=False, sort_keys=True), flush=True)
+    if audit.get("passed") is not True:
+        raise SnapshotQualityError(
+            "official school count reconciliation failed"
+        )
 
 
 async def geocode_missing_records(
@@ -456,16 +635,21 @@ def build_candidate_snapshot(
         ),
     )
     _write_json(candidate_path / "manifest.json", manifest)
+    for file_name in ("manifest.json", "institutions.jsonl", "sites.jsonl"):
+        _fsync_file(candidate_path / file_name)
+    _fsync_directory(candidate_path)
+    _fsync_directory(root)
+    _create_build_transaction(
+        root,
+        snapshot_id=snapshot_id,
+        manifest=manifest,
+        issues=tuple(issues),
+    )
     return SnapshotBuildResult(
         snapshot_id=snapshot_id,
         candidate_path=candidate_path,
         approved=False,
         issues=tuple(issues),
-        source_attestation_sha256=_manifest_section_sha256(manifest["sources"]),
-        enrichment_attestation_sha256=_manifest_section_sha256(
-            manifest["enrichments"]
-        ),
-        manifest_attestation_sha256=_manifest_section_sha256(manifest),
     )
 
 
@@ -477,8 +661,6 @@ def promote_snapshot(
 ) -> None:
     if _SAFE_SNAPSHOT_ID.fullmatch(candidate.snapshot_id) is None:
         raise SnapshotQualityError("snapshot ID is unsafe")
-    if candidate.issues:
-        raise SnapshotQualityError("; ".join(candidate.issues))
     root = _validated_snapshot_root(Path(output_root))
     lock_path = root / ".promotion.lock"
     flags = os.O_CREAT | os.O_RDWR
@@ -511,8 +693,6 @@ def _promote_snapshot_locked(
 ) -> None:
     if _SAFE_SNAPSHOT_ID.fullmatch(candidate.snapshot_id) is None:
         raise SnapshotQualityError("snapshot ID is unsafe")
-    if candidate.issues:
-        raise SnapshotQualityError("; ".join(candidate.issues))
     root = _validated_snapshot_root(Path(output_root))
     candidate_path = Path(candidate.candidate_path)
     expected_candidate_name = f".{candidate.snapshot_id}.candidate"
@@ -527,6 +707,13 @@ def _promote_snapshot_locked(
         raise SnapshotQualityError("candidate path is outside the snapshot root")
     if candidate_path.is_symlink():
         raise SnapshotQualityError("candidate path must not be a symlink")
+    transaction = _load_build_transaction(root, candidate.snapshot_id)
+    transaction_issues = transaction.get("issues")
+    if type(transaction_issues) is not list:
+        raise SnapshotQualityError("build transaction issues are invalid")
+    if transaction_issues:
+        raise SnapshotQualityError("; ".join(cast(list[str], transaction_issues)))
+    phase = cast(str, transaction["phase"])
     candidate_path = root / expected_candidate_name
     final_path = root / candidate.snapshot_id
     if final_path.is_symlink():
@@ -551,21 +738,36 @@ def _promote_snapshot_locked(
         raise SnapshotQualityError("candidate manifest fields are invalid") from exc
     if selected_path == candidate_path and manifest.get("approved") is not False:
         raise SnapshotQualityError("candidate manifest must remain approved=false")
-    if (
-        _manifest_section_sha256(manifest.get("sources"))
-        != candidate.source_attestation_sha256
-    ):
-        raise SnapshotQualityError("candidate source provenance attestation mismatch")
-    if (
-        _manifest_section_sha256(manifest.get("enrichments"))
-        != candidate.enrichment_attestation_sha256
+    if selected_path == candidate_path and phase != "BUILT":
+        raise SnapshotQualityError("build transaction phase is invalid")
+    if transaction.get("sourcesSha256") != _manifest_section_sha256(
+        manifest.get("sources")
     ):
         raise SnapshotQualityError(
-            "candidate enrichment provenance attestation mismatch"
+            "candidate source provenance transaction attestation mismatch"
+        )
+    if transaction.get("enrichmentsSha256") != _manifest_section_sha256(
+        manifest.get("enrichments")
+    ):
+        raise SnapshotQualityError(
+            "candidate enrichment provenance transaction attestation mismatch"
         )
     if manifest.get("approved") is False:
+        if selected_path == final_path and phase not in {
+            "BUILT",
+            "MOVED",
+            "APPROVAL_PREPARED",
+        }:
+            raise SnapshotQualityError("build transaction approval phase is invalid")
         _validate_unapproved_manifest_schema(manifest)
     elif selected_path == final_path and manifest.get("approved") is True:
+        if phase not in {
+            "APPROVAL_PREPARED",
+            "VERIFIED",
+            "POINTER_PREPARED",
+            "PUBLISHED",
+        }:
+            raise SnapshotQualityError("build transaction approval phase is invalid")
         _validate_approved_manifest_schema(manifest)
     else:
         raise SnapshotQualityError("recoverable final manifest approval is invalid")
@@ -577,6 +779,7 @@ def _promote_snapshot_locked(
     _recheck_promotion_quality(root, manifest, institutions, sites, coverage)
     _recheck_source_provenance(manifest, institutions, sites)
     _recheck_enrichment_provenance(manifest, institutions, sites)
+    _transaction_attests_manifest(transaction, manifest)
     for file_name in ("manifest.json", "institutions.jsonl", "sites.jsonl"):
         _fsync_file(selected_path / file_name)
     _fsync_directory(selected_path)
@@ -585,19 +788,56 @@ def _promote_snapshot_locked(
         _fsync_directory(root)
         selected_path = final_path
         manifest_path = final_path / "manifest.json"
+        transaction = _advance_build_transaction(
+            root,
+            transaction,
+            phase="MOVED",
+        )
+        phase = "MOVED"
+    elif manifest.get("approved") is False and phase == "BUILT":
+        transaction = _advance_build_transaction(
+            root,
+            transaction,
+            phase="MOVED",
+        )
+        phase = "MOVED"
     if manifest.get("approved") is False:
-        manifest["approved"] = True
-        manifest["approvedAt"] = _utc_now()
-        manifest["approvedByRole"] = "data-steward"
+        approved_manifest = dict(manifest)
+        if phase == "MOVED":
+            approved_manifest["approved"] = True
+            approved_manifest["approvedAt"] = _utc_now()
+            approved_manifest["approvedByRole"] = "data-steward"
+            transaction = _advance_build_transaction(
+                root,
+                transaction,
+                phase="APPROVAL_PREPARED",
+                approved_manifest=approved_manifest,
+            )
+            phase = "APPROVAL_PREPARED"
+        elif phase == "APPROVAL_PREPARED":
+            approved_manifest["approved"] = True
+            approved_manifest["approvedAt"] = transaction.get("approvedAt")
+            approved_manifest["approvedByRole"] = transaction.get(
+                "approvedByRole"
+            )
+        else:
+            raise SnapshotQualityError("build transaction approval phase is invalid")
+        if transaction.get("approvedManifestSha256") != _manifest_section_sha256(
+            approved_manifest
+        ):
+            raise SnapshotQualityError("build transaction approval phase mismatch")
         temporary_manifest = selected_path / ".manifest.json.tmp"
         _validate_atomic_temporary_path(
             temporary_manifest,
             selected_path,
             ".manifest.json.tmp",
         )
-        _write_json(temporary_manifest, manifest, durable=True)
+        _write_json(temporary_manifest, approved_manifest, durable=True)
         os.replace(temporary_manifest, manifest_path)
         _fsync_directory(selected_path)
+        manifest = approved_manifest
+
+    _transaction_attests_manifest(transaction, manifest)
 
     try:
         verify_snapshot_directory(root, candidate.snapshot_id)
@@ -605,15 +845,34 @@ def _promote_snapshot_locked(
         raise SnapshotQualityError(
             "strict snapshot verification failed before pointer publication"
         ) from exc
-    attested_manifest = dict(manifest)
-    attested_manifest["approved"] = False
-    attested_manifest["approvedAt"] = None
-    attested_manifest["approvedByRole"] = None
-    if (
-        _manifest_section_sha256(attested_manifest)
-        != candidate.manifest_attestation_sha256
-    ):
-        raise SnapshotQualityError("candidate manifest attestation mismatch")
+    if phase == "APPROVAL_PREPARED":
+        transaction = _advance_build_transaction(
+            root,
+            transaction,
+            phase="VERIFIED",
+        )
+        phase = "VERIFIED"
+    if phase == "PUBLISHED":
+        try:
+            verified = verify_snapshot(root)
+        except (OSError, ValueError) as exc:
+            raise SnapshotQualityError(
+                "published build transaction pointer is invalid"
+            ) from exc
+        if verified.manifest.snapshot_id != candidate.snapshot_id:
+            raise SnapshotQualityError(
+                "published build transaction pointer is invalid"
+            )
+        return
+    if phase == "VERIFIED":
+        transaction = _advance_build_transaction(
+            root,
+            transaction,
+            phase="POINTER_PREPARED",
+        )
+        phase = "POINTER_PREPARED"
+    if phase != "POINTER_PREPARED":
+        raise SnapshotQualityError("build transaction pointer phase is invalid")
 
     temporary_pointer = root / ".current.json.tmp"
     _validate_atomic_temporary_path(
@@ -628,6 +887,11 @@ def _promote_snapshot_locked(
     )
     os.replace(temporary_pointer, current_path)
     _fsync_directory(root)
+    _advance_build_transaction(
+        root,
+        transaction,
+        phase="PUBLISHED",
+    )
 
 
 def _validated_snapshot_root(root: Path) -> Path:
@@ -784,10 +1048,6 @@ def _validate_source_record(record: SourceInstitutionRecord) -> None:
         raise SnapshotQualityError("source coordinate quality does not match coordinates")
     if not record.site_name.strip():
         raise SnapshotQualityError("source main site name must be nonblank")
-    if record.additional_sites and not has_latitude:
-        raise SnapshotQualityError(
-            "source main site needs coordinates when branches are present"
-        )
     site_codes: set[str] = set()
     for site in record.additional_sites:
         if (
@@ -863,7 +1123,10 @@ def _validate_source_provenance(
             raise SnapshotQualityError("source provenance timing/count is invalid")
     elif expected_timing is not None:
         raise SnapshotQualityError("source provenance timing is invalid")
-    if source_name == "SEN_REVIEWED_CSV" and fetched_row_count != provenance.row_count:
+    if (
+        source_name == "SEN_REVIEWED_CSV"
+        and fetched_row_count != provenance.row_count + 1
+    ):
         raise SnapshotQualityError("source provenance count is invalid")
     if (
         source_name == "NEIS"
@@ -1457,6 +1720,283 @@ def _manifest_section_sha256(value: object) -> str:
     ).hexdigest()
 
 
+def _create_build_transaction(
+    root: Path,
+    *,
+    snapshot_id: str,
+    manifest: dict[str, object],
+    issues: tuple[str, ...],
+) -> None:
+    transaction_directory = _validated_transaction_directory(root, create=True)
+    transaction_path = transaction_directory / f"{snapshot_id}.json"
+    if transaction_path.exists() or transaction_path.is_symlink():
+        raise SnapshotQualityError("build transaction already exists")
+    diff = manifest.get("diff")
+    if type(diff) is not dict:
+        raise SnapshotQualityError("candidate diff metadata is invalid")
+    transaction: dict[str, object] = {
+        "version": _TRANSACTION_VERSION,
+        "snapshotId": snapshot_id,
+        "candidateName": f".{snapshot_id}.candidate",
+        "nonce": secrets.token_hex(16),
+        "phase": "BUILT",
+        "issues": list(issues),
+        "manifestSha256": _manifest_section_sha256(manifest),
+        "sourcesSha256": _manifest_section_sha256(manifest.get("sources")),
+        "enrichmentsSha256": _manifest_section_sha256(
+            manifest.get("enrichments")
+        ),
+        "institutionsSha256": manifest.get("institutionsSha256"),
+        "sitesSha256": manifest.get("sitesSha256"),
+        "previousSnapshotId": diff.get("previousSnapshotId"),
+        "approvedManifestSha256": None,
+        "approvedAt": None,
+        "approvedByRole": None,
+    }
+    _write_signed_transaction(root, transaction, replace_existing=False)
+
+
+def _validated_transaction_directory(root: Path, *, create: bool) -> Path:
+    path = root / _TRANSACTION_DIRECTORY_NAME
+    if create:
+        try:
+            path.mkdir(mode=0o700)
+            _fsync_directory(root)
+        except FileExistsError:
+            pass
+    if path.is_symlink():
+        raise SnapshotQualityError("build transaction directory is invalid")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SnapshotQualityError("build transaction directory is missing") from exc
+    if resolved.parent != root or not resolved.is_dir():
+        raise SnapshotQualityError("build transaction directory is invalid")
+    return resolved
+
+
+def _load_or_create_attestation_key(root: Path) -> bytes:
+    key_path = root / _TRANSACTION_KEY_NAME
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(key_path, flags, 0o600)
+    except FileExistsError:
+        return _load_attestation_key(root)
+    except OSError as exc:
+        raise SnapshotQualityError("build transaction key is invalid") from exc
+    try:
+        key = secrets.token_bytes(32)
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(key)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+    _fsync_directory(root)
+    return key
+
+
+def _load_attestation_key(root: Path) -> bytes:
+    key_path = root / _TRANSACTION_KEY_NAME
+    if key_path.is_symlink():
+        raise SnapshotQualityError("build transaction key is invalid")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(key_path, flags)
+    except OSError as exc:
+        raise SnapshotQualityError("build transaction key is invalid") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or key_path.resolve(strict=True).parent != root
+        ):
+            raise SnapshotQualityError("build transaction key is invalid")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            key = stream.read(33)
+    finally:
+        os.close(descriptor)
+    if len(key) != 32:
+        raise SnapshotQualityError("build transaction key is invalid")
+    return key
+
+
+def _signed_transaction(
+    transaction: Mapping[str, object],
+    key: bytes,
+) -> dict[str, object]:
+    body = {name: value for name, value in transaction.items() if name != "signature"}
+    signature = hmac.new(
+        key,
+        json.dumps(
+            body,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return {**body, "signature": signature}
+
+
+def _write_signed_transaction(
+    root: Path,
+    transaction: Mapping[str, object],
+    *,
+    replace_existing: bool,
+) -> dict[str, object]:
+    snapshot_id = transaction.get("snapshotId")
+    if type(snapshot_id) is not str or _SAFE_SNAPSHOT_ID.fullmatch(snapshot_id) is None:
+        raise SnapshotQualityError("build transaction snapshot ID is invalid")
+    directory = _validated_transaction_directory(root, create=True)
+    path = directory / f"{snapshot_id}.json"
+    if not replace_existing and (path.exists() or path.is_symlink()):
+        raise SnapshotQualityError("build transaction already exists")
+    temporary = directory / f".{snapshot_id}.json.tmp"
+    _validate_atomic_temporary_path(
+        temporary,
+        directory,
+        f".{snapshot_id}.json.tmp",
+    )
+    signed = _signed_transaction(transaction, _load_or_create_attestation_key(root))
+    _write_json(temporary, signed, durable=True)
+    os.replace(temporary, path)
+    _fsync_directory(directory)
+    return signed
+
+
+def _load_build_transaction(root: Path, snapshot_id: str) -> dict[str, object]:
+    directory = _validated_transaction_directory(root, create=False)
+    path = _validated_snapshot_file(
+        directory / f"{snapshot_id}.json",
+        directory,
+        "build transaction",
+    )
+    transaction = _read_json_object(path)
+    if set(transaction) != _TRANSACTION_FIELDS:
+        raise SnapshotQualityError("build transaction fields are invalid")
+    signature = transaction.get("signature")
+    if type(signature) is not str or _SHA256.fullmatch(signature) is None:
+        raise SnapshotQualityError("build transaction signature is invalid")
+    expected = _signed_transaction(transaction, _load_attestation_key(root))[
+        "signature"
+    ]
+    if type(expected) is not str or not hmac.compare_digest(signature, expected):
+        raise SnapshotQualityError("build transaction attestation is invalid")
+    _validate_build_transaction(transaction, snapshot_id)
+    return transaction
+
+
+def _validate_build_transaction(
+    transaction: Mapping[str, object],
+    snapshot_id: str,
+) -> None:
+    phase = transaction.get("phase")
+    issues = transaction.get("issues")
+    nonce = transaction.get("nonce")
+    digest_fields = (
+        "manifestSha256",
+        "sourcesSha256",
+        "enrichmentsSha256",
+        "institutionsSha256",
+        "sitesSha256",
+    )
+    if (
+        transaction.get("version") != _TRANSACTION_VERSION
+        or transaction.get("snapshotId") != snapshot_id
+        or transaction.get("candidateName") != f".{snapshot_id}.candidate"
+        or type(nonce) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", nonce) is None
+        or phase not in _TRANSACTION_PHASES
+        or type(issues) is not list
+        or any(type(issue) is not str for issue in issues)
+        or any(
+            type(transaction.get(field)) is not str
+            or _SHA256.fullmatch(cast(str, transaction.get(field))) is None
+            for field in digest_fields
+        )
+        or (
+            transaction.get("previousSnapshotId") is not None
+            and type(transaction.get("previousSnapshotId")) is not str
+        )
+    ):
+        raise SnapshotQualityError("build transaction contents are invalid")
+    approval_values = (
+        transaction.get("approvedManifestSha256"),
+        transaction.get("approvedAt"),
+        transaction.get("approvedByRole"),
+    )
+    if phase in {"BUILT", "MOVED"}:
+        if any(value is not None for value in approval_values):
+            raise SnapshotQualityError("build transaction approval phase is invalid")
+    elif (
+        type(approval_values[0]) is not str
+        or _SHA256.fullmatch(cast(str, approval_values[0])) is None
+        or type(approval_values[1]) is not str
+        or approval_values[2] != "data-steward"
+    ):
+        raise SnapshotQualityError("build transaction approval phase is invalid")
+
+
+def _advance_build_transaction(
+    root: Path,
+    transaction: Mapping[str, object],
+    *,
+    phase: str,
+    approved_manifest: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    if phase not in _TRANSACTION_PHASES:
+        raise SnapshotQualityError("build transaction phase is invalid")
+    updated = dict(transaction)
+    updated["phase"] = phase
+    if approved_manifest is not None:
+        updated["approvedManifestSha256"] = _manifest_section_sha256(
+            approved_manifest
+        )
+        updated["approvedAt"] = approved_manifest.get("approvedAt")
+        updated["approvedByRole"] = approved_manifest.get("approvedByRole")
+    updated.pop("signature", None)
+    return _write_signed_transaction(root, updated, replace_existing=True)
+
+
+def _transaction_attests_manifest(
+    transaction: Mapping[str, object],
+    manifest: Mapping[str, object],
+) -> None:
+    unapproved = dict(manifest)
+    unapproved["approved"] = False
+    unapproved["approvedAt"] = None
+    unapproved["approvedByRole"] = None
+    diff = unapproved.get("diff")
+    if type(diff) is not dict:
+        raise SnapshotQualityError("candidate diff metadata is invalid")
+    if (
+        transaction.get("manifestSha256") != _manifest_section_sha256(unapproved)
+        or transaction.get("sourcesSha256")
+        != _manifest_section_sha256(unapproved.get("sources"))
+        or transaction.get("enrichmentsSha256")
+        != _manifest_section_sha256(unapproved.get("enrichments"))
+        or transaction.get("institutionsSha256")
+        != unapproved.get("institutionsSha256")
+        or transaction.get("sitesSha256") != unapproved.get("sitesSha256")
+        or transaction.get("previousSnapshotId")
+        != diff.get("previousSnapshotId")
+    ):
+        raise SnapshotQualityError("build transaction attestation mismatch")
+    if manifest.get("approved") is True and (
+        manifest.get("approvedAt") != transaction.get("approvedAt")
+        or manifest.get("approvedByRole") != transaction.get("approvedByRole")
+        or transaction.get("approvedManifestSha256")
+        != _manifest_section_sha256(manifest)
+    ):
+        raise SnapshotQualityError("build transaction approval phase mismatch")
+
+
 def _reject_duplicate_json_keys(
     pairs: list[tuple[str, object]],
 ) -> dict[str, object]:
@@ -1704,7 +2244,7 @@ def _recheck_source_provenance(
         if (
             source == "SEN_REVIEWED_CSV"
             and current_count > 0
-            and entry["fetchedRowCount"] != current_count
+            and entry["fetchedRowCount"] != current_count + 1
         ):
             raise SnapshotQualityError(
                 "candidate source provenance count is invalid"

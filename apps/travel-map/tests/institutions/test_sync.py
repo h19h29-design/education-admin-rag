@@ -1,5 +1,7 @@
+import argparse
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -10,7 +12,7 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 
 import app.institutions.sources.kindergarten as kindergarten_module
 import app.institutions.sources.neis as neis_module
@@ -24,6 +26,7 @@ from app.institutions.snapshot import VerifiedSnapshot, verify_snapshot
 from app.institutions.sources.common import (
     EnrichmentProvenance,
     SourceDataError,
+    SourceFetchResult,
     SourceInstitutionRecord,
     SourceInstitutionSiteRecord,
     SourceProvenance,
@@ -37,15 +40,24 @@ from app.institutions.sources.kindergarten import (
 )
 from app.institutions.sources.neis import NeisSource, parse_neis_rows
 from app.institutions.sources.sen import SenCsvSource, parse_sen_csv
+from app.institutions.sources.sen_counts import (
+    ReportedSchoolTotal,
+    ReviewedSchoolCounts,
+    SchoolCountEvidence,
+    load_reviewed_school_counts,
+)
 from app.institutions.sources.standard_school import (
     StandardSchoolLocationSource,
     enrich_neis_coordinates,
     parse_standard_school_locations,
 )
+from app.institutions.store import InstitutionStore
 from app.institutions.sync import (
     SnapshotBuildResult,
     SnapshotQualityError,
     build_candidate_snapshot,
+    build_sync_preflight_audit,
+    emit_sync_preflight_audit,
     enrichment_records_sha256,
     geocode_missing_records,
     promote_snapshot,
@@ -182,6 +194,32 @@ def test_neis_explicitly_excludes_nonselectable_joint_training_center() -> None:
     payload = neis_payload(source_type="\uacf5\ub3d9\uc2e4\uc2b5\uc18c")
 
     assert parse_neis_rows(payload) == ()
+
+
+# Production break caught: collapsing two raw vintages on one API page to the later
+# date and presenting the page as one coherent source snapshot.
+def test_neis_rejects_multiple_raw_load_dates_within_one_page() -> None:
+    payload = load_json("neis-school-info.json")
+    rows = payload["schoolInfo"][1]["row"]  # type: ignore[index]
+    rows[0]["LOAD_DTM"] = "20260809"
+    rows[1]["LOAD_DTM"] = "20260810"
+
+    with pytest.raises(
+        SourceDataError,
+        match="^NEIS page contains multiple raw LOAD_DTM dates$",
+    ):
+        parse_neis_rows(payload)
+
+
+# Production break caught: treating a filtered-out row as if its vintage cannot
+# invalidate the raw source page.
+def test_neis_validates_load_date_on_nonselectable_raw_row() -> None:
+    payload = neis_payload(source_type="공동실습소")
+    row = payload["schoolInfo"][1]["row"][0]  # type: ignore[index]
+    row["LOAD_DTM"] = "invalid"
+
+    with pytest.raises(SourceDataError, match="unsupported"):
+        parse_neis_rows(payload)
 
 
 # Production break caught: coercing a newly introduced establishment category to
@@ -341,9 +379,213 @@ def test_reviewed_sen_resource_matches_official_organization_totals() -> None:
 
     assert len(result.records) == 41
     assert result.provenance.row_count == 41
+    assert result.provenance.fetched_row_count == 42
     assert all(record.foundation_type == "PUBLIC" for record in result.records)
     assert all(record.source_region_code == "SEOUL" for record in result.records)
     assert all(not hasattr(record, "telephone") for record in result.records)
+    gangseo = next(
+        record
+        for record in result.records
+        if record.institution_id == "sen:gangseo-library"
+    )
+    assert gangseo.official_name == "강서도서관"
+    assert gangseo.site_name == "본관"
+    assert gangseo.road_address == "서울특별시 강서구 등촌로51나길 29"
+    assert gangseo.additional_sites == (
+        SourceInstitutionSiteRecord(
+            site_code="gayang",
+            site_name="가양관",
+            road_address="서울특별시 강서구 양천로55길 46",
+            district="강서구",
+            latitude=None,
+            longitude=None,
+            coordinate_quality="MISSING",
+        ),
+    )
+    assert not hasattr(gangseo.additional_sites[0], "telephone")
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (",gayang,\\uac00\\uc591\\uad00,false", ",main,\\uac00\\uc591\\uad00,false"),
+        (",gayang,\\uac00\\uc591\\uad00,false", ",gayang,\\uac00\\uc591\\uad00,true"),
+    ],
+)
+def test_sen_multisite_parser_rejects_duplicate_or_second_default(
+    tmp_path: Path,
+    old: str,
+    new: str,
+) -> None:
+    source = SOURCE_RESOURCES / "sen-institutions.csv"
+    text = source.read_text(encoding="utf-8")
+    assert old in text
+    changed = text.replace(old, new, 1)
+    data_lines = [
+        line
+        for line in changed.splitlines()
+        if line.strip() and not line.startswith("# ")
+    ]
+    digest = hashlib.sha256(
+        ("\n".join(data_lines) + "\n").encode("utf-8")
+    ).hexdigest()
+    changed = changed.replace(
+        "c2b7e84c476175586b9f3764f54ee008fc35cb7831b4a8a0186ded9b608aac50",
+        digest,
+        1,
+    )
+    path = tmp_path / "invalid-sites.csv"
+    path.write_text(changed, encoding="utf-8")
+
+    with pytest.raises(SourceDataError, match="defaults|identifiers"):
+        parse_sen_csv(path)
+
+
+def test_unresolved_sen_main_and_branch_are_both_persisted_for_review(
+    tmp_path: Path,
+) -> None:
+    result = SenCsvSource(
+        SOURCE_RESOURCES / "sen-institutions.csv",
+        expected_type_counts={
+            "HEADQUARTERS": 1,
+            "DISTRICT_OFFICE": 11,
+            "DIRECT_AGENCY": 8,
+            "LIFELONG_LEARNING_CENTER": 4,
+            "LIBRARY": 17,
+        },
+    ).load()
+
+    candidate = build_candidate_snapshot(
+        records=result.records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="unresolved-sen-multisite",
+        coverage=TEST_COVERAGE,
+        source_provenance={result.provenance.source: result.provenance},
+    )
+
+    assert candidate.issues == (
+        "coordinate validation success rate is below 98 percent",
+    )
+    institutions = [
+        json.loads(line)
+        for line in (candidate.candidate_path / "institutions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    sites = [
+        json.loads(line)
+        for line in (candidate.candidate_path / "sites.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    gangseo = next(
+        item
+        for item in institutions
+        if item["institutionId"] == "sen:gangseo-library"
+    )
+    gangseo_sites = [
+        item
+        for item in sites
+        if item["institutionId"] == "sen:gangseo-library"
+    ]
+    assert gangseo["status"] == "REVIEW_REQUIRED"
+    assert {item["siteId"] for item in gangseo_sites} == {
+        "sen:gangseo-library:main",
+        "sen:gangseo-library:gayang",
+    }
+    assert {item["status"] for item in gangseo_sites} == {"REVIEW_REQUIRED"}
+    assert all(item["latitude"] is None for item in gangseo_sites)
+
+
+def test_reviewed_sen_multisite_survives_snapshot_and_store(
+    tmp_path: Path,
+) -> None:
+    sen_result = SenCsvSource(
+        SOURCE_RESOURCES / "sen-institutions.csv",
+        expected_type_counts={
+            "HEADQUARTERS": 1,
+            "DISTRICT_OFFICE": 11,
+            "DIRECT_AGENCY": 8,
+            "LIFELONG_LEARNING_CENTER": 4,
+            "LIBRARY": 17,
+        },
+    ).load()
+    geocoded_sen = tuple(
+        replace(
+            record,
+            latitude=37.56,
+            longitude=126.97,
+            coordinate_quality="GEOCODED",
+            additional_sites=tuple(
+                replace(
+                    site,
+                    latitude=37.57,
+                    longitude=126.84,
+                    coordinate_quality="GEOCODED",
+                )
+                for site in record.additional_sites
+            ),
+        )
+        for record in sen_result.records
+    )
+    neis_records = tuple(
+        source_record(institution_id=f"neis:B10:7011{index:03d}")
+        for index in range(9)
+    )
+    records = geocoded_sen + neis_records
+    geocoded_count = sum(
+        record.coordinate_quality == "GEOCODED"
+        for record in records
+    ) + sum(
+        site.coordinate_quality == "GEOCODED"
+        for record in records
+        for site in record.additional_sites
+    )
+    kakao = EnrichmentProvenance(
+        source="KAKAO_LOCAL_GEOCODING",
+        endpoint="https://dapi.kakao.com/v2/local/search/address.json",
+        license_name="KAKAO_LOCAL_API_TERMS",
+        attribution="Kakao Local API",
+        fetched_at="2026-08-10T09:00:00Z",
+        source_as_of="2026-08-10",
+        raw_sha256="c" * 64,
+        normalized_sha256=sync_module._geocoded_records_sha256(records),
+        request_region_code="SEOUL_ADDRESS_BATCH",
+        request_timing=None,
+        page_count=geocoded_count,
+        fetched_row_count=geocoded_count,
+        matched_row_count=geocoded_count,
+        matched_normalized_sha256=enrichment_records_sha256(
+            records,
+            "GEOCODED",
+        ),
+    )
+    neis_provenance = source_provenance_for(neis_records)["NEIS"]
+    candidate = build_candidate_snapshot(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="reviewed-sen-multisite",
+        coverage=TEST_COVERAGE,
+        source_provenance={
+            sen_result.provenance.source: sen_result.provenance,
+            neis_provenance.source: neis_provenance,
+        },
+        enrichment_provenance=(kakao,),
+    )
+
+    assert candidate.issues == ()
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    store = InstitutionStore.load(tmp_path)
+
+    matches = store.search("강서도서관")
+    assert {item.site_id for item in matches} == {
+        "sen:gangseo-library:main",
+        "sen:gangseo-library:gayang",
+    }
+    assert sum(item.site_name == "본관" for item in matches) == 1
+    assert store.require_site("sen:gangseo-library:gayang").site_name == "가양관"
 
 
 def test_reviewed_sen_provenance_is_accepted_by_candidate_builder(
@@ -400,28 +642,354 @@ def test_reviewed_sen_provenance_rejects_valid_looking_wrong_raw_digest(
         )
 
 
-def test_school_reconciliation_blocks_more_than_one_percent_mismatch() -> None:
-    records = tuple(
-        source_record(institution_id=f"neis:B10:{index:07d}")
-        for index in range(99)
+def test_reviewed_school_count_resource_is_official_and_pinned() -> None:
+    benchmark = load_reviewed_school_counts(
+        SOURCE_RESOURCES / "sen-annual-school-counts.csv"
+    )
+    assert benchmark.counts == {
+        "KINDERGARTEN": 724,
+        "ELEMENTARY_SCHOOL": 609,
+        "MIDDLE_SCHOOL": 390,
+        "HIGH_SCHOOL": 319,
+        "SPECIAL_SCHOOL": 32,
+        "MISC_SCHOOL": 18,
+    }
+    assert benchmark.category_evidence["KINDERGARTEN"].source_as_of == (
+        "2026-03-10"
+    )
+    assert (
+        benchmark.category_evidence["KINDERGARTEN"].status
+        == "PRELIMINARY_2026"
+    )
+    assert benchmark.category_evidence["ELEMENTARY_SCHOOL"].source_as_of == (
+        "2026-03-10"
+    )
+    assert (
+        benchmark.category_evidence["ELEMENTARY_SCHOOL"].status
+        == "PRELIMINARY_2026"
+    )
+    assert benchmark.category_composition["MISC_SCHOOL"] == (
+        "각종학교17+고등기술학교1"
+    )
+    assert benchmark.reported_totals == (
+        ReportedSchoolTotal(
+            expected_count=2_092,
+            population=(
+                "KINDERGARTEN+ELEMENTARY_SCHOOL+MIDDLE_SCHOOL+"
+                "HIGH_SCHOOL+SPECIAL_SCHOOL+MISC_SCHOOL"
+            ),
+            used_for_gate=False,
+            evidence=SchoolCountEvidence(
+                source_url=(
+                    "https://enews.sen.go.kr/uploads/img_smart//"
+                    "2026-06-08/20260608075519432.png"
+                ),
+                source_as_of="2026-03-10",
+                source_sha256=(
+                    "6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a170"
+                    "5db508afeee15e70"
+                ),
+                status="PRELIMINARY_2026",
+            ),
+        ),
     )
 
-    boundary = reconcile_selectable_school_counts(
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("KINDERGARTEN,724,", "KINDERGARTEN,725,"),
+        (
+            "https://enews.sen.go.kr/uploads/img_smart//",
+            "https://attacker.invalid/",
+        ),
+        ("PRELIMINARY_2026", "FINAL_2026"),
+        (
+            "36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332",
+            "f" * 64,
+        ),
+    ],
+)
+def test_reviewed_school_count_resource_rejects_mutation(
+    tmp_path: Path,
+    old: str,
+    new: str,
+) -> None:
+    source = SOURCE_RESOURCES / "sen-annual-school-counts.csv"
+    text = source.read_text(encoding="utf-8")
+    assert old in text
+    tampered = tmp_path / "sen-counts.csv"
+    tampered.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    with pytest.raises(SourceDataError, match="reviewed|provenance"):
+        load_reviewed_school_counts(tampered)
+
+
+@pytest.mark.parametrize(
+    ("institution_type", "expected", "passing_actual", "failing_actual"),
+    [
+        ("ELEMENTARY_SCHOOL", 609, 603, 602),
+        ("MIDDLE_SCHOOL", 390, 387, 386),
+        ("HIGH_SCHOOL", 318, 315, 314),
+    ],
+)
+def test_school_reconciliation_checks_one_percent_per_category(
+    institution_type: str,
+    expected: int,
+    passing_actual: int,
+    failing_actual: int,
+) -> None:
+    benchmark = reviewed_counts_fixture({institution_type: expected})
+    passing = reconcile_selectable_school_counts(
+        records_for_type_counts({institution_type: passing_actual}),
+        benchmark=benchmark,
+    )
+    failing = reconcile_selectable_school_counts(
+        records_for_type_counts({institution_type: failing_actual}),
+        benchmark=benchmark,
+    )
+
+    assert passing["categories"][institution_type]["passed"] is True
+    assert passing["passed"] is True
+    assert failing["categories"][institution_type]["passed"] is False
+    assert failing["passed"] is False
+
+
+def test_school_reconciliation_cannot_hide_swapped_category_losses() -> None:
+    benchmark = reviewed_counts_fixture(
+        {"ELEMENTARY_SCHOOL": 609, "MIDDLE_SCHOOL": 390}
+    )
+    audit = reconcile_selectable_school_counts(
+        records_for_type_counts(
+            {"ELEMENTARY_SCHOOL": 599, "MIDDLE_SCHOOL": 400}
+        ),
+        benchmark=benchmark,
+    )
+
+    assert audit["categories"]["ELEMENTARY_SCHOOL"]["passed"] is False
+    assert audit["categories"]["MIDDLE_SCHOOL"]["passed"] is False
+    assert audit["passed"] is False
+
+
+def test_school_reconciliation_passes_reviewed_real_count_fixture() -> None:
+    benchmark = load_reviewed_school_counts(
+        SOURCE_RESOURCES / "sen-annual-school-counts.csv"
+    )
+    audit = reconcile_selectable_school_counts(
+        records_for_type_counts(benchmark.counts),
+        benchmark=benchmark,
+    )
+
+    assert audit["passed"] is True
+    assert audit["reportedTotals"] == [
+        {
+            "expectedCount": 2_092,
+            "actualCount": 2_092,
+            "population": (
+                "KINDERGARTEN+ELEMENTARY_SCHOOL+MIDDLE_SCHOOL+"
+                "HIGH_SCHOOL+SPECIAL_SCHOOL+MISC_SCHOOL"
+            ),
+            "usedForGate": False,
+            "passed": None,
+            "sourceUrl": (
+                "https://enews.sen.go.kr/uploads/img_smart//"
+                "2026-06-08/20260608075519432.png"
+            ),
+            "sourceAsOf": "2026-03-10",
+            "sourceSha256": (
+                "6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a170"
+                "5db508afeee15e70"
+            ),
+            "evidenceStatus": "PRELIMINARY_2026",
+        }
+    ]
+    assert (
+        audit["categories"]["KINDERGARTEN"]["sourceAsOf"]
+        == "2026-03-10"
+    )
+    assert (
+        audit["categories"]["ELEMENTARY_SCHOOL"]["sourceAsOf"]
+        == "2026-03-10"
+    )
+    assert audit["categories"]["MISC_SCHOOL"]["composition"] == (
+        "각종학교17+고등기술학교1"
+    )
+    assert all(
+        category["deltaCount"] == 0
+        for category in audit["categories"].values()
+    )
+
+
+def test_school_reconciliation_rejects_actual_source_contamination() -> None:
+    benchmark = reviewed_counts_fixture({"KINDERGARTEN": 1})
+    contaminated = (
+        replace(
+            source_record(),
+            institution_type="KINDERGARTEN",
+            source="NEIS",
+            institution_id="neis:B10:7010001",
+        ),
+    )
+
+    audit = reconcile_selectable_school_counts(
+        contaminated,
+        benchmark=benchmark,
+    )
+
+    assert audit["categories"]["KINDERGARTEN"]["sourceValidationPassed"] is False
+    assert audit["categories"]["KINDERGARTEN"]["passed"] is False
+    assert audit["passed"] is False
+
+
+def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    records = records_for_type_counts({"ELEMENTARY_SCHOOL": 602})
+    reconciliation = reconcile_selectable_school_counts(
         records,
-        expected_count=100,
+        benchmark=reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 609}),
     )
-    assert boundary["passed"] is True
-    assert boundary["deltaRatio"] == 0.01
+    provenance = source_provenance_for(records)["NEIS"]
+    audit = build_sync_preflight_audit(
+        records,
+        source_provenance={provenance.source: provenance},
+        reconciliation=reconciliation,
+    )
 
-    with pytest.raises(SnapshotQualityError, match="reconciliation"):
-        reconcile_selectable_school_counts(records[:-1], expected_count=100)
+    with pytest.raises(
+        SnapshotQualityError,
+        match="official school count reconciliation failed",
+    ):
+        emit_sync_preflight_audit(audit)
+
+    output = capsys.readouterr()
+    parsed = json.loads(output.out)
+    assert parsed["auditStage"] == "PRE_PROMOTION_RECONCILIATION"
+    assert parsed["passed"] is False
+    assert parsed["reconciliation"]["passed"] is False
+    assert parsed["typeCounts"] == {"ELEMENTARY_SCHOOL": 602}
+    assert parsed["sourceCounts"]["NEIS"]["normalized"] == 602
+    assert len(parsed["districtCounts"]) == 25
+    assert "statusCounts" in parsed
+    assert "quarantinedInstitutionIds" in parsed
+    assert "quarantinedSiteIds" in parsed
+    assert output.err == ""
+
+
+@pytest.mark.asyncio
+async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script_path = Path("apps/travel-map/scripts/sync-institutions.py")
+    spec = importlib.util.spec_from_file_location("sync_institutions_cli", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    neis_records = records_for_type_counts({"ELEMENTARY_SCHOOL": 602})
+    neis_provenance = source_provenance_for(neis_records)["NEIS"]
+    empty_kindergarten_provenance = SourceProvenance(
+        source="KINDERGARTEN_INFO",
+        endpoint="https://e-childschoolinfo.moe.go.kr/api/notice/basicInfo2.do",
+        license_name="PUBLIC_DATA_PORTAL_TERMS",
+        attribution="Ministry of Education Kindergarten Info",
+        fetched_at="2026-08-10T09:00:00Z",
+        source_as_of="2026-03-10",
+        raw_sha256="b" * 64,
+        page_count=25,
+        row_count=0,
+        fetched_row_count=0,
+        request_region_code="11",
+        request_timing="20261",
+        normalized_sha256=normalized_records_sha256(()),
+    )
+
+    class FakeAsyncClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class FakeNeisSource:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def fetch(self) -> SourceFetchResult:
+            return SourceFetchResult(neis_records, neis_provenance)
+
+    class FakeKindergartenSource:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def fetch(self) -> SourceFetchResult:
+            return SourceFetchResult((), empty_kindergarten_provenance)
+
+    class FakeStandardSource:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def fetch(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                locations=(),
+                provenance=standard_enrichment_provenance(matched_row_count=0),
+            )
+
+    class ForbiddenKakaoClient:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("Kakao must not be created before reconciliation")
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(module, "NeisSource", FakeNeisSource)
+    monkeypatch.setattr(module, "KindergartenSource", FakeKindergartenSource)
+    monkeypatch.setattr(module, "StandardSchoolLocationSource", FakeStandardSource)
+    monkeypatch.setattr(module, "KakaoLocalClient", ForbiddenKakaoClient)
+    monkeypatch.setattr(
+        module,
+        "load_reviewed_school_counts",
+        lambda _path: reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 609}),
+    )
+    snapshot_root = tmp_path / "snapshots"
+    args = argparse.Namespace(
+        sen_csv=SOURCE_RESOURCES / "sen-institutions.csv",
+        region_codes=SOURCE_RESOURCES / "kindergarten-region-codes.csv",
+        school_counts=SOURCE_RESOURCES / "sen-annual-school-counts.csv",
+        snapshot_root=snapshot_root,
+        geodata_root=Path("apps/travel-map/resources/geodata"),
+        timing="20261",
+        snapshot_id="must-not-build",
+    )
+
+    with pytest.raises(
+        SnapshotQualityError,
+        match="official school count reconciliation failed",
+    ):
+        await module._run_with_keys(
+            args,
+            {
+                "NEIS_API_KEY": "neis-test",
+                "KINDERGARTEN_API_KEY": "kindergarten-test",
+                "KAKAO_REST_API_KEY": "kakao-test",
+            },
+            [],
+        )
+
+    audit = json.loads(capsys.readouterr().out)
+    assert audit["reconciliation"]["passed"] is False
+    assert audit["passed"] is False
+    assert not snapshot_root.exists()
 
 
 @pytest.mark.parametrize(
     ("old", "new"),
     [
         (
-            "9f202202edc653b09b4debb5a0ff939cf9fcdc64dd58174b28f8d009bb1b7424",
+            "69863ac78689fb4b6e9941aabea03c3c1d618ccb26568e844079afd9092eb2c2",
             "f" * 64,
         ),
         (
@@ -726,7 +1294,35 @@ async def test_neis_source_rejects_mixed_load_dates_across_pages() -> None:
         transport=httpx.MockTransport(handler)
     ) as client:
         source = NeisSource(api_key="test-key", client=client, page_size=1)
-        with pytest.raises(SourceDataError, match="source_as_of"):
+        with pytest.raises(
+            SourceDataError,
+            match="^NEIS source contains multiple raw LOAD_DTM dates across pages$",
+        ):
+            await source.fetch()
+
+
+@pytest.mark.asyncio
+async def test_neis_source_rejects_different_date_on_excluded_only_page() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["pIndex"])
+        payload = neis_payload(
+            source_type=("초등학교" if page == 1 else "공동실습소")
+        )
+        section = payload["schoolInfo"]
+        section[0]["head"][0]["list_total_count"] = 2  # type: ignore[index]
+        row = section[1]["row"][0]  # type: ignore[index]
+        row["SD_SCHUL_CODE"] = f"701000{page}"
+        row["LOAD_DTM"] = "20260810" if page == 1 else "20260809"
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        source = NeisSource(api_key="test-key", client=client, page_size=1)
+        with pytest.raises(
+            SourceDataError,
+            match="^NEIS source contains multiple raw LOAD_DTM dates across pages$",
+        ):
             await source.fetch()
 
 
@@ -1965,6 +2561,157 @@ def test_promotion_rejects_replacement_acquisition_provenance(
     assert not (tmp_path / "current.json").exists()
 
 
+def test_public_result_cannot_authorize_replaced_raw_provenance(
+    tmp_path: Path,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="forged-public-attestations",
+        coverage=TEST_COVERAGE,
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sources"][0]["rawSha256"] = "f" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    forged = replace(candidate, issues=())
+
+    with pytest.raises(SnapshotQualityError, match="transaction attestation"):
+        promote_snapshot(forged, tmp_path, coverage=TEST_COVERAGE)
+    assert not (tmp_path / "current.json").exists()
+
+
+def test_builder_writes_private_root_transaction_without_source_pii(
+    tmp_path: Path,
+) -> None:
+    record = source_record()
+    candidate = build_test_candidate(
+        records=(record,),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="durable-transaction",
+        coverage=TEST_COVERAGE,
+    )
+    key_path = tmp_path / ".sync-attestation.key"
+    receipt_path = tmp_path / ".sync-transactions" / "durable-transaction.json"
+
+    assert key_path.is_file()
+    assert key_path.stat().st_mode & 0o777 == 0o600
+    assert receipt_path.is_file()
+    assert candidate.candidate_path not in receipt_path.parents
+    receipt_text = receipt_path.read_text(encoding="utf-8")
+    assert record.official_name not in receipt_text
+    assert record.road_address not in receipt_text
+
+
+def test_builder_fsyncs_existing_root_before_durable_transaction_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="transaction-bootstrap",
+        coverage=TEST_COVERAGE,
+    )
+    events: list[tuple[str, Path]] = []
+    real_fsync_directory = sync_module._fsync_directory
+    real_replace = os.replace
+
+    def record_fsync(path: Path) -> None:
+        events.append(("fsync", Path(path)))
+        real_fsync_directory(path)
+
+    def record_replace(source: str | Path, destination: str | Path) -> None:
+        destination_path = Path(destination)
+        if destination_path.parent.name == ".sync-transactions":
+            events.append(("receipt-replace", destination_path))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(sync_module, "_fsync_directory", record_fsync)
+    monkeypatch.setattr(os, "replace", record_replace)
+    second = build_test_candidate(
+        records=(source_record(institution_id="neis:B10:7010002"),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="transaction-after-bootstrap",
+        coverage=TEST_COVERAGE,
+    )
+
+    receipt_index = next(
+        index for index, event in enumerate(events) if event[0] == "receipt-replace"
+    )
+    candidate_fsync_index = events.index(("fsync", second.candidate_path))
+    root_fsync_indices = [
+        index
+        for index, event in enumerate(events)
+        if event == ("fsync", tmp_path.resolve())
+    ]
+    assert candidate_fsync_index < root_fsync_indices[-1] < receipt_index
+
+
+@pytest.mark.parametrize("mutation", ["missing", "tampered"])
+def test_promotion_rejects_missing_or_tampered_build_transaction(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id=f"{mutation}-transaction",
+        coverage=TEST_COVERAGE,
+    )
+    receipt_path = (
+        tmp_path / ".sync-transactions" / f"{candidate.snapshot_id}.json"
+    )
+    if mutation == "missing":
+        receipt_path.unlink()
+    else:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["manifestSha256"] = "f" * 64
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(SnapshotQualityError, match="transaction"):
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    assert not (tmp_path / "current.json").exists()
+
+
+def test_build_transaction_cannot_be_copied_between_output_roots(
+    tmp_path: Path,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=first_root,
+        snapshot_id="copied-transaction",
+        coverage=TEST_COVERAGE,
+    )
+    second = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=second_root,
+        snapshot_id="copied-transaction",
+        coverage=TEST_COVERAGE,
+    )
+    first_receipt = (
+        first_root / ".sync-transactions" / "copied-transaction.json"
+    )
+    second_receipt = (
+        second_root / ".sync-transactions" / "copied-transaction.json"
+    )
+    second_receipt.write_bytes(first_receipt.read_bytes())
+
+    with pytest.raises(SnapshotQualityError, match="transaction attestation"):
+        promote_snapshot(second, second_root, coverage=TEST_COVERAGE)
+    assert not (second_root / "current.json").exists()
+    assert first.candidate_path.is_dir()
+
+
 def test_standard_enrichment_binds_selected_site_mapping(
     tmp_path: Path,
 ) -> None:
@@ -2032,7 +2779,7 @@ def test_promotion_runs_task3_strict_checks_before_pointer(
     manifest["institutionsSha256"] = hashlib.sha256(institution_bytes).hexdigest()
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(SnapshotQualityError, match="strict snapshot verification"):
+    with pytest.raises(SnapshotQualityError, match="transaction attestation"):
         promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
@@ -2292,6 +3039,192 @@ def test_pointer_replace_failure_is_recoverable(
     monkeypatch.setattr(os, "replace", real_replace)
     promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert verify_snapshot(tmp_path).manifest.snapshot_id == "recoverable"
+
+
+def test_pointer_failure_restart_uses_durable_transaction_not_result_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="restart-from-transaction",
+        coverage=TEST_COVERAGE,
+    )
+    real_replace = os.replace
+
+    def fail_pointer(source: str | Path, destination: str | Path) -> None:
+        if Path(destination).name == "current.json":
+            raise OSError("simulated pointer failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_pointer)
+    with pytest.raises(OSError, match="simulated pointer failure"):
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    monkeypatch.setattr(os, "replace", real_replace)
+    snapshot_id = candidate.snapshot_id
+    candidate_path = candidate.candidate_path
+    del candidate
+    restarted = SnapshotBuildResult(
+        snapshot_id=snapshot_id,
+        candidate_path=candidate_path,
+        approved=False,
+        issues=(),
+    )
+
+    promote_snapshot(restarted, tmp_path, coverage=TEST_COVERAGE)
+    assert verify_snapshot(tmp_path).manifest.snapshot_id == snapshot_id
+
+
+def test_restart_after_pointer_fsync_before_published_phase_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="pointer-written-before-phase",
+        coverage=TEST_COVERAGE,
+    )
+    real_advance = sync_module._advance_build_transaction
+
+    def fail_published_phase(
+        root: Path,
+        transaction: Mapping[str, object],
+        *,
+        phase: str,
+        approved_manifest: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        if phase == "PUBLISHED":
+            raise OSError("simulated crash before published receipt")
+        return real_advance(
+            root,
+            transaction,
+            phase=phase,
+            approved_manifest=approved_manifest,
+        )
+
+    monkeypatch.setattr(
+        sync_module,
+        "_advance_build_transaction",
+        fail_published_phase,
+    )
+    with pytest.raises(OSError, match="before published receipt"):
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    receipt_path = (
+        tmp_path
+        / ".sync-transactions"
+        / "pointer-written-before-phase.json"
+    )
+    assert json.loads(receipt_path.read_text(encoding="utf-8"))["phase"] == (
+        "POINTER_PREPARED"
+    )
+    monkeypatch.setattr(
+        sync_module,
+        "_advance_build_transaction",
+        real_advance,
+    )
+    restarted = SnapshotBuildResult(
+        snapshot_id=candidate.snapshot_id,
+        candidate_path=candidate.candidate_path,
+        approved=False,
+        issues=(),
+    )
+
+    promote_snapshot(restarted, tmp_path, coverage=TEST_COVERAGE)
+
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+    assert json.loads(receipt_path.read_text(encoding="utf-8"))["phase"] == (
+        "PUBLISHED"
+    )
+    assert verify_snapshot(tmp_path).manifest.snapshot_id == candidate.snapshot_id
+
+
+def test_published_transaction_cannot_authorize_a_different_current_pointer(
+    tmp_path: Path,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="published-pointer-binding",
+        coverage=TEST_COVERAGE,
+    )
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    (tmp_path / "current.json").write_text(
+        json.dumps({"snapshotId": "different-snapshot"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SnapshotQualityError, match="pointer|current snapshot"):
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+
+    assert json.loads((tmp_path / "current.json").read_text(encoding="utf-8")) == {
+        "snapshotId": "different-snapshot"
+    }
+
+
+def test_pointer_failure_rejects_changed_attested_approval_timestamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="changed-approved-at",
+        coverage=TEST_COVERAGE,
+    )
+    real_replace = os.replace
+
+    def fail_pointer(source: str | Path, destination: str | Path) -> None:
+        if Path(destination).name == "current.json":
+            raise OSError("simulated pointer failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_pointer)
+    with pytest.raises(OSError, match="simulated pointer failure"):
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    monkeypatch.setattr(os, "replace", real_replace)
+    manifest_path = tmp_path / candidate.snapshot_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["approvedAt"] = "2099-01-01T00:00:00Z"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SnapshotQualityError, match="approval phase"):
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    assert not (tmp_path / "current.json").exists()
+
+
+def test_forged_approved_final_without_attested_phase_is_rejected(
+    tmp_path: Path,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="forged-approved-final",
+        coverage=TEST_COVERAGE,
+    )
+    final_path = tmp_path / candidate.snapshot_id
+    os.replace(candidate.candidate_path, final_path)
+    manifest_path = final_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(
+        {
+            "approved": True,
+            "approvedAt": manifest["createdAt"],
+            "approvedByRole": "data-steward",
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SnapshotQualityError, match="approval phase"):
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    assert not (tmp_path / "current.json").exists()
 
 
 def test_manifest_replace_failure_is_recoverable(
@@ -2628,13 +3561,17 @@ def source_provenance_for(
             fetched_at="2026-08-10T09:00:00Z",
             source_as_of=max(record.source_as_of for record in source_records),
             raw_sha256=(
-                "9f202202edc653b09b4debb5a0ff939cf9fcdc64dd58174b28f8d009bb1b7424"
+                "69863ac78689fb4b6e9941aabea03c3c1d618ccb26568e844079afd9092eb2c2"
                 if source == "SEN_REVIEWED_CSV"
                 else "a" * 64
             ),
             page_count=(25 if source == "KINDERGARTEN_INFO" else 1),
             row_count=len(source_records),
-            fetched_row_count=len(source_records),
+            fetched_row_count=(
+                len(source_records) + 1
+                if source == "SEN_REVIEWED_CSV"
+                else len(source_records)
+            ),
             request_region_code=regions[source],
             request_timing=(
                 "20261" if source == "KINDERGARTEN_INFO" else None
@@ -2708,6 +3645,66 @@ def _before_enrichment(
             for site in record.additional_sites
         ),
     )
+
+
+def reviewed_counts_fixture(counts: Mapping[str, int]) -> ReviewedSchoolCounts:
+    evidence = SchoolCountEvidence(
+        source_url=(
+            "https://enews.sen.go.kr/uploads/img_smart//"
+            "2026-06-08/20260608075519432.png"
+        ),
+        source_as_of="2026-03-10",
+        source_sha256=(
+            "6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70"
+        ),
+        status="PRELIMINARY_2026",
+    )
+    return ReviewedSchoolCounts(
+        normalized_sha256="a" * 64,
+        license_name="KOGL_TYPE_1_ATTRIBUTION",
+        attribution="Source: Seoul Metropolitan Office of Education",
+        counts=dict(counts),
+        category_evidence={name: evidence for name in counts},
+        category_composition={name: name for name in counts},
+        reported_totals=(
+            ReportedSchoolTotal(
+                expected_count=sum(counts.values()),
+                population="+".join(counts),
+                used_for_gate=False,
+                evidence=evidence,
+            ),
+        ),
+    )
+
+
+def records_for_type_counts(
+    counts: Mapping[str, int],
+) -> tuple[SourceInstitutionRecord, ...]:
+    records: list[SourceInstitutionRecord] = []
+    sequence = 1
+    for institution_type, count in counts.items():
+        for _ in range(count):
+            source = (
+                "KINDERGARTEN_INFO"
+                if institution_type == "KINDERGARTEN"
+                else "NEIS"
+            )
+            institution_id = (
+                f"kindergarten:{sequence:07d}"
+                if source == "KINDERGARTEN_INFO"
+                else f"neis:B10:{sequence:07d}"
+            )
+            records.append(
+                replace(
+                    source_record(
+                        institution_id=institution_id
+                    ),
+                    institution_type=institution_type,
+                    source=source,
+                )
+            )
+            sequence += 1
+    return tuple(records)
 
 
 def source_record(

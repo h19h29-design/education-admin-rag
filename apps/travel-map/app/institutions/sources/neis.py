@@ -75,6 +75,7 @@ class NeisSource:
         pages: list[bytes] = []
         records: list[SourceInstitutionRecord] = []
         seen_page_ids: set[tuple[str, ...]] = set()
+        raw_source_dates: set[str] = set()
         declared_total: int | None = None
         raw_row_count = 0
         cumulative_raw_bytes = 0
@@ -114,6 +115,11 @@ class NeisSource:
             elif total != declared_total:
                 raise SourceDataError("NEIS list_total_count changed during pagination")
             raw_rows = _neis_rows(payload)
+            raw_source_dates.update(_raw_neis_load_dates(raw_rows))
+            if len(raw_source_dates) > 1:
+                raise SourceDataError(
+                    "NEIS source contains multiple raw LOAD_DTM dates across pages"
+                )
             if len(raw_rows) > self._page_size:
                 raise SourceDataError("NEIS returned more rows than requested page size")
             if raw_row_count + len(raw_rows) > declared_total:
@@ -144,14 +150,11 @@ class NeisSource:
             page += 1
         if raw_row_count != declared_total:
             raise SourceDataError("NEIS row count does not match list_total_count")
-        source_dates = {record.source_as_of for record in records}
         if not records:
             raise SourceDataError("NEIS returned no selectable source rows")
-        if len(source_dates) != 1:
-            raise SourceDataError(
-                "NEIS records must have one exact source_as_of across all pages"
-            )
-        source_as_of = source_dates.pop()
+        if len(raw_source_dates) != 1:
+            raise SourceDataError("NEIS raw source date is missing")
+        source_as_of = raw_source_dates.pop()
         return SourceFetchResult(
             records=tuple(records),
             provenance=SourceProvenance(
@@ -174,6 +177,9 @@ class NeisSource:
 
 def parse_neis_rows(payload: Mapping[str, object]) -> tuple[SourceInstitutionRecord, ...]:
     rows = _neis_rows(payload)
+    raw_source_dates = _raw_neis_load_dates(rows)
+    if len(raw_source_dates) > 1:
+        raise SourceDataError("NEIS page contains multiple raw LOAD_DTM dates")
 
     selectable_rows = [
         row
@@ -203,6 +209,16 @@ def parse_neis_rows(payload: Mapping[str, object]) -> tuple[SourceInstitutionRec
         )
         for record, _ in parsed_rows
     )
+
+
+def _raw_neis_load_dates(rows: list[object]) -> set[str]:
+    try:
+        return {
+            _yyyymmdd_as_iso(_required_string_from_object(row, "LOAD_DTM"))
+            for row in rows
+        }
+    except ValueError as exc:
+        raise SourceDataError("NEIS row contains an unsupported value") from exc
 
 
 def _neis_rows(payload: Mapping[str, object]) -> list[object]:

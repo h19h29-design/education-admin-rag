@@ -1,0 +1,22 @@
+# normalized_sha256=36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332
+# license_name=KOGL_TYPE_1_ATTRIBUTION
+# attribution=Source: Seoul Metropolitan Office of Education school statistics
+# detailed_corroborating_url=https://www.sen.go.kr/www/information/statistics/statistics_2/statistics_2025.jsp
+# detailed_corroborating_raw_sha256=8d3791e2ebf84799c7af53be0d662a4eaeb922bab3e85f0c82fe08793b1bd26b
+# preliminary_table_source_url=https://enews.sen.go.kr/uploads/img_smart//2026-06-08/20260608075519432.png
+# preliminary_table_source_raw_sha256=6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70
+# misc_school_composition=각종학교17+고등기술학교1
+# reported_total_count=2092
+# reported_total_population=KINDERGARTEN+ELEMENTARY_SCHOOL+MIDDLE_SCHOOL+HIGH_SCHOOL+SPECIAL_SCHOOL+MISC_SCHOOL
+# reported_total_evidence_url=https://enews.sen.go.kr/uploads/img_smart//2026-06-08/20260608075519432.png
+# reported_total_evidence_as_of=2026-03-10
+# reported_total_evidence_raw_sha256=6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70
+# reported_total_evidence_status=PRELIMINARY_2026
+# reported_total_used_for_gate=false
+institution_type,count,evidence_url,evidence_as_of,evidence_raw_sha256,evidence_status
+KINDERGARTEN,724,https://enews.sen.go.kr/uploads/img_smart//2026-06-08/20260608075519432.png,2026-03-10,6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70,PRELIMINARY_2026
+ELEMENTARY_SCHOOL,609,https://enews.sen.go.kr/uploads/img_smart//2026-06-08/20260608075519432.png,2026-03-10,6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70,PRELIMINARY_2026
+MIDDLE_SCHOOL,390,https://enews.sen.go.kr/uploads/img_smart//2026-06-08/20260608075519432.png,2026-03-10,6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70,PRELIMINARY_2026
+HIGH_SCHOOL,319,https://enews.sen.go.kr/uploads/img_smart//2026-06-08/20260608075519432.png,2026-03-10,6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70,PRELIMINARY_2026
+SPECIAL_SCHOOL,32,https://enews.sen.go.kr/uploads/img_smart//2026-06-08/20260608075519432.png,2026-03-10,6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70,PRELIMINARY_2026
+MISC_SCHOOL,18,https://enews.sen.go.kr/uploads/img_smart//2026-06-08/20260608075519432.png,2026-03-10,6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70,PRELIMINARY_2026

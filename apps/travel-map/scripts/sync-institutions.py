@@ -15,6 +15,7 @@ from app.institutions.sources.common import EnrichmentProvenance, SourceDataErro
 from app.institutions.sources.kindergarten import KindergartenSource
 from app.institutions.sources.neis import NeisSource
 from app.institutions.sources.sen import SenCsvSource
+from app.institutions.sources.sen_counts import load_reviewed_school_counts
 from app.institutions.sources.standard_school import (
     StandardSchoolLocationSource,
     enrich_neis_coordinates,
@@ -22,6 +23,8 @@ from app.institutions.sources.standard_school import (
 from app.institutions.sync import (
     SnapshotQualityError,
     build_candidate_snapshot,
+    build_sync_preflight_audit,
+    emit_sync_preflight_audit,
     enrichment_records_sha256,
     geocode_missing_records,
     promote_snapshot,
@@ -59,6 +62,14 @@ def parse_args() -> argparse.Namespace:
         default=Path(
             "apps/travel-map/resources/institution-sources/"
             "kindergarten-region-codes.csv"
+        ),
+    )
+    parser.add_argument(
+        "--school-counts",
+        type=Path,
+        default=Path(
+            "apps/travel-map/resources/institution-sources/"
+            "sen-annual-school-counts.csv"
         ),
     )
     parser.add_argument(
@@ -121,12 +132,28 @@ async def _run_with_keys(
             neis_result.records,
             standard_result.locations,
         )
+        benchmark = load_reviewed_school_counts(args.school_counts)
         reconciliation = reconcile_selectable_school_counts(
-            neis_records,
-            expected_count=len(standard_result.locations),
+            neis_result.records + kindergarten_result.records,
+            benchmark=benchmark,
         )
         all_records = (
             neis_records + kindergarten_result.records + sen_result.records
+        )
+        source_provenance = {
+            item.source: item
+            for item in (
+                neis_result.provenance,
+                kindergarten_result.provenance,
+                sen_result.provenance,
+            )
+        }
+        emit_sync_preflight_audit(
+            build_sync_preflight_audit(
+                all_records,
+                source_provenance=source_provenance,
+                reconciliation=reconciliation,
+            )
         )
         geocoder = KakaoLocalClient(
             api_key=keys["KAKAO_REST_API_KEY"],
@@ -146,14 +173,6 @@ async def _run_with_keys(
         buffer_distance_m=12_000,
     )
     snapshot_id = args.snapshot_id or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    provenance = {
-        item.source: item
-        for item in (
-            neis_result.provenance,
-            kindergarten_result.provenance,
-            sen_result.provenance,
-        )
-    }
     standard_provenance = replace(
         standard_result.provenance,
         matched_row_count=sum(
@@ -183,7 +202,7 @@ async def _run_with_keys(
         output_root=args.snapshot_root,
         snapshot_id=snapshot_id,
         coverage=coverage,
-        source_provenance=provenance,
+        source_provenance=source_provenance,
         enrichment_provenance=enrichments,
     )
     if candidate.issues:

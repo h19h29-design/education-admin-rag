@@ -4,6 +4,70 @@ Date: 2026-08-10 KST
 
 Fix-round base: 59e78a1b1ae9425b40b389894bfa19658ccad8d6
 
+Fix-round-2 base: 8c416b0dc6a1a3c9428bd3990fa54f2b54464c07
+
+Round-2 verification date: 2026-08-11 KST
+
+Round-2 status: READY. The independent fixed-point reviewer found no reproducible
+blocker across all five findings. No production pointer was created.
+
+## Fix round 2 - durable acquisition attestations and reviewed multi-site data
+
+This section supersedes the round-1 statements about in-memory attestations,
+coordinate-attachment count reconciliation, and the single-site SEN resource.
+
+- NEIS now rejects more than one raw `LOAD_DTM` within a page and across pages,
+  including rows explicitly excluded from selectable output. One excluded-only page
+  can no longer disappear from the raw-vintage contract.
+- The builder creates a root-scoped HMAC transaction receipt outside the candidate.
+  A mode-0600 random key signs the exact unapproved manifest, source/enrichment
+  acquisitions, persisted hashes, issues, previous pointer and phase. Promotion
+  trusts the signed receipt under the root lock, not caller-replaceable fields in
+  `SnapshotBuildResult`.
+- Durable phases are `BUILT`, `MOVED`, `APPROVAL_PREPARED`, `VERIFIED`,
+  `POINTER_PREPARED`, and `PUBLISHED`. Exact approval bytes/timestamp/role are signed
+  before replacing the manifest. Tests cover forged raw evidence, copied/tampered
+  receipts, manually moved approved directories, changed approval timestamps,
+  pointer failure/restart, and a crash after pointer fsync but before the final phase.
+- School completeness uses a reviewed category resource rather than the coordinate
+  attachment. All categories are pinned to the official 2026-03-10 preliminary
+  table: kindergarten 724, elementary 609, middle 390, high school 319, special 32,
+  and miscellaneous 18 (`각종학교 17 + 고등기술학교 1`). Every category exposes the
+  table URL/date/raw hash/preliminary status and must independently stay within 1%;
+  the reported 2,092 total is informational (`usedForGate=false`) and never masks a
+  category loss.
+- Reconciliation also enforces actual population sources: kindergarten rows must be
+  `KINDERGARTEN_INFO`, while every school category must be `NEIS`, with one exact
+  source date. Before any Kakao call or candidate creation the CLI prints and flushes
+  privacy-safe JSON containing source/type/foundation/all-25-district/status counts,
+  quarantine IDs and every category delta/evidence. A failing audit exits nonzero.
+- The reviewed SEN resource is now 42 physical site rows grouped into 41 institutions.
+  `sen:gangseo-library` has exactly one default `:main` site (`본관`) and the official
+  `sen:gangseo-library:gayang` site (`가양관`). The official main and Gayang directions
+  pages, their raw hashes, the directory hash, canonical CSV digest and canonical
+  41-record digest are separately pinned. No telephone/fax/homepage field is modeled.
+- A missing coordinate on the default SEN site no longer rejects its branches. Both
+  unresolved main and Gayang sites remain inspectable `REVIEW_REQUIRED` evidence;
+  after exact geocoding both survive promotion and are independently searchable route
+  origins. Duplicate site codes, multiple defaults and conflicting institution rows
+  fail closed.
+
+Round-2 RED evidence included mixed dates hidden in excluded NEIS rows, recomputable
+public raw-provenance attestations, a forged approved final, count failure before any
+audit output, inability to represent Gayang, and a crash window after pointer fsync.
+
+Round-2 GREEN verification so far:
+
+- Focused sync: 153 passed with `PYTHONWARNINGS=error`.
+- All institution tests: 301 passed with `PYTHONWARNINGS=error`.
+- Full app tests: 398 passed with `PYTHONWARNINGS=error`.
+- Targeted attack/restart replay: 15 passed.
+- Ruff: all checks passed.
+- mypy: success in 27 application/script source files.
+- Git diff, privacy-field and literal-secret scans: clean.
+- Live credential-free replay: pinned SHA-256, 12,011 nationwide rows and 1,313
+  unique Seoul rows (606 elementary, 388 middle, 319 high) all reproduced.
+
 ## Fix round 1 - promotion and provenance hardening
 
 The independent review findings were reproduced with failing tests before each
@@ -198,19 +262,42 @@ subset was not promoted.
 
 - Directory: https://www.sen.go.kr/www/website.jsp
 - Count corroboration:
-  https://www.sen.go.kr/resources/www/data/policydata1_9.pdf and
+  https://www.sen.go.kr/resources/www/data/policydata1_9_2.pdf and
   https://www.sen.go.kr/resources/www/data/minwonservice_3.pdf
 - The reviewed resource pins the 2026-08-10 directory HTML SHA-256
   9f202202edc653b09b4debb5a0ff939cf9fcdc64dd58174b28f8d009bb1b7424.
-- Its canonical 41-record source digest is
-  79f7405bfb90c0848162dd6c9ca22487b10b9375df998efd5ad39ee9244efd9d;
+- Main/Gayang directions evidence is pinned from
+  https://gslib.sen.go.kr/gslib/html.do?menu_idx=52 (SHA-256
+  312ca8f63086188dabcb272ed3a2bfdfdb0d2c360f010cdc1fb59e6ff90288e7)
+  and https://gylib.sen.go.kr/gylib/html.do?menu_idx=43 (SHA-256
+  b3036767d04ef37b77d72c617ca21b052b83682eeab6f19ecb15a8a0aa54dd49).
+- Its canonical 42-row CSV digest is
+  c2b7e84c476175586b9f3764f54ee008fc35cb7831b4a8a0186ded9b608aac50;
+  its grouped 41-record source digest is
+  8cd2aa66f3df95a25a2127eaa2791e876f2d21cd7bc47aa700d34be75293b3b3;
   this remains distinct from the post-geocode persisted-output digest.
 - Count gates: headquarters 1, district offices 11, direct agencies 8,
-  lifelong-learning centers 4, libraries 17; 41 rows total.
-- Only official institution name, type, foundation, education office, road address,
-  and district are retained. Coordinates remain blank until exact Kakao geocoding.
-  The Student Education Institute's Gyeonggi address is expected to remain outside
-  Seoul quarantine.
+  lifelong-learning centers 4, libraries 17; 41 institutions and 42 physical site
+  rows total.
+- Only official institution/site name, type, foundation, education office, road
+  address and district are retained. Coordinates remain blank until exact Kakao
+  geocoding. The Student Education Institute's Gyeonggi address is expected to remain
+  outside Seoul quarantine. Gangseo Library retains one institution with default
+  `sen:gangseo-library:main` and branch `sen:gangseo-library:gayang` route origins.
+
+### Seoul school-count reconciliation
+
+- Official article:
+  https://enews.sen.go.kr/news/view.do?bbsSn=191455&step1=3&step2=1
+- Official attached table:
+  https://enews.sen.go.kr/uploads/img_smart//2026-06-08/20260608075519432.png
+- The table is the 2026-03-10 class-formation result and is explicitly preliminary
+  until the April 1 education statistics are finalized. Its pinned raw SHA-256 is
+  6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70.
+- Reviewed per-category gates are kindergarten 724, elementary 609, middle 390,
+  high 319, special 32, and miscellaneous 18 (`각종학교 17 + 고등기술학교 1`).
+  The reported total 2,092 is retained as informational evidence and is never used
+  to hide a failing category.
 
 ### Credential-free official school-location data
 
@@ -280,14 +367,14 @@ Verification recorded before the live date-format regression:
 - Ruff: All checks passed.
 - mypy: Success, no issues in 24 source files.
 
-Final verification immediately before commit:
+Final round-2 verification immediately before commit:
 
-- Focused sync: 123 passed with PYTHONWARNINGS=error.
-- All institution tests: 271 passed with PYTHONWARNINGS=error.
-- Full app tests: 368 passed with PYTHONWARNINGS=error.
+- Focused sync: 153 passed with PYTHONWARNINGS=error.
+- All institution tests: 301 passed with PYTHONWARNINGS=error.
+- Full app tests: 398 passed with PYTHONWARNINGS=error.
 - Ruff: All checks passed.
-- mypy: Success, no issues in 26 source files.
-- Atomic/path/provenance/secret replay subset: 20 passed.
+- mypy: Success, no issues in 27 source files.
+- Atomic/path/provenance/secret attack/restart subset: 15 passed.
 - Official keyless hash/count replay: 1,313 unique Seoul rows, elementary 606,
   middle 388, high 319, against the pinned 12,011-row attachment.
 
