@@ -1,7 +1,8 @@
 import asyncio
+from dataclasses import replace
 
 import pytest
-from app.routing.models import ProviderResult, TravelMode
+from app.routing.models import Coordinate, ProviderResult, ProviderWarning, TravelMode
 from app.routing.orchestrator import RouteOrchestrator
 from tests.routing.fakes import (
     ConcurrencyTracker,
@@ -389,3 +390,123 @@ async def test_orchestrator_rejects_route_mode_mismatch_and_falls_back() -> None
 
     assert [item.id for item in collection.routes] == ["right"]
     assert [warning.code for warning in collection.warnings] == ["MODE_MISMATCH"]
+
+
+# Break caught: presenting the public provider's endpoint chord as actual geometry.
+@pytest.mark.asyncio
+async def test_orchestrator_supplements_unique_matching_public_geometry_with_lineage() -> (
+    None
+):
+    placeholder = route(
+        "public",
+        seconds=2_820,
+        meters=14_600,
+        cost=None,
+        source="SEOUL_TRANSIT",
+        geometry=(Coordinate(37.55, 126.97), Coordinate(37.56, 126.98)),
+    )
+    placeholder = replace(
+        placeholder,
+        warnings=("GEOMETRY_MISSING", "FARE_MISSING"),
+    )
+    geometry = (
+        Coordinate(37.55, 126.97),
+        Coordinate(37.555, 126.975),
+        Coordinate(37.56, 126.98),
+    )
+    public = FakeProvider(
+        "SEOUL_TRANSIT",
+        ProviderResult(
+            provider="SEOUL_TRANSIT",
+            routes=(placeholder,),
+            warnings=(
+                ProviderWarning(
+                    code="GEOMETRY_MISSING",
+                    message="Public route geometry is unavailable",
+                    source="SEOUL_TRANSIT",
+                ),
+                ProviderWarning(
+                    code="FARE_MISSING",
+                    message="Public route fare is unavailable",
+                    source="SEOUL_TRANSIT",
+                ),
+            ),
+        ),
+    )
+    kakao = FakeProvider(
+        "KAKAO_TRANSIT",
+        result_with(
+            route(
+                "kakao",
+                seconds=2_820,
+                meters=14_600,
+                cost=1_550,
+                source="KAKAO_TRANSIT",
+                geometry=geometry,
+            )
+        ),
+    )
+    orchestrator = RouteOrchestrator(
+        {TravelMode.TRANSIT: (public, kakao)},
+        max_concurrency=1,
+    )
+
+    collection = await orchestrator.collect(base_query(), {TravelMode.TRANSIT})
+
+    assert len(collection.routes) == 1
+    enriched = collection.routes[0]
+    assert enriched.source == "SEOUL_TRANSIT+KAKAO_GEOMETRY"
+    assert enriched.geometry == geometry
+    assert enriched.duration_seconds == 2_820
+    assert enriched.distance_meters == 14_600
+    assert enriched.mobility_cost_krw is None
+    assert "GEOMETRY_MISSING" not in enriched.warnings
+    assert "GEOMETRY_SOURCE=KAKAO_TRANSIT:kakao" in enriched.warnings
+    assert [warning.code for warning in collection.warnings] == [
+        "GEOMETRY_MISSING",
+        "FARE_MISSING",
+        "GEOMETRY_SUPPLEMENTED",
+    ]
+
+
+# Break caught: attaching an arbitrary Kakao polyline when two candidates match.
+@pytest.mark.asyncio
+async def test_orchestrator_does_not_supplement_ambiguous_public_geometry() -> None:
+    placeholder = replace(
+        route(
+            "public",
+            seconds=1_000,
+            meters=10_000,
+            cost=None,
+            source="SEOUL_TRANSIT",
+        ),
+        warnings=("GEOMETRY_MISSING",),
+    )
+    public = FakeProvider(
+        "SEOUL_TRANSIT",
+        ProviderResult(provider="SEOUL_TRANSIT", routes=(placeholder,)),
+    )
+    alternatives = ProviderResult(
+        provider="KAKAO_TRANSIT",
+        routes=(
+            route("kakao-a", seconds=1_000, meters=10_000, source="KAKAO_TRANSIT"),
+            route("kakao-b", seconds=1_010, meters=10_100, source="KAKAO_TRANSIT"),
+        ),
+    )
+    kakao = FakeProvider("KAKAO_TRANSIT", alternatives)
+    orchestrator = RouteOrchestrator(
+        {TravelMode.TRANSIT: (public, kakao)},
+        max_concurrency=1,
+    )
+
+    collection = await orchestrator.collect(base_query(), {TravelMode.TRANSIT})
+
+    assert {route.source for route in collection.routes} == {"KAKAO_TRANSIT"}
+    assert not any(
+        "GEOMETRY_SOURCE=" in warning
+        for route in collection.routes
+        for warning in route.warnings
+    )
+    assert [warning.code for warning in collection.warnings] == [
+        "GEOMETRY_MATCH_AMBIGUOUS"
+    ]

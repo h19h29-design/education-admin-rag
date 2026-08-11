@@ -1,0 +1,17 @@
+{
+  "trans_id": "synthetic-contract-fixture",
+  "routes": [
+    {
+      "result_code": 0,
+      "result_msg": "길찾기 성공",
+      "summary": {"origin": {"name": "", "x": 126.9700, "y": 37.5500}, "destination": {"name": "", "x": 126.9900, "y": 37.5700}, "waypoints": [], "priority": "RECOMMEND", "bound": {"min_x": 126.9700, "min_y": 37.5500, "max_x": 126.9900, "max_y": 37.5700}, "fare": {"taxi": 24000, "toll": 1000}, "distance": 20000, "duration": 2400},
+      "sections": [{"distance": 20000, "duration": 2400, "bound": {"min_x": 126.9700, "min_y": 37.5500, "max_x": 126.9900, "max_y": 37.5700}, "roads": [{"name": "세종대로", "distance": 20000, "duration": 2400, "traffic_speed": 30.0, "traffic_state": 2, "vertexes": [126.9700, 37.5500, 126.9800, 37.5600, 126.9900, 37.5700]}], "guides": []}]
+    },
+    {
+      "result_code": 0,
+      "result_msg": "길찾기 성공",
+      "summary": {"origin": {"name": "", "x": 126.9700, "y": 37.5500}, "destination": {"name": "", "x": 126.9900, "y": 37.5700}, "waypoints": [], "priority": "RECOMMEND", "bound": {"min_x": 126.9700, "min_y": 37.5500, "max_x": 126.9910, "max_y": 37.5710}, "fare": {"taxi": 25000, "toll": 0}, "distance": 21000, "duration": 2300},
+      "sections": [{"distance": 21000, "duration": 2300, "bound": {"min_x": 126.9700, "min_y": 37.5500, "max_x": 126.9910, "max_y": 37.5710}, "roads": [{"name": "대안도로", "distance": 21000, "duration": 2300, "traffic_speed": 32.0, "traffic_state": 1, "vertexes": [126.9700, 37.5500, 126.9810, 37.5610, 126.9910, 37.5710]}], "guides": []}]
+    }
+  ]
+}

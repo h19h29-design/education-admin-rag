@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ServiceResult>
+  <comMsgHeader />
+  <msgHeader><headerCd>0</headerCd><headerMsg>정상적으로 처리되었습니다.</headerMsg><itemCount>1</itemCount></msgHeader>
+  <msgBody>
+    <itemList>
+      <distance>14600</distance><time>47</time>
+      <pathList><routeId>100100001</routeId><routeNm>7016</routeNm><fid>100000001</fid><fname>출발정류소</fname><fx>126.9700</fx><fy>37.5500</fy><tid>100000002</tid><tname>환승정류소</tname><tx>126.9750</tx><ty>37.5550</ty></pathList>
+      <pathList><routeId>2</routeId><routeNm>2호선</routeNm><fid>200</fid><fname>환승역</fname><fx>126.9750</fx><fy>37.5550</fy><tid>201</tid><tname>도착역</tname><tx>126.9800</tx><ty>37.5600</ty></pathList>
+    </itemList>
+  </msgBody>
+</ServiceResult>

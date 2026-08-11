@@ -1,0 +1,21 @@
+{
+  "status": "OK",
+  "properties": {"total": 3, "bus": 1, "subway": 1, "busAndSubway": 1, "landingURL": "https://map.kakao.com/"},
+  "routes": [
+    {
+      "properties": {"type": "BUS_AND_SUBWAY", "totalDistance": 14600, "totalTime": 2820, "transfers": 1, "fare": {"value": 1550, "min": 1550, "max": 1550}},
+      "steps": [
+        {"properties": {"guidance": "도보 이동", "type": "WALKING", "distance": 100, "time": 90, "stops": [], "vehicles": []}, "path": {"points": [[126.9700, 37.5500], [126.9750, 37.5550]]}},
+        {"properties": {"guidance": "대중교통 이동", "type": "SUBWAY", "distance": 14500, "time": 2730, "stops": [], "vehicles": []}, "path": {"points": [[126.9750, 37.5550], [126.9800, 37.5600]]}}
+      ]
+    },
+    {
+      "properties": {"type": "BUS", "totalDistance": 15000, "totalTime": 3000, "transfers": 0, "fare": {"value": 1500, "min": 1500, "max": 1500}},
+      "steps": [{"properties": {"guidance": "버스 이동", "type": "BUS", "distance": 15000, "time": 3000, "stops": [], "vehicles": []}, "path": {"points": [[126.9700, 37.5500], [126.9810, 37.5610]]}}]
+    },
+    {
+      "properties": {"type": "SUBWAY", "totalDistance": 14000, "totalTime": 3300, "transfers": 0, "fare": {"value": 1450, "min": 1450, "max": 1450}},
+      "steps": [{"properties": {"guidance": "지하철 이동", "type": "SUBWAY", "distance": 14000, "time": 3300, "stops": [], "vehicles": []}, "path": {"points": [[126.9700, 37.5500], [126.9790, 37.5590]]}}]
+    }
+  ]
+}

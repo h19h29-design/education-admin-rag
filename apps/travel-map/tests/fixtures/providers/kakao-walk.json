@@ -1,0 +1,15 @@
+{
+  "status": "OK",
+  "route": {
+    "properties": {"totalDistance": 4025, "totalTime": 3914, "landingUrl": "https://map.kakao.com/link/by/walk"},
+    "legs": [
+      {
+        "properties": {"distance": 4025, "time": 3914},
+        "steps": [
+          {"properties": {"distance": 2000, "time": 1900, "guidance": "직진", "x": 126.9700, "y": 37.5500}, "path": {"points": [[126.9700, 37.5500], [126.9750, 37.5550]]}},
+          {"properties": {"distance": 2025, "time": 2014, "guidance": "도착", "x": 126.9800, "y": 37.5600}, "path": {"points": [[126.9750, 37.5550], [126.9800, 37.5600]]}}
+        ]
+      }
+    ]
+  }
+}

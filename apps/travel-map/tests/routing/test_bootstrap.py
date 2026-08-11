@@ -42,12 +42,12 @@ def test_classification_provider_is_separate_distance_only_car_instance() -> Non
     assert display.alternatives is True
 
 
-# Break caught: placeholder factories fabricating plausible routes before adapters exist.
+# Break caught: development without keys making a network request or fake success.
 @pytest.mark.asyncio
-async def test_stage_a_placeholders_fail_closed_without_fake_routes() -> None:
+async def test_provider_factories_fail_closed_without_credentials() -> None:
     provider = build_route_providers(Settings())[TravelMode.TRANSIT][0]
 
     result = await provider.get_routes(base_query())
 
     assert result.routes == ()
-    assert [warning.code for warning in result.warnings] == ["PROVIDER_NOT_IMPLEMENTED"]
+    assert [warning.code for warning in result.warnings] == ["MISSING_CREDENTIAL"]

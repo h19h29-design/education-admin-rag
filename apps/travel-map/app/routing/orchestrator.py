@@ -2,9 +2,10 @@ import asyncio
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from inspect import iscoroutinefunction
-from math import isfinite
+from math import cos, isfinite, radians, sqrt
 
 from app.routing.models import (
+    Coordinate,
     ProviderResult,
     ProviderWarning,
     RouteCollection,
@@ -78,6 +79,13 @@ class RouteOrchestrator:
 
         unique_routes, duplicate_warnings = _drop_duplicate_route_ids(routes)
         warnings.extend(duplicate_warnings)
+        for route in unique_routes:
+            if route.source not in priorities and "+KAKAO_GEOMETRY" in route.source:
+                original_source = route.source.split("+", 1)[0]
+                priorities[route.source] = priorities.get(
+                    original_source,
+                    max(priorities.values(), default=-1) + 1,
+                )
         normalized_routes = deduplicate_routes(
             unique_routes,
             provider_priorities=priorities,
@@ -113,6 +121,7 @@ class RouteOrchestrator:
             return (), (warning,)
 
         warnings: list[ProviderWarning] = []
+        geometry_placeholders: ProviderResult | None = None
         for provider in chain:
             if mode not in provider.supported_modes:
                 warnings.append(
@@ -177,6 +186,21 @@ class RouteOrchestrator:
                 )
                 continue
             if result.routes:
+                if provider.name == "SEOUL_TRANSIT" and any(
+                    "GEOMETRY_MISSING" in route.warnings for route in result.routes
+                ):
+                    geometry_placeholders = result
+                    continue
+                if (
+                    geometry_placeholders is not None
+                    and provider.name == "KAKAO_TRANSIT"
+                ):
+                    supplemented, match_warning = _supplement_public_geometry(
+                        geometry_placeholders.routes,
+                        result.routes,
+                    )
+                    warnings.append(match_warning)
+                    return supplemented, tuple(warnings)
                 return result.routes, tuple(warnings)
             if not result.warnings:
                 warnings.append(
@@ -186,6 +210,14 @@ class RouteOrchestrator:
                         source=provider.name,
                     )
                 )
+        if geometry_placeholders is not None:
+            warnings.append(
+                ProviderWarning(
+                    code="GEOMETRY_UNAVAILABLE",
+                    message="No defensible geometry supplement was available",
+                    source="ROUTE_ORCHESTRATOR",
+                )
+            )
         return (), tuple(warnings)
 
 
@@ -228,3 +260,80 @@ def _validate_provider(provider: object) -> None:
         type(get_routes).__call__
     ):
         raise TypeError("provider get_routes must be async")
+
+
+def _supplement_public_geometry(
+    public_routes: tuple[RouteOption, ...],
+    kakao_routes: tuple[RouteOption, ...],
+) -> tuple[tuple[RouteOption, ...], ProviderWarning]:
+    matches: list[tuple[RouteOption, RouteOption]] = []
+    used_kakao_ids: set[str] = set()
+    for public_route in public_routes:
+        candidates = tuple(
+            kakao_route
+            for kakao_route in kakao_routes
+            if _geometry_candidate_matches(public_route, kakao_route)
+        )
+        if len(candidates) != 1 or candidates[0].id in used_kakao_ids:
+            return kakao_routes, ProviderWarning(
+                code=(
+                    "GEOMETRY_MATCH_AMBIGUOUS"
+                    if len(candidates) > 1 or candidates
+                    else "GEOMETRY_MATCH_NOT_FOUND"
+                ),
+                message="Public route geometry could not be matched uniquely",
+                source="ROUTE_ORCHESTRATOR",
+            )
+        used_kakao_ids.add(candidates[0].id)
+        matches.append((public_route, candidates[0]))
+
+    supplemented = tuple(
+        replace(
+            public_route,
+            id=f"{public_route.id}+geometry:{kakao_route.id}",
+            geometry=kakao_route.geometry,
+            source=f"{public_route.source}+KAKAO_GEOMETRY",
+            warnings=tuple(
+                warning
+                for warning in public_route.warnings
+                if warning != "GEOMETRY_MISSING"
+            )
+            + (f"GEOMETRY_SOURCE={kakao_route.source}:{kakao_route.id}",),
+        )
+        for public_route, kakao_route in matches
+    )
+    return supplemented, ProviderWarning(
+        code="GEOMETRY_SUPPLEMENTED",
+        message="Public route geometry was matched to a unique Kakao route",
+        source="ROUTE_ORCHESTRATOR",
+    )
+
+
+def _geometry_candidate_matches(public: RouteOption, candidate: RouteOption) -> bool:
+    if public.mode is not candidate.mode:
+        return False
+    if not _within_two_percent(public.duration_seconds, candidate.duration_seconds):
+        return False
+    if not _within_two_percent(public.distance_meters, candidate.distance_meters):
+        return False
+    return (
+        _coordinate_distance_meters(public.geometry[0], candidate.geometry[0]) <= 20.0
+        and _coordinate_distance_meters(public.geometry[-1], candidate.geometry[-1])
+        <= 20.0
+    )
+
+
+def _within_two_percent(left: int, right: int) -> bool:
+    denominator = max(left, right)
+    return denominator == 0 or abs(left - right) / denominator <= 0.02
+
+
+def _coordinate_distance_meters(left: Coordinate, right: Coordinate) -> float:
+    left_latitude = radians(left.latitude)
+    right_latitude = radians(right.latitude)
+    mean_latitude = (left_latitude + right_latitude) / 2.0
+    latitude_delta = right_latitude - left_latitude
+    longitude_delta = radians(right.longitude - left.longitude)
+    return 6_371_008.8 * sqrt(
+        latitude_delta**2 + (cos(mean_latitude) * longitude_delta) ** 2
+    )
