@@ -38,6 +38,20 @@ Register the exact public HTTPS app domain in Kakao Developers and restrict `KAK
 
 Production also requires explicit canonical HTTPS `ALLOWED_ORIGINS` and exact `ALLOWED_HOSTS`. The process fails before serving when they or runtime route credentials are incomplete.
 
+## Provider extension points
+
+Stage A fixes the registry order as Seoul Transit, Kakao Transit, Kakao Car,
+and Kakao Walk. The follow-on plans are
+[`docs/superpowers/plans/2026-08-10-seoul-public-road-routing-engine.md`](../../docs/superpowers/plans/2026-08-10-seoul-public-road-routing-engine.md)
+and
+[`docs/superpowers/plans/2026-08-10-seoul-public-walk-routing-engine.md`](../../docs/superpowers/plans/2026-08-10-seoul-public-walk-routing-engine.md).
+
+Stage B changes only `build_car_provider_chain()` and retains the WALK-chain
+regression test. Stage C changes only `build_walk_provider_chain()` and retains
+the CAR-chain regression test. A public provider must not be promoted ahead of
+Kakao as primary until it passes gold-route validation, missing-data detection,
+and performance and outage fallback verification.
+
 ## Institution snapshot synchronization
 
 Production accepts only the normalized snapshot selected by `resources/institution-snapshots/current.json`. Its pointer, approval metadata, hashes, and row schemas are validated at image build and startup. Never copy from `tests/fixtures` to this directory.

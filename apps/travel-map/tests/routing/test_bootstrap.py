@@ -4,15 +4,14 @@ from app.routing.bootstrap import (
     build_car_provider_chain,
     build_classification_provider,
     build_route_providers,
-    build_walk_provider_chain,
 )
 from app.routing.models import TravelMode
 from app.settings import Settings
-from tests.routing.fakes import base_query
+from tests.routing.fakes import FakeProvider, base_query, result_with, route
 
 
-# Break caught: stage B/C helpers overwriting each other's provider chain.
-def test_bootstrap_builds_independent_mode_chains_in_fixed_order() -> None:
+# Break caught: a Stage A provider order regression changing fallback priority.
+def test_stage_a_provider_order_is_explicit() -> None:
     settings = Settings()
 
     providers = build_route_providers(settings)
@@ -21,9 +20,28 @@ def test_bootstrap_builds_independent_mode_chains_in_fixed_order() -> None:
         "SEOUL_TRANSIT",
         "KAKAO_TRANSIT",
     ]
-    assert providers[TravelMode.CAR] == build_car_provider_chain(settings)
-    assert providers[TravelMode.WALK] == build_walk_provider_chain(settings)
     assert [provider.name for provider in providers[TravelMode.CAR]] == ["KAKAO_CAR"]
+    assert [provider.name for provider in providers[TravelMode.WALK]] == ["KAKAO_WALK"]
+
+
+# Break caught: a car-engine extension replacing the independent walk chain.
+def test_car_and_walk_extension_points_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings()
+    monkeypatch.setattr(
+        "app.routing.bootstrap.build_car_provider_chain",
+        lambda _settings: (
+            FakeProvider(
+                "PUBLIC_CAR",
+                result_with(route("public-car", 600, 4_000, 1_000)),
+            ),
+        ),
+    )
+
+    providers = build_route_providers(settings)
+
+    assert [provider.name for provider in providers[TravelMode.CAR]] == ["PUBLIC_CAR"]
     assert [provider.name for provider in providers[TravelMode.WALK]] == ["KAKAO_WALK"]
 
 
