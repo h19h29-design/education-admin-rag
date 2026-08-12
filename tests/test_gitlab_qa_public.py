@@ -122,6 +122,19 @@ def test_long_specific_term_in_answer_is_relevant() -> None:
     assert len(public_cases_from_evidence("수의계약", evidence)) == 1
 
 
+@pytest.mark.parametrize("query", ["계약", "물품", "복무", "휴가"])
+def test_single_short_business_term_in_case_is_relevant(query: str) -> None:
+    evidence = _evidence(
+        _result(
+            title="계약 물품 복무 휴가",
+            question="업무 처리 기준",
+            answer="관련 절차를 확인합니다.",
+        )
+    )
+
+    assert len(public_cases_from_evidence(query, evidence)) == 1
+
+
 def test_public_case_drops_internal_fields() -> None:
     case = public_cases_from_evidence("학교 수의계약", _evidence(_result()))[0]
     assert set(case.as_dict()) == {
