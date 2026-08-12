@@ -197,6 +197,36 @@ def test_release_context_allowlists_only_production_app_files(tmp_path: Path) ->
     )
 
 
+# Production break caught: suffix-only application allowlisting can stage a
+# hidden Python module or static payload, including ones beneath a hidden path.
+def test_release_context_omits_every_hidden_application_path(tmp_path: Path) -> None:
+    source_root = _release_source_with_current_snapshot(tmp_path)
+    app_root = source_root / "app"
+    hidden_paths = (
+        ".secret.py",
+        ".private/module.py",
+        "static/.secret.js",
+        "static/.private/bundle.css",
+    )
+    for relative_path in hidden_paths:
+        path = app_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not for Docker", encoding="utf-8")
+
+    module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
+    context_root = tmp_path / "context"
+    module["stage_release_context"](source_root, context_root)
+
+    staged_app = context_root / "app"
+    assert (staged_app / "main.py").is_file()
+    assert (staged_app / "static/index.html").is_file()
+    assert all(not (staged_app / relative_path).exists() for relative_path in hidden_paths)
+    assert all(
+        not any(part.startswith(".") for part in path.relative_to(staged_app).parts)
+        for path in staged_app.rglob("*")
+    )
+
+
 # Production break caught: a symlink in a copied application path can resolve
 # outside the reviewed source tree while bypassing the context allowlist.
 def test_release_context_rejects_an_application_symlink(tmp_path: Path) -> None:

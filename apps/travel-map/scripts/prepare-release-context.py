@@ -163,7 +163,7 @@ def _is_allowed_application_file(candidate: Path, app_root: Path) -> bool:
     relative_path = candidate.relative_to(app_root)
     if any(part in _EXCLUDED_APP_PATH_PARTS for part in relative_path.parts):
         return False
-    if any(part.startswith(".env") for part in relative_path.parts):
+    if any(part.startswith(".") for part in relative_path.parts):
         return False
     if candidate.suffix == ".py":
         return True
