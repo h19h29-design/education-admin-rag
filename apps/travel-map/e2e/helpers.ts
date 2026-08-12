@@ -7,6 +7,7 @@ const fixtureDir = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
 export type MockApiOptions = {
   preview?: object;
+  previewForPayload?: (payload: Record<string, unknown>) => object;
   reverse?: object;
 };
 
@@ -133,9 +134,15 @@ export async function installMockApi(
   await page.route("**/api/v1/bootstrap", (route) =>
     json(route, readFixture("bootstrap.json")),
   );
-  await page.route("**/api/v1/institutions**", (route) =>
-    json(route, readFixture("institutions.json")),
-  );
+  await page.route("**/api/v1/institutions**", (route) => {
+    const requestUrl = new URL(route.request().url());
+    const payload = readFixture<{ items: Array<Record<string, string>> }>("institutions.json");
+    const items = payload.items.filter((item) => (
+      (!requestUrl.searchParams.get("institution_type") || item.institutionType === requestUrl.searchParams.get("institution_type"))
+      && (!requestUrl.searchParams.get("foundation_type") || item.foundationType === requestUrl.searchParams.get("foundation_type"))
+    ));
+    return json(route, { items });
+  });
   await page.route("**/api/v1/places**", (route) =>
     json(route, readFixture("places.json")),
   );
@@ -148,9 +155,13 @@ export async function installMockApi(
   await page.route("**/api/v1/geodata/support", (route) =>
     json(route, readFixture("support.geojson")),
   );
-  await page.route("**/api/v1/trips/preview", (route) =>
-    json(route, options.preview ?? readFixture("preview.json")),
-  );
+  await page.route("**/api/v1/trips/preview", (route) => {
+    const payload = JSON.parse(route.request().postData() || "{}") as Record<string, unknown>;
+    return json(
+      route,
+      options.previewForPayload?.(payload) ?? options.preview ?? readFixture("preview.json"),
+    );
+  });
 }
 
 export async function mapState(page: Page): Promise<MapState> {

@@ -20,20 +20,31 @@ class ApiModel(BaseModel):
     )
 
 
-class DestinationInput(ApiModel):
+class ApiRequestModel(BaseModel):
+    """Strict HTTP input model that accepts only its documented camelCase aliases."""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        extra="forbid",
+        validate_by_alias=True,
+        validate_by_name=False,
+    )
+
+
+class DestinationInput(ApiRequestModel):
     name: Annotated[str, StringConstraints(min_length=1, max_length=120)]
     address: Annotated[str, StringConstraints(min_length=1, max_length=240)]
     latitude: Annotated[float, Field(ge=33.0, le=39.5)]
     longitude: Annotated[float, Field(ge=124.0, le=132.0)]
 
 
-class CarAssumptionsInput(ApiModel):
+class CarAssumptionsInput(ApiRequestModel):
     fuel_type: FuelType
     efficiency_km_per_liter: Annotated[float, Field(ge=3.0, le=30.0)]
     parking_cost_krw: Annotated[int, Field(ge=0, le=100_000)]
 
 
-class TripPreviewRequest(ApiModel):
+class TripPreviewRequest(ApiRequestModel):
     origin_site_id: Annotated[
         str,
         StringConstraints(pattern=r"^[a-z][a-z0-9-]*:[A-Za-z0-9:_-]+$"),

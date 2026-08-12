@@ -25,6 +25,74 @@ test("keeps institution filters available without crowding the initial form", as
   ).toBeVisible();
 });
 
+test("uses normalized institution filters to narrow origin results", async ({ page }) => {
+  const filterQueries: URL[] = [];
+  await installMockApi(page);
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/v1/institutions") {
+      filterQueries.push(new URL(request.url()));
+    }
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "기관 검색 필터 열기" }).click();
+  await page.getByLabel("기관유형").selectOption("ELEMENTARY_SCHOOL");
+  await page.getByLabel("설립구분").selectOption("PUBLIC");
+  await page.getByLabel("출발 기관").fill("샘물");
+
+  await expect(
+    page.getByRole("option", { name: /샘물공립초등학교.*공립.*중구/ }),
+  ).toBeVisible();
+  await expect(page.getByRole("option", { name: /샘물사립고등학교/ })).toHaveCount(0);
+  expect(filterQueries.at(-1)?.searchParams.get("institution_type")).toBe("ELEMENTARY_SCHOOL");
+  expect(filterQueries.at(-1)?.searchParams.get("foundation_type")).toBe("PUBLIC");
+});
+
+test("submits prior same-day allowance and displays only the remaining amount", async ({
+  page,
+}) => {
+  const payloads: Record<string, unknown>[] = [];
+  await installMockApi(page, {
+    previewForPayload: (payload) => {
+      payloads.push(payload);
+      const preview = readFixture<Record<string, unknown>>("preview.json");
+      const previous = Number(payload.previousAllowanceKrw);
+      preview.allowance = { status: "ESTIMATED", amountKrw: 20_000 - previous, warnings: [] };
+      return preview;
+    },
+  });
+  await page.goto("/");
+  await expect(page.getByLabel("기존 지급액(원)")).toBeDisabled();
+  await completePublicOfficialTrip(page);
+  await page.getByLabel("오늘 다른 관내출장이 있습니다").check();
+  await expect(page.getByLabel("기존 지급액(원)")).toBeEnabled();
+  await page.getByLabel("기존 지급액(원)").fill("10000");
+  await page.getByRole("button", { name: "경로 계산" }).click();
+  await expect(page.locator("#allowance-amount")).toHaveText("10,000원");
+  await page.getByLabel("기존 지급액(원)").fill("20000");
+  await page.getByRole("button", { name: "경로 계산" }).click();
+  await expect(page.locator("#allowance-amount")).toHaveText("0원");
+  expect(payloads.slice(1).map((payload) => payload.previousAllowanceKrw)).toEqual([10_000, 20_000]);
+});
+
+test("labels a supported-area twelve-kilometre result as expected non-local", async ({
+  page,
+}) => {
+  const preview = readFixture<Record<string, unknown>>("preview.json");
+  preview.coverage = { status: "BUFFER" };
+  preview.classification = "NON_LOCAL_EXPECTED";
+  preview.allowance = {
+    status: "REVIEW_REQUIRED",
+    amountKrw: null,
+    warnings: ["NON_LOCAL_ALLOWANCE_OUT_OF_SCOPE"],
+  };
+  await installMockApi(page, { preview });
+  await page.goto("/");
+  await completePublicOfficialTrip(page);
+
+  await expect(page.locator("#classification-result")).toHaveText("관외 예상");
+  await expect(page.locator("#classification-distance")).toContainText("기관의 최종 관외 판단");
+});
+
 test("selects a private school origin and shows route rankings", async ({ page }) => {
   await installMockApi(page);
   await page.goto("/");
@@ -252,6 +320,31 @@ test("map polyline, cleanup, and boundary effects reach the Kakao adapter", asyn
       ).length,
     )
     .toBeGreaterThanOrEqual(6);
+});
+
+test("keeps checked boundary layers after a route preview is rendered again", async ({
+  page,
+}) => {
+  await installMockApi(page);
+  await page.goto("/");
+  await completePublicOfficialTrip(page);
+  await page.getByLabel("서울 경계").check();
+  await page.getByLabel("12km 지원영역").check();
+  await expect
+    .poll(async () =>
+      (await mapState(page)).created.filter(({ kind }) => kind === "PolygonFake").length,
+    )
+    .toBe(2);
+
+  await page.getByRole("button", { name: "경로 계산" }).click();
+
+  await expect(page.getByLabel("서울 경계")).toBeChecked();
+  await expect(page.getByLabel("12km 지원영역")).toBeChecked();
+  await expect
+    .poll(async () =>
+      (await mapState(page)).created.filter(({ kind }) => kind === "PolygonFake").length,
+    )
+    .toBe(2);
 });
 
 test("keyboard option selection authorizes calculation while free text does not", async ({

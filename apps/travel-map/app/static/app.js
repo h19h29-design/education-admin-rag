@@ -18,6 +18,9 @@ const controls = {
   calculateButton: $("#calculate-button"),
   mapCollapse: $("#map-collapse"),
   filtersToggle: $("#institution-filters-toggle"),
+  otherTrips: $("#other-trips"),
+  previousAllowanceField: $("#previous-allowance-field"),
+  previousAllowance: $("#previous-allowance"),
 };
 
 const state = {
@@ -36,6 +39,21 @@ const bestName = {
   shortestRouteId: "최단거리",
   cheapestRouteId: "최저비용",
 };
+const institutionTypeName = {
+  KINDERGARTEN: "유치원",
+  ELEMENTARY_SCHOOL: "초등학교",
+  MIDDLE_SCHOOL: "중학교",
+  HIGH_SCHOOL: "고등학교",
+};
+const foundationTypeName = {
+  NATIONAL: "국립",
+  PUBLIC: "공립",
+  PRIVATE: "사립",
+};
+
+function institutionDetails(item) {
+  return `${institutionTypeName[item.institutionType] || item.institutionType} · ${foundationTypeName[item.foundationType] || item.foundationType} · ${item.district} · ${item.roadAddress}`;
+}
 
 function formatMoney(value) {
   return value == null ? "비용 정보 없음" : `${new Intl.NumberFormat("ko-KR").format(value)}원`;
@@ -83,7 +101,7 @@ function setDefaultDates() {
 
 function optionText(item, kind) {
   return kind === "origin"
-    ? `${item.siteName} · ${item.institutionType} · ${item.foundationType} · ${item.district} · ${item.roadAddress}`
+    ? `${item.siteName} · ${institutionDetails(item)}`
     : `${item.name} · ${item.roadAddress || item.lotAddress}`;
 }
 
@@ -125,7 +143,7 @@ function selectSuggestion(kind, item) {
   if (kind === "origin") {
     state.origin = item;
     controls.origin.value = item.siteName;
-    controls.originNote.textContent = `${item.institutionType} · ${item.foundationType} · ${item.district} · ${item.roadAddress}`;
+    controls.originNote.textContent = institutionDetails(item);
   } else {
     state.destination = item;
     controls.destination.value = item.name;
@@ -233,7 +251,9 @@ function requestPayload() {
       parkingCostKrw: Number($("#parking-cost").value),
     },
     hasOtherLocalTripsToday: $("#other-trips").checked,
-    previousAllowanceKrw: 0,
+    previousAllowanceKrw: controls.otherTrips.checked
+      ? Number(controls.previousAllowance.value)
+      : 0,
   };
 }
 
@@ -330,8 +350,15 @@ function selectRoute(routeId) {
 function renderSummary() {
   const { coverage, classification, classificationDistanceMeters, mobilityCost, allowance } = state.preview;
   $("#coverage-status").textContent = coverage.status === "SEOUL" ? "서울 경계 내" : coverage.status;
-  $("#classification-result").textContent = classification === "LOCAL" ? "관내출장" : "판정 보류";
-  $("#classification-distance").textContent = classificationDistanceMeters == null ? "분류 경로 확인 필요" : `분류 왕복 ${formatDistance(classificationDistanceMeters)}`;
+  $("#classification-result").textContent = {
+    LOCAL: "관내출장",
+    NON_LOCAL_EXPECTED: "관외 예상",
+  }[classification] || "판정 보류";
+  $("#classification-distance").textContent = classification === "NON_LOCAL_EXPECTED"
+    ? "기관의 최종 관외 판단과 지급 기준을 확인하세요."
+    : classificationDistanceMeters == null
+      ? "분류 경로 확인 필요"
+      : `분류 왕복 ${formatDistance(classificationDistanceMeters)}`;
   $("#mobility-cost").textContent = formatMoney(mobilityCost.amountKrw);
   $("#mobility-status").textContent = mobilityCost.status === "ESTIMATED" ? "예상값" : "경로 기준";
   const profileNeedsReview = controls.policy.value === "NONPUBLIC_OR_UNKNOWN";
@@ -401,6 +428,13 @@ function bindMapControls() {
   });
 }
 
+function updatePreviousAllowanceControl() {
+  const enabled = controls.otherTrips.checked;
+  controls.previousAllowanceField.hidden = !enabled;
+  controls.previousAllowance.disabled = !enabled;
+  if (!enabled) controls.previousAllowance.value = "0";
+}
+
 async function initialize() {
   setDefaultDates();
   bindCombobox("origin", async (query) => (await api.institutions({ q: query, ...originFilters() })).items);
@@ -421,6 +455,8 @@ async function initialize() {
   bindSortTabs();
   bindMapControls();
   controls.policy.addEventListener("change", updateCalculateAvailability);
+  controls.otherTrips.addEventListener("change", updatePreviousAllowanceControl);
+  updatePreviousAllowanceControl();
   updateCalculateAvailability();
   try {
     const bootstrap = await api.bootstrap();

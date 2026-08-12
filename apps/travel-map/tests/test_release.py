@@ -159,6 +159,34 @@ def test_release_context_contains_only_the_current_verified_snapshot(
     assert not (context_root / "e2e").exists()
 
 
+def test_release_context_omits_unlisted_files_from_selected_snapshot_and_rules(
+    tmp_path: Path,
+) -> None:
+    source_root = _release_source_with_current_snapshot(tmp_path)
+    snapshot = source_root / "resources/institution-snapshots/fixture-001"
+    (snapshot / "secrets.txt").write_text("not for Docker", encoding="utf-8")
+    (snapshot / "review-notes.md").write_text("not for Docker", encoding="utf-8")
+    rules = source_root / "resources/rules"
+    (rules / "unlisted-rule.json").write_text("not for Docker", encoding="utf-8")
+    (rules / "review-notes.md").write_text("not for Docker", encoding="utf-8")
+
+    module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
+    context_root = tmp_path / "context"
+    module["stage_release_context"](source_root, context_root)
+
+    staged_snapshot = context_root / "resources/institution-snapshots/fixture-001"
+    staged_rules = context_root / "resources/rules"
+    assert sorted(path.name for path in staged_snapshot.iterdir()) == [
+        "institutions.jsonl",
+        "manifest.json",
+        "sites.jsonl",
+    ]
+    assert sorted(path.name for path in staged_rules.iterdir()) == [
+        "index.json",
+        "local-travel-2026-07-01.json",
+    ]
+
+
 # Production break caught: a broad application-tree copy leaks nested dotenvs,
 # raw inputs, test assets, caches, or Git data into a Docker build context.
 def test_release_context_allowlists_only_production_app_files(tmp_path: Path) -> None:

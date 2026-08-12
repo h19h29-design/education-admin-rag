@@ -23,6 +23,45 @@ def test_trip_preview_rejects_caller_supplied_origin_coordinates(client) -> None
     assert response.status_code == 422
 
 
+def test_trip_preview_rejects_snake_case_request_fields(client) -> None:
+    payload = trip_payload()
+    payload["previous_allowance_krw"] = payload.pop("previousAllowanceKrw")
+
+    response = client.post("/api/v1/trips/preview", json=payload)
+
+    assert response.status_code == 422
+
+
+def test_trip_preview_accepts_camel_case_request_fields(client) -> None:
+    response = client.post("/api/v1/trips/preview", json=trip_payload())
+
+    assert response.status_code == 200
+
+
+def test_same_day_remaining_allowance_never_exceeds_the_daily_cap(client) -> None:
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(
+            hasOtherLocalTripsToday=True,
+            previousAllowanceKrw=10_000,
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["allowance"]["amountKrw"] == 10_000
+
+    exhausted = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(
+            hasOtherLocalTripsToday=True,
+            previousAllowanceKrw=20_000,
+        ),
+    )
+
+    assert exhausted.status_code == 200
+    assert exhausted.json()["allowance"]["amountKrw"] == 0
+
+
 # Break caught: contacting route providers after an out-of-coverage destination has been determined.
 def test_outside_coverage_stops_before_provider_calls(client, fake_provider) -> None:
     payload = trip_payload(

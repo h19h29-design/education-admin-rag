@@ -44,17 +44,18 @@
               <label>기관유형
                 <select id="institution-type" name="institutionType">
                   <option value="">전체</option>
-                  <option value="유치원">유치원</option>
-                  <option value="초등학교">초등학교</option>
-                  <option value="중학교">중학교</option>
-                  <option value="고등학교">고등학교</option>
+                  <option value="KINDERGARTEN">유치원</option>
+                  <option value="ELEMENTARY_SCHOOL">초등학교</option>
+                  <option value="MIDDLE_SCHOOL">중학교</option>
+                  <option value="HIGH_SCHOOL">고등학교</option>
                 </select>
               </label>
               <label>설립구분
                 <select id="foundation-type" name="foundationType">
                   <option value="">전체</option>
-                  <option value="공립">공립</option>
-                  <option value="사립">사립</option>
+                  <option value="NATIONAL">국립</option>
+                  <option value="PUBLIC">공립</option>
+                  <option value="PRIVATE">사립</option>
                 </select>
               </label>
               <label>교육지원청
@@ -126,6 +127,9 @@
             </fieldset>
 
             <label class="check-line" for="other-trips"><input id="other-trips" type="checkbox" /> 오늘 다른 관내출장이 있습니다</label>
+            <label id="previous-allowance-field" class="select-field" for="previous-allowance" hidden>기존 지급액(원)
+              <input id="previous-allowance" type="number" min="0" max="20000" step="1000" value="0" inputmode="numeric" disabled />
+            </label>
             <p id="form-error" class="form-error" role="alert" hidden></p>
             <button id="calculate-button" class="primary-button" type="submit">▣ 경로 계산</button>
           </form>

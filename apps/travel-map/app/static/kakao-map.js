@@ -82,9 +82,8 @@ export class KakaoMapController {
   }
 
   clearRouteOverlays() {
-    [...this.overlays, ...this.boundaries].forEach((overlay) => overlay.setMap?.(null));
+    this.overlays.forEach((overlay) => overlay.setMap?.(null));
     this.overlays = [];
-    this.boundaries = [];
     this.routeLines.clear();
     this.element.dataset.activeRoute = "";
   }

@@ -1,6 +1,7 @@
 """Create the exact, allowlisted Docker build context for a release."""
 
 import argparse
+import json
 import shutil
 from pathlib import Path
 
@@ -67,22 +68,21 @@ def stage_release_context(source_root: Path, destination: Path) -> str:
         for relative_path in (".dockerignore", "Dockerfile", "pyproject.toml", "uv.lock"):
             _copy_file(source, destination, relative_path)
         _copy_application(source, destination)
-        _copy_tree(source, destination, "resources/rules")
+        _copy_rules(source, destination)
         for relative_path in (
             "resources/geodata/manifest.json",
             "resources/geodata/seoul.geojson",
             "resources/geodata/seoul-plus-12km.geojson",
             "resources/institution-snapshots/current.json",
-            (
-                "resources/institution-snapshots/"
-                f"{verified_snapshot.manifest.snapshot_id}"
-            ),
         ):
-            candidate = source / relative_path
-            if candidate.is_dir():
-                _copy_tree(source, destination, relative_path)
-            else:
-                _copy_file(source, destination, relative_path)
+            _copy_file(source, destination, relative_path)
+        snapshot_root = "resources/institution-snapshots"
+        for filename in ("manifest.json", "institutions.jsonl", "sites.jsonl"):
+            _copy_file(
+                source,
+                destination,
+                f"{snapshot_root}/{verified_snapshot.manifest.snapshot_id}/{filename}",
+            )
     except Exception:
         # The caller chose a fresh path, so cleanup cannot affect unrelated data.
         shutil.rmtree(destination)
@@ -134,6 +134,23 @@ def _copy_tree(source_root: Path, destination: Path, relative_path: str) -> None
             shutil.copy2(candidate, target, follow_symlinks=False)
         else:
             raise ValueError(f"release context file is invalid: {relative_path}")
+
+
+def _copy_rules(source_root: Path, destination: Path) -> None:
+    """Copy the verified rule index and only the files it authenticates."""
+
+    index_path = source_root / "resources/rules/index.json"
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        entries = index["rules"]
+        filenames = tuple(entry["file"] for entry in entries)
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("release context rule index is invalid") from exc
+    if any(type(filename) is not str for filename in filenames):
+        raise ValueError("release context rule index is invalid")
+    _copy_file(source_root, destination, "resources/rules/index.json")
+    for filename in filenames:
+        _copy_file(source_root, destination, f"resources/rules/{filename}")
 
 
 def _copy_application(source_root: Path, destination: Path) -> None:
