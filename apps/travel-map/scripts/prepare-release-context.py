@@ -8,6 +8,38 @@ from app.institutions.snapshot import verify_snapshot
 from app.policy.coverage import verify_geodata_resources
 from app.policy.rules import RuleRepository
 
+_STATIC_SUFFIXES = frozenset(
+    {
+        ".css",
+        ".html",
+        ".jpeg",
+        ".jpg",
+        ".js",
+        ".png",
+        ".svg",
+        ".webp",
+        ".woff2",
+    }
+)
+_EXCLUDED_APP_PATH_PARTS = frozenset(
+    {
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "__pycache__",
+        "artifacts",
+        "e2e",
+        "node_modules",
+        "playwright-report",
+        "raw",
+        "source",
+        "test-results",
+        "tests",
+    }
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -32,9 +64,9 @@ def stage_release_context(source_root: Path, destination: Path) -> str:
 
     destination.mkdir(mode=0o700, parents=True)
     try:
-        for relative_path in ("Dockerfile", "pyproject.toml", "uv.lock"):
+        for relative_path in (".dockerignore", "Dockerfile", "pyproject.toml", "uv.lock"):
             _copy_file(source, destination, relative_path)
-        _copy_tree(source, destination, "app")
+        _copy_application(source, destination)
         _copy_tree(source, destination, "resources/rules")
         for relative_path in (
             "resources/geodata/manifest.json",
@@ -70,7 +102,11 @@ def _resolve_directory(path: Path, label: str) -> Path:
 
 def _copy_file(source_root: Path, destination: Path, relative_path: str) -> None:
     source = source_root / relative_path
-    if source.is_symlink() or not source.is_file():
+    if (
+        source.is_symlink()
+        or not source.is_file()
+        or not _is_within(source, source_root)
+    ):
         raise ValueError(f"release context file is invalid: {relative_path}")
     target = destination / relative_path
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -79,12 +115,16 @@ def _copy_file(source_root: Path, destination: Path, relative_path: str) -> None
 
 def _copy_tree(source_root: Path, destination: Path, relative_path: str) -> None:
     source = source_root / relative_path
-    if source.is_symlink() or not source.is_dir():
+    if (
+        source.is_symlink()
+        or not source.is_dir()
+        or not _is_within(source, source_root)
+    ):
         raise ValueError(f"release context directory is invalid: {relative_path}")
     target_root = destination / relative_path
     target_root.mkdir(mode=0o700, parents=True)
     for candidate in sorted(source.rglob("*")):
-        if candidate.is_symlink():
+        if candidate.is_symlink() or not _is_within(candidate, source_root):
             raise ValueError(f"release context symlink is invalid: {relative_path}")
         relative = candidate.relative_to(source)
         target = target_root / relative
@@ -94,6 +134,47 @@ def _copy_tree(source_root: Path, destination: Path, relative_path: str) -> None
             shutil.copy2(candidate, target, follow_symlinks=False)
         else:
             raise ValueError(f"release context file is invalid: {relative_path}")
+
+
+def _copy_application(source_root: Path, destination: Path) -> None:
+    """Copy only runtime Python modules and explicitly supported static assets."""
+
+    app_root = source_root / "app"
+    if (
+        app_root.is_symlink()
+        or not app_root.is_dir()
+        or not _is_within(app_root, source_root)
+    ):
+        raise ValueError("release context directory is invalid: app")
+    target_root = destination / "app"
+    target_root.mkdir(mode=0o700, parents=True)
+    for candidate in sorted(app_root.rglob("*")):
+        if candidate.is_symlink() or not _is_within(candidate, source_root):
+            raise ValueError("release context symlink is invalid: app")
+        if not candidate.is_file() or not _is_allowed_application_file(candidate, app_root):
+            continue
+        relative_path = candidate.relative_to(app_root)
+        target = target_root / relative_path
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shutil.copy2(candidate, target, follow_symlinks=False)
+
+
+def _is_allowed_application_file(candidate: Path, app_root: Path) -> bool:
+    relative_path = candidate.relative_to(app_root)
+    if any(part in _EXCLUDED_APP_PATH_PARTS for part in relative_path.parts):
+        return False
+    if any(part.startswith(".env") for part in relative_path.parts):
+        return False
+    if candidate.suffix == ".py":
+        return True
+    return relative_path.parts[0] == "static" and candidate.suffix in _STATIC_SUFFIXES
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    try:
+        return candidate.resolve(strict=True).is_relative_to(root)
+    except OSError:
+        return False
 
 
 def main() -> int:

@@ -159,6 +159,57 @@ def test_release_context_contains_only_the_current_verified_snapshot(
     assert not (context_root / "e2e").exists()
 
 
+# Production break caught: a broad application-tree copy leaks nested dotenvs,
+# raw inputs, test assets, caches, or Git data into a Docker build context.
+def test_release_context_allowlists_only_production_app_files(tmp_path: Path) -> None:
+    source_root = _release_source_with_current_snapshot(tmp_path)
+    app_root = source_root / "app"
+    malicious_paths = (
+        ".env",
+        "nested/.env",
+        "nested/.env.production",
+        "raw/provider-response.json",
+        "source/archive.geojson",
+        "artifacts/report.json",
+        "tests/test_hidden.py",
+        "e2e/trace.zip",
+        "__pycache__/main.cpython-312.pyc",
+        ".git/config",
+    )
+    for relative_path in malicious_paths:
+        path = app_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not for Docker", encoding="utf-8")
+
+    module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
+    context_root = tmp_path / "context"
+    module["stage_release_context"](source_root, context_root)
+
+    staged_app = context_root / "app"
+    assert (context_root / ".dockerignore").is_file()
+    assert (staged_app / "main.py").is_file()
+    assert (staged_app / "static/index.html").is_file()
+    assert all(not (staged_app / relative_path).exists() for relative_path in malicious_paths)
+    assert all(
+        path.suffix == ".py" or path.relative_to(staged_app).parts[0] == "static"
+        for path in staged_app.rglob("*")
+        if path.is_file()
+    )
+
+
+# Production break caught: a symlink in a copied application path can resolve
+# outside the reviewed source tree while bypassing the context allowlist.
+def test_release_context_rejects_an_application_symlink(tmp_path: Path) -> None:
+    source_root = _release_source_with_current_snapshot(tmp_path)
+    link = source_root / "app/nested-link.py"
+    link.symlink_to(source_root / "app/main.py")
+
+    module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
+
+    with pytest.raises(ValueError, match="symlink"):
+        module["stage_release_context"](source_root, tmp_path / "context")
+
+
 # Production break caught: enabling a billed live check by accident or allowing
 # a credential/snapshot error to disclose a secret or institution identifier.
 def test_live_smoke_refuses_unapproved_execution_with_a_safe_report() -> None:
@@ -309,20 +360,53 @@ def test_live_case_report_only_emits_approved_operational_fields() -> None:
 
 # Production break caught: reporting a generic no-route state after all route
 # providers failed, which hides an upstream outage from release review.
-def test_live_case_report_marks_provider_unavailability_meaningfully() -> None:
+@pytest.mark.parametrize(
+    ("warning", "expected_status"),
+    (
+        ("UPSTREAM_UNAVAILABLE", "UPSTREAM_UNAVAILABLE"),
+        ("UPSTREAM_RATE_LIMIT", "UPSTREAM_RATE_LIMITED"),
+        ("UPSTREAM_REJECTED", "UPSTREAM_REJECTED"),
+        ("UPSTREAM_TIMEOUT", "UPSTREAM_TIMEOUT"),
+        ("UPSTREAM_ERROR", "UPSTREAM_ERROR"),
+        ("SCHEMA_MISMATCH", "RESPONSE_SCHEMA_MISMATCH"),
+        ("RESPONSE_TOO_LARGE", "RESPONSE_TOO_LARGE"),
+        ("RESPONSE_LIMIT_EXCEEDED", "RESPONSE_LIMIT_EXCEEDED"),
+        ("INVALID_PROVIDER_RESULT", "INVALID_PROVIDER_RESPONSE"),
+    ),
+)
+def test_live_case_report_maps_provider_failures_to_safe_statuses(
+    warning: str,
+    expected_status: str,
+) -> None:
     module = runpy.run_path(str(SMOKE), run_name="release_smoke_test")
     report_case = module["_case_report"]
     response = TripPreviewResponse.model_validate(
-        _trip_response_payload(routes=[], warnings=["UPSTREAM_TIMEOUT"])
+        _trip_response_payload(routes=[], warnings=[warning])
     )
 
     assert report_case("PUBLIC_LOCAL", response, latency_ms=12) == {
         "caseId": "PUBLIC_LOCAL",
-        "providerStatus": "UPSTREAM_UNAVAILABLE",
+        "providerStatus": expected_status,
         "routeCount": 0,
         "decision": "LOCAL",
         "latencyMs": 12,
     }
+
+
+def _release_source_with_current_snapshot(tmp_path: Path) -> Path:
+    source_root = tmp_path / "travel-map"
+    shutil.copytree(ROOT, source_root)
+    snapshots = source_root / "resources/institution-snapshots"
+    snapshots.mkdir()
+    shutil.copytree(
+        FIXTURE_SNAPSHOT / "fixture-001",
+        snapshots / "fixture-001",
+    )
+    (snapshots / "current.json").write_text(
+        json.dumps({"snapshotId": "fixture-001"}),
+        encoding="utf-8",
+    )
+    return source_root
 
 
 # Production break caught: using a closer headquarters, library, or other
