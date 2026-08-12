@@ -1,7 +1,10 @@
 import { solveFirstPartyChallenge } from "./challenge.js";
 import {
+  expirePendingHistory,
+  historyStatusLabel,
   normalizeCompletion,
   normalizeHistory,
+  PENDING_TIMEOUT_MS,
   publicSourceLabel,
   resolveTheme,
 } from "./view-model.js";
@@ -9,7 +12,7 @@ import {
 const STORAGE_KEY = "senqa-preview-questions-v2";
 const THEME_KEY = "senqa-theme-v1";
 const POLL_INTERVAL_MS = 3_000;
-const MAX_POLL_ATTEMPTS = 100;
+const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 
 const elements = {
   answerCaseCount: document.querySelector("#answer-case-count"),
@@ -17,12 +20,13 @@ const elements = {
   answerText: document.querySelector("#answer-text"),
   characterCount: document.querySelector("#character-count"),
   clearHistory: document.querySelector("#clear-history"),
-  evidenceList: document.querySelector("#evidence-list"),
-  evidencePanel: document.querySelector("#evidence-panel"),
   form: document.querySelector("#question-form"),
   formError: document.querySelector("#form-error"),
+  historyClose: document.querySelector("#history-close"),
+  historyDialog: document.querySelector("#history-dialog"),
   historyEmpty: document.querySelector("#history-empty"),
   historyList: document.querySelector("#history-list"),
+  historyOpen: document.querySelector("#history-open"),
   progressPanel: document.querySelector("#progress-panel"),
   question: document.querySelector("#question"),
   relatedCases: document.querySelector("#related-cases"),
@@ -69,7 +73,7 @@ function safeStorageRemove(key) {
 
 function readHistory() {
   try {
-    return normalizeHistory(JSON.parse(safeStorageGet(STORAGE_KEY) ?? "[]"));
+    return expirePendingHistory(JSON.parse(safeStorageGet(STORAGE_KEY) ?? "[]"), Date.now());
   } catch {
     return [];
   }
@@ -79,12 +83,24 @@ function writeHistory(items) {
   safeStorageSet(STORAGE_KEY, JSON.stringify(normalizeHistory(items)));
 }
 
-function statusLabel(status) {
-  return status === "complete" ? "검색 완료" : "답변 준비 중";
+function formatHistoryDate(createdAt) {
+  const value = new Date(createdAt);
+  if (Number.isNaN(value.getTime())) return "";
+  return new Intl.DateTimeFormat("ko-KR", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(value);
+}
+
+function closeHistory() {
+  if (elements.historyDialog.open) elements.historyDialog.close();
 }
 
 function renderHistory() {
   const items = readHistory();
+  writeHistory(items);
   elements.historyList.replaceChildren();
   elements.historyEmpty.hidden = items.length > 0;
   for (const item of items) {
@@ -99,15 +115,10 @@ function renderHistory() {
     const meta = document.createElement("span");
     meta.className = "history-meta";
     const status = document.createElement("span");
-    status.textContent = statusLabel(item.status);
+    status.textContent = historyStatusLabel(item.status);
     const date = document.createElement("time");
     date.dateTime = new Date(item.createdAt).toISOString();
-    date.textContent = new Intl.DateTimeFormat("ko-KR", {
-      month: "numeric",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    }).format(new Date(item.createdAt));
+    date.textContent = formatHistoryDate(item.createdAt);
     meta.append(status, date);
     button.append(question, meta);
     button.addEventListener("click", () => restoreQuestion(item));
@@ -161,36 +172,25 @@ function renderRelatedCases(cases) {
   }
 }
 
-function renderEvidence(cases) {
-  elements.evidenceList.replaceChildren();
-  for (const item of cases) {
-    const row = document.createElement("li");
-    row.className = "evidence-item";
-    const location = document.createElement("span");
-    location.className = "evidence-location";
-    location.textContent = publicSourceLabel(item);
-    row.append(location);
-    elements.evidenceList.append(row);
-  }
-}
-
 function showResult(result) {
   elements.progressPanel.hidden = true;
   elements.answerPanel.hidden = false;
   elements.answerText.textContent = result.answer;
   const hasCases = result.cases.length > 0;
-  elements.answerCaseCount.textContent = hasCases ? `관련 사례 ${result.cases.length}건 기반` : "";
+  elements.answerCaseCount.textContent = hasCases ? `관련 사례 ${result.cases.length}건` : "";
   elements.reviewWarning.hidden = !hasCases;
   elements.relatedSection.hidden = !hasCases;
-  elements.evidencePanel.hidden = !hasCases;
   renderRelatedCases(result.cases);
-  renderEvidence(result.cases);
 }
 
 function showPending() {
   elements.answerPanel.hidden = true;
-  elements.evidencePanel.hidden = true;
   elements.progressPanel.hidden = false;
+}
+
+function showIdle() {
+  elements.answerPanel.hidden = true;
+  elements.progressPanel.hidden = true;
 }
 
 function showError(message) {
@@ -221,9 +221,30 @@ function updateHistory(requestId, changes) {
   renderHistory();
 }
 
-async function poll(item, attempt = 0) {
-  if (attempt >= MAX_POLL_ATTEMPTS) {
-    showError("답변 대기 시간이 길어지고 있습니다. 최근 질문에서 다시 확인해 주세요.");
+function markHistoryForRetry(item) {
+  const items = readHistory().map((entry) => {
+    if (entry.requestId !== item.requestId) return entry;
+    return {
+      createdAt: entry.createdAt,
+      question: entry.question,
+      requestId: entry.requestId,
+      status: "retry",
+    };
+  });
+  writeHistory(items);
+  renderHistory();
+}
+
+function hasExpired(item) {
+  return Date.now() - item.createdAt >= PENDING_TIMEOUT_MS;
+}
+
+async function poll(item, failedAttempts = 0) {
+  if (item.status !== "pending") return;
+  if (hasExpired(item)) {
+    markHistoryForRetry(item);
+    showIdle();
+    showError("답변이 지연되었습니다. 같은 질문으로 다시 검색해 주세요.");
     return;
   }
   try {
@@ -231,6 +252,12 @@ async function poll(item, attempt = 0) {
       `/api/questions/${item.requestId}?token=${encodeURIComponent(item.pollToken)}`,
     );
     if (value.status === "complete") {
+      if (hasExpired(item)) {
+        markHistoryForRetry(item);
+        showIdle();
+        showError("답변이 지연되었습니다. 같은 질문으로 다시 검색해 주세요.");
+        return;
+      }
       const result = normalizeCompletion(value);
       if (!result) throw new Error("response_invalid");
       updateHistory(item.requestId, { result, status: "complete" });
@@ -238,12 +265,16 @@ async function poll(item, attempt = 0) {
       return;
     }
   } catch {
-    if (attempt > 4) {
-      showError("답변 상태를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.");
+    if (failedAttempts + 1 >= MAX_CONSECUTIVE_POLL_FAILURES) {
+      markHistoryForRetry(item);
+      showIdle();
+      showError("답변이 지연되었습니다. 같은 질문으로 다시 검색해 주세요.");
       return;
     }
+    window.setTimeout(() => poll(item, failedAttempts + 1), POLL_INTERVAL_MS);
+    return;
   }
-  window.setTimeout(() => poll(item, attempt + 1), POLL_INTERVAL_MS);
+  window.setTimeout(() => poll(item, failedAttempts), POLL_INTERVAL_MS);
 }
 
 function restoreQuestion(item) {
@@ -252,12 +283,14 @@ function restoreQuestion(item) {
   elements.question.value = item.question;
   updateCount();
   renderHistory();
+  closeHistory();
   if (item.status === "complete" && item.result) {
     showResult(item.result);
-  } else {
-    showPending();
-    poll(item);
+    return;
   }
+  showIdle();
+  elements.question.focus();
+  if (item.status === "pending") poll(item);
 }
 
 function updateCount() {
@@ -336,6 +369,11 @@ elements.clearHistory.addEventListener("click", () => {
   safeStorageRemove(STORAGE_KEY);
   selectedRequestId = "";
   renderHistory();
+});
+elements.historyOpen.addEventListener("click", () => elements.historyDialog.showModal());
+elements.historyClose.addEventListener("click", closeHistory);
+elements.historyDialog.addEventListener("click", (event) => {
+  if (event.target === elements.historyDialog) closeHistory();
 });
 
 for (const button of elements.themeButtons) {

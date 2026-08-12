@@ -3,21 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="교육행정 사례집에서 관련 사례와 원문 근거를 찾아보세요." />
-    <title>교육행정 사례검색</title>
+    <meta name="description" content="교육행정 사례집에서 관련 사례와 근거를 찾아보세요." />
+    <title>교육행정 AI</title>
     <link rel="stylesheet" href="/styles.css" />
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" defer></script>
     <script type="module" src="/app.js"></script>
   </head>
   <body>
     <header class="site-header">
-      <a class="brand" href="/" aria-label="교육행정 사례검색 홈">
-        교육행정 <span>AI</span>
-      </a>
-      <div class="header-tools">
-        <p class="privacy-note">
-          개인정보(이름, 연락처, 주민번호, 이메일 등)는 입력하지 마세요.
-        </p>
+      <a class="brand" href="/" aria-label="교육행정 AI 홈">교육행정 <span>AI</span></a>
+      <div class="header-actions">
         <div class="theme-switch" aria-label="화면 테마">
           <button id="theme-light" type="button" data-theme-choice="light" aria-pressed="false">
             밝게
@@ -26,97 +21,94 @@
             어둡게
           </button>
         </div>
+        <button id="history-open" class="history-open" type="button" aria-haspopup="dialog">
+          최근 질문
+        </button>
       </div>
     </header>
 
-    <div class="app-shell">
-      <aside class="history-panel" aria-labelledby="history-title">
-        <div class="panel-heading history-heading">
-          <div>
-            <p class="section-label">MY QUESTIONS</p>
-            <h2 id="history-title">최근 질문</h2>
-          </div>
-          <button id="clear-history" class="text-button" type="button">지우기</button>
-        </div>
-        <ol id="history-list" class="history-list"></ol>
-        <p id="history-empty" class="history-empty">이 기기에 저장된 최근 질문이 없습니다.</p>
-      </aside>
-
-      <main class="conversation-panel">
-        <section class="intro" aria-labelledby="page-title">
-          <h1 id="page-title">무엇을 도와드릴까요?</h1>
-          <p>교육행정 사례집에서 관련 사례를 찾아 근거와 함께 답합니다.</p>
-        </section>
+    <main class="main-flow">
+      <section class="search-hero" aria-labelledby="page-title">
+        <p class="corpus-range">2020–2025 사례집 기반</p>
+        <h1 id="page-title">질문 하나로 답과 사례까지</h1>
+        <p class="hero-copy">짧은 업무 키워드도 괜찮습니다. 관련 사례를 먼저 찾아 정리해 드립니다.</p>
 
         <form id="question-form" class="question-form" novalidate>
           <label class="sr-only" for="question">교육행정 질문</label>
-          <textarea
-            id="question"
-            name="question"
-            maxlength="1000"
-            placeholder="예: 학교 계약 업무에서 수의계약이 가능한 경우를 알려줘"
-            required
-          ></textarea>
-          <div class="suggestion-row" aria-label="추천 검색어">
-            <span>추천 검색</span>
-            <button type="button" data-suggestion="수의계약 관련 사례를 알려줘">수의계약</button>
-            <button type="button" data-suggestion="시간외근무 관련 사례를 알려줘">시간외근무</button>
-            <button type="button" data-suggestion="휴가와 복무 관련 사례를 알려줘">휴가·복무</button>
-          </div>
-          <div class="form-footer">
-            <span id="character-count" class="character-count">0 / 1,000</span>
-            <div id="turnstile" class="turnstile-slot" aria-label="접속 확인"></div>
+          <div class="question-field">
+            <textarea
+              id="question"
+              name="question"
+              maxlength="1000"
+              placeholder="예: 계약 물품, 휴가, 수의계약"
+              required
+            ></textarea>
             <button id="submit-button" class="primary-button" type="submit" disabled>검색</button>
           </div>
+          <div class="suggestion-row" aria-label="추천 검색어">
+            <button type="button" data-suggestion="계약">계약</button>
+            <button type="button" data-suggestion="물품구매">물품구매</button>
+            <button type="button" data-suggestion="휴가 복무">휴가·복무</button>
+            <button type="button" data-suggestion="시간외근무">시간외근무</button>
+          </div>
+          <div class="form-meta">
+            <p class="privacy-note">개인정보(이름, 연락처, 주민번호, 이메일 등)는 입력하지 마세요.</p>
+            <span id="character-count" class="character-count">0 / 1,000</span>
+          </div>
+          <div id="turnstile" class="turnstile-slot" aria-label="접속 확인"></div>
           <p id="form-error" class="form-error" role="alert" hidden></p>
         </form>
+      </section>
 
-        <section id="progress-panel" class="progress-panel" aria-live="polite" hidden>
-          <span class="spinner" aria-hidden="true"></span>
+      <section id="progress-panel" class="progress-panel" aria-live="polite" hidden>
+        <span class="spinner" aria-hidden="true"></span>
+        <div>
+          <h2>관련 사례를 찾고 답변을 정리하고 있습니다.</h2>
+          <p>잠시만 기다려 주세요.</p>
+        </div>
+      </section>
+
+      <section id="answer-panel" class="answer-panel" aria-labelledby="answer-title" hidden>
+        <div class="answer-heading">
           <div>
-            <h2>관련 사례를 찾고 답변을 정리하고 있습니다.</h2>
-            <p>잠시만 기다려 주세요.</p>
-          </div>
-        </section>
-
-        <section id="answer-panel" class="answer-panel" aria-labelledby="answer-title" hidden>
-          <div class="answer-heading">
-            <div>
-              <p class="section-label">ANSWER</p>
-              <h2 id="answer-title">AI 답변</h2>
-            </div>
+            <h2 id="answer-title">AI 답변</h2>
             <p id="answer-case-count" class="answer-case-count"></p>
           </div>
-          <div class="answer-card">
-            <p id="review-warning" class="review-warning">
-              미검수 참고 답변입니다. 실제 업무 처리 전 최신 지침을 확인하세요.
-            </p>
-            <div id="answer-text" class="answer-text"></div>
-          </div>
-
-          <section id="related-section" class="related-section" aria-labelledby="related-cases-title">
-            <div class="section-heading">
-              <div>
-                <p class="section-label">SOURCE CASES</p>
-                <h3 id="related-cases-title">관련 사례 질의·답변</h3>
-              </div>
-              <span>관련도순</span>
-            </div>
-            <div id="related-cases" class="related-cases"></div>
-          </section>
-        </section>
-      </main>
-
-      <aside id="evidence-panel" class="evidence-panel" aria-labelledby="evidence-title" hidden>
-        <div class="panel-heading">
-          <div>
-            <p class="section-label">EVIDENCE</p>
-            <h2 id="evidence-title">답변 근거</h2>
-          </div>
         </div>
-        <p class="evidence-help">AI 답변에 사용된 사례와 원문 위치입니다.</p>
-        <ol id="evidence-list" class="evidence-list"></ol>
-      </aside>
-    </div>
+        <div class="answer-card">
+          <p id="review-warning" class="review-warning">
+            미검수 참고 답변입니다. 실제 업무 처리 전 최신 지침을 확인하세요.
+          </p>
+          <div id="answer-text" class="answer-text"></div>
+        </div>
+
+        <section id="related-section" class="related-section" aria-labelledby="related-cases-title">
+          <div class="section-heading">
+            <div>
+              <h3 id="related-cases-title">관련 사례 질의·답변</h3>
+              <p>관련도순 · 내용을 눌러 질의와 답변을 확인하세요.</p>
+            </div>
+          </div>
+          <div id="related-cases" class="related-cases"></div>
+        </section>
+      </section>
+    </main>
+
+    <dialog id="history-dialog" class="history-dialog" aria-labelledby="history-title">
+      <div class="dialog-header">
+        <div>
+          <h2 id="history-title">최근 질문</h2>
+          <p>이 기기에서만 저장됩니다.</p>
+        </div>
+        <button id="history-close" class="icon-button" type="button" aria-label="최근 질문 닫기">
+          <span aria-hidden="true"></span>
+        </button>
+      </div>
+      <ol id="history-list" class="history-list"></ol>
+      <p id="history-empty" class="history-empty">이 기기에 저장된 최근 질문이 없습니다.</p>
+      <div class="dialog-footer">
+        <button id="clear-history" class="text-button" type="button">최근 질문 지우기</button>
+      </div>
+    </dialog>
   </body>
 </html>

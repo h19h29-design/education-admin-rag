@@ -225,8 +225,10 @@ def public_cases_from_evidence(
             _raise()
         searchable = f"{case.title}\n{case.question}\n{case.answer}".casefold()
         matched = {token for token in tokens if token in searchable}
-        if (len(tokens) == 1 and matched) or len(matched) >= 2 or any(
-            len(token) >= 4 and token in searchable for token in tokens
+        if (
+            (len(tokens) == 1 and matched)
+            or len(matched) >= 2
+            or any(len(token) >= 4 and token in searchable for token in tokens)
         ):
             selected.append(case)
     return tuple(selected)

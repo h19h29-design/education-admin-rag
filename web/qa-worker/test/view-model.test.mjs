@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  expirePendingHistory,
+  historyStatusLabel,
   normalizeCompletion,
   normalizeHistory,
+  PENDING_TIMEOUT_MS,
   publicSourceLabel,
   resolveTheme,
 } from "../public/view-model.js";
@@ -112,4 +115,59 @@ test("history accepts a strict pending row", () => {
     status: "pending",
   };
   assert.deepEqual(normalizeHistory([pending]), [pending]);
+});
+
+test("history drops an impossible timestamp before the browser renders it", () => {
+  assert.deepEqual(
+    normalizeHistory([
+      {
+        createdAt: 9_000_000_000_000_000,
+        pollToken: "E".repeat(43),
+        question: "계약 기준",
+        requestId: "senqa-abcdefabcdefabcdefabcdefabcdefab",
+        status: "pending",
+      },
+    ]),
+    [],
+  );
+});
+
+test("history marks a pending request older than five minutes for a fresh retry", () => {
+  const pending = {
+    createdAt: 1_800_000_000_000,
+    pollToken: "C".repeat(43),
+    question: "계약 물품 기준",
+    requestId: "senqa-fedcfedcfedcfedcfedcfedcfedcfedc",
+    status: "pending",
+  };
+
+  assert.deepEqual(expirePendingHistory([pending], pending.createdAt + PENDING_TIMEOUT_MS), [
+    {
+      createdAt: pending.createdAt,
+      question: pending.question,
+      requestId: pending.requestId,
+      status: "retry",
+    },
+  ]);
+});
+
+test("history keeps a recent pending request pollable", () => {
+  const pending = {
+    createdAt: 1_800_000_000_000,
+    pollToken: "D".repeat(43),
+    question: "휴가 기준",
+    requestId: "senqa-abcdefabcdefabcdefabcdefabcdefab",
+    status: "pending",
+  };
+
+  assert.deepEqual(
+    expirePendingHistory([pending], pending.createdAt + PENDING_TIMEOUT_MS - 1),
+    [pending],
+  );
+});
+
+test("history exposes only public status labels", () => {
+  assert.equal(historyStatusLabel("complete"), "검색 완료");
+  assert.equal(historyStatusLabel("pending"), "답변 준비 중");
+  assert.equal(historyStatusLabel("retry"), "다시 검색 필요");
 });

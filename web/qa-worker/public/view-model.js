@@ -7,6 +7,8 @@ const CASES_ONLY_TEXT =
   "답변을 정리하지 못했습니다. 관련 사례는 아래 목록에서 직접 확인해 주세요.";
 const LEGACY_TEXT =
   "이전 형식의 답변입니다. 같은 질문을 다시 검색해 관련 사례를 확인해 주세요.";
+export const PENDING_TIMEOUT_MS = 5 * 60 * 1_000;
+const MAX_DATE_TIMESTAMP = 8_640_000_000_000_000;
 const FORBIDDEN_TERMS = [
   "gitlab",
   "webhook",
@@ -134,6 +136,12 @@ export function resolveTheme(stored, prefersDark) {
   return prefersDark === true ? "dark" : "light";
 }
 
+export function historyStatusLabel(status) {
+  if (status === "complete") return "검색 완료";
+  if (status === "retry") return "다시 검색 필요";
+  return "답변 준비 중";
+}
+
 export function normalizeHistory(value) {
   if (!Array.isArray(value)) return [];
   const checked = [];
@@ -144,8 +152,7 @@ export function normalizeHistory(value) {
       item.constructor !== Object ||
       !Number.isSafeInteger(item.createdAt) ||
       item.createdAt < 1 ||
-      typeof item.pollToken !== "string" ||
-      !POLL_TOKEN_RE.test(item.pollToken) ||
+      item.createdAt > MAX_DATE_TIMESTAMP ||
       typeof item.question !== "string" ||
       !item.question.trim() ||
       item.question.length > 1_000 ||
@@ -156,7 +163,9 @@ export function normalizeHistory(value) {
     }
     if (
       item.status === "pending" &&
-      exactObject(item, ["createdAt", "pollToken", "question", "requestId", "status"])
+      exactObject(item, ["createdAt", "pollToken", "question", "requestId", "status"]) &&
+      typeof item.pollToken === "string" &&
+      POLL_TOKEN_RE.test(item.pollToken)
     ) {
       checked.push({
         createdAt: item.createdAt,
@@ -169,7 +178,9 @@ export function normalizeHistory(value) {
     }
     if (
       item.status === "complete" &&
-      exactObject(item, ["createdAt", "pollToken", "question", "requestId", "result", "status"])
+      exactObject(item, ["createdAt", "pollToken", "question", "requestId", "result", "status"]) &&
+      typeof item.pollToken === "string" &&
+      POLL_TOKEN_RE.test(item.pollToken)
     ) {
       const result = normalizeCompletion(item.result);
       if (result && result.request_id === item.requestId) {
@@ -182,7 +193,34 @@ export function normalizeHistory(value) {
           status: "complete",
         });
       }
+      continue;
+    }
+    if (
+      item.status === "retry" &&
+      exactObject(item, ["createdAt", "question", "requestId", "status"])
+    ) {
+      checked.push({
+        createdAt: item.createdAt,
+        question: item.question,
+        requestId: item.requestId,
+        status: "retry",
+      });
     }
   }
   return checked;
+}
+
+export function expirePendingHistory(value, now) {
+  const timestamp = Number.isSafeInteger(now) && now > 0 ? now : Date.now();
+  return normalizeHistory(value).map((item) => {
+    if (item.status !== "pending" || timestamp - item.createdAt < PENDING_TIMEOUT_MS) {
+      return item;
+    }
+    return {
+      createdAt: item.createdAt,
+      question: item.question,
+      requestId: item.requestId,
+      status: "retry",
+    };
+  });
 }
