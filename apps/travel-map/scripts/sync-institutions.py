@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+from app.environment import EnvironmentFileError, load_environment_file
 from app.institutions.models import InstitutionStatus
 from app.institutions.snapshot import verify_snapshot
 from app.institutions.sources.common import EnrichmentProvenance, SourceDataError
@@ -84,6 +85,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--timing", default="20261")
     parser.add_argument("--snapshot-id")
+    parser.add_argument("--env-file", type=Path)
     return parser.parse_args()
 
 
@@ -255,6 +257,11 @@ async def _run_with_keys(
 
 def main() -> int:
     args = parse_args()
+    try:
+        load_environment_file(args.env_file)
+    except EnvironmentFileError:
+        print("invalid environment file", file=sys.stderr)
+        return 2
     missing = [
         name for name in _REQUIRED_KEYS if not os.environ.get(name, "").strip()
     ]

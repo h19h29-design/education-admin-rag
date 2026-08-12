@@ -40,8 +40,8 @@ ARG SNAPSHOT_ID
 COPY --chown=appuser:appuser resources/institution-snapshots/current.json /app/resources/institution-snapshots/current.json
 COPY --chown=appuser:appuser resources/institution-snapshots/${SNAPSHOT_ID}/ /app/resources/institution-snapshots/${SNAPSHOT_ID}/
 RUN test -n "$SNAPSHOT_ID" \
-    && test "$(python -c 'import json; print(json.load(open("/app/resources/institution-snapshots/current.json", encoding="utf-8"))["snapshotId"])')" = "$SNAPSHOT_ID" \
-    && python -c 'from app.institutions.snapshot import verify_snapshot; verify_snapshot("/app/resources/institution-snapshots")'
+    && test "$(.venv/bin/python -c 'import json; print(json.load(open("/app/resources/institution-snapshots/current.json", encoding="utf-8"))["snapshotId"])')" = "$SNAPSHOT_ID" \
+    && .venv/bin/python -c 'from app.institutions.snapshot import verify_snapshot; from app.policy.coverage import verify_geodata_resources; from app.policy.rules import RuleRepository; verify_snapshot("/app/resources/institution-snapshots"); verify_geodata_resources("/app/resources/geodata", verify_source=False); RuleRepository.from_directory("/app/resources/rules", require_hashes=True)'
 
 USER appuser
 

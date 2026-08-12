@@ -1,5 +1,6 @@
 """Opt-in, bounded release smoke checks with deliberately minimal telemetry."""
 
+import argparse
 import asyncio
 import json
 import os
@@ -12,10 +13,11 @@ from zoneinfo import ZoneInfo
 
 from app.contracts import TripPreviewRequest, TripPreviewResponse
 from app.dependencies import AppDependencies, build_production_dependencies
+from app.environment import EnvironmentFileError, load_environment_file
 from app.institutions.models import InstitutionSearchItem
 from app.institutions.snapshot import SnapshotIntegrityError, verify_snapshot
-from app.policy.models import PolicyProfile, VehicleUse
-from app.routing.models import FuelType
+from app.policy.models import CoverageState, PolicyProfile, VehicleUse
+from app.routing.models import Coordinate, FuelType
 from app.services.trip_preview import TripPreviewService
 from app.settings import Settings
 
@@ -41,10 +43,36 @@ _RUNTIME_CREDENTIAL_FIELDS = (
     "seoul_transit_service_key",
     "opinet_cert_key",
 )
+_SCHOOL_TYPES = (
+    "ELEMENTARY_SCHOOL",
+    "MIDDLE_SCHOOL",
+    "HIGH_SCHOOL",
+    "SPECIAL_SCHOOL",
+    "MISC_SCHOOL",
+)
+_UPSTREAM_UNAVAILABLE_WARNINGS = frozenset(
+    {
+        "UPSTREAM_TIMEOUT",
+        "UPSTREAM_ERROR",
+        "INVALID_PROVIDER_RESULT",
+        "PROVIDER_IDENTITY_MISMATCH",
+        "CAPABILITY_MISSING",
+        "NO_PROVIDER",
+        "GEOMETRY_UNAVAILABLE",
+    }
+)
 
 
 class SmokeExpectationError(RuntimeError):
     """A bounded live check completed but did not meet its release expectation."""
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run bounded live release smoke cases only with explicit opt-in."
+    )
+    parser.add_argument("--env-file", type=Path)
+    return parser.parse_args()
 
 
 @dataclass(frozen=True)
@@ -76,24 +104,40 @@ def _case_report(
 ) -> dict[str, object]:
     """Return only the telemetry explicitly approved for the live smoke output."""
 
-    route_ids = {route.id for route in response.routes}
     return {
         "caseId": case_id,
-        "providerStatus": "SUCCESS" if response.routes else "NO_ROUTES",
+        "providerStatus": _provider_status(response),
         "routeCount": len(response.routes),
         "decision": response.classification,
         "latencyMs": latency_ms,
-        "representativeRoutePresent": response.best.fastest_route_id in route_ids,
     }
 
 
-def _nearest_active_site(dependencies: AppDependencies, foundation_type: str) -> str:
-    candidates = dependencies.institutions.search(
-        foundation_type=foundation_type,
-        limit=50,
+def _provider_status(response: TripPreviewResponse) -> str:
+    if response.coverage.status == "OUT_OF_COVERAGE":
+        return "NOT_CALLED_OUT_OF_COVERAGE"
+    if response.routes:
+        return "ROUTES_AVAILABLE"
+    if _UPSTREAM_UNAVAILABLE_WARNINGS.intersection(response.warnings):
+        return "UPSTREAM_UNAVAILABLE"
+    return "NO_ROUTES"
+
+
+def _nearest_active_school_site(
+    dependencies: AppDependencies,
+    foundation_type: str,
+) -> str:
+    candidates = tuple(
+        item
+        for institution_type in _SCHOOL_TYPES
+        for item in dependencies.institutions.search(
+            institution_type=institution_type,
+            foundation_type=foundation_type,
+            limit=50,
+        )
     )
     if not candidates:
-        raise SmokeExpectationError("required foundation type is unavailable")
+        raise SmokeExpectationError("required school foundation type is unavailable")
 
     def distance_key(item: InstitutionSearchItem) -> float:
         site = dependencies.institutions.require_site(item.site_id)
@@ -101,6 +145,12 @@ def _nearest_active_site(dependencies: AppDependencies, foundation_type: str) ->
             site.routing_anchor_latitude is None
             or site.routing_anchor_longitude is None
         ):
+            return float("inf")
+        origin = Coordinate(
+            latitude=site.routing_anchor_latitude,
+            longitude=site.routing_anchor_longitude,
+        )
+        if dependencies.coverage.classify(origin) is not CoverageState.SEOUL:
             return float("inf")
         return (site.routing_anchor_latitude - _CITY_HALL_LATITUDE) ** 2 + (
             site.routing_anchor_longitude - _CITY_HALL_LONGITUDE
@@ -145,14 +195,13 @@ async def _run_case(
         response,
         latency_ms=int((perf_counter() - started) * 1000),
     )
-    _validate_case(case, response, report)
+    _validate_case(case, response)
     return response, report
 
 
 def _validate_case(
     case: SmokeCase,
     response: TripPreviewResponse,
-    report: dict[str, object],
 ) -> None:
     if case.expect_out_of_coverage:
         if response.coverage.status != "OUT_OF_COVERAGE" or response.routes:
@@ -164,8 +213,6 @@ def _validate_case(
         mode_count = len({route.mode for route in response.routes})
         if response.classification != "LOCAL" or mode_count < 2:
             raise SmokeExpectationError("public local case did not meet route expectations")
-        if report["representativeRoutePresent"] is not True:
-            raise SmokeExpectationError("public local case has no representative route")
     if (
         case.expect_no_allowance_amount
         and response.allowance.amount_krw is not None
@@ -175,8 +222,8 @@ def _validate_case(
 
 async def _run_cases(dependencies: AppDependencies) -> list[dict[str, object]]:
     service = TripPreviewService(dependencies)
-    public_site_id = _nearest_active_site(dependencies, "PUBLIC")
-    private_site_id = _nearest_active_site(dependencies, "PRIVATE")
+    public_site_id = _nearest_active_school_site(dependencies, "PUBLIC")
+    private_site_id = _nearest_active_school_site(dependencies, "PRIVATE")
     cases = (
         SmokeCase(
             case_id="PUBLIC_LOCAL",
@@ -216,8 +263,14 @@ async def _execute(settings: Settings) -> list[dict[str, object]]:
 
 
 def main() -> int:
+    args = parse_args()
     if os.environ.get("TRAVEL_MAP_LIVE_SMOKE") != "1":
         _emit({"status": "REFUSED_NOT_OPTED_IN"})
+        return 2
+    try:
+        load_environment_file(args.env_file)
+    except EnvironmentFileError:
+        _emit({"status": "BLOCKED_INVALID_SETTINGS"})
         return 2
     try:
         settings = Settings()

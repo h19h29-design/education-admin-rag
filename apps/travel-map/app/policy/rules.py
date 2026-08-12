@@ -1,4 +1,6 @@
+import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -15,6 +17,9 @@ RULE_PAYLOAD_KEYS = {
     "officialVehicleDeductionKrw",
     "sourceRefs",
 }
+_RULE_INDEX_FIELDS = {"effectiveFrom", "file"}
+_HASHED_RULE_INDEX_FIELDS = _RULE_INDEX_FIELDS | {"sha256"}
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
@@ -47,17 +52,51 @@ class RuleRepository:
         self._rules = tuple(sorted(rules, key=lambda item: item.effective_from))
 
     @classmethod
-    def from_directory(cls, directory: str | Path) -> "RuleRepository":
+    def from_directory(
+        cls,
+        directory: str | Path,
+        *,
+        require_hashes: bool = False,
+    ) -> "RuleRepository":
         root = Path(directory)
         index = json.loads((root / "index.json").read_text(encoding="utf-8"))
+        if type(index) is not dict or set(index) != {"rules"}:
+            raise ValueError("rule index must contain exactly the rules field")
+        entries = index["rules"]
+        if type(entries) is not list or not entries:
+            raise ValueError("rule index must contain at least one rule")
         rules: list[RuleSet] = []
-        for entry in index["rules"]:
-            payload = json.loads((root / entry["file"]).read_text(encoding="utf-8"))
+        for entry in entries:
+            if type(entry) is not dict or (
+                set(entry) != _RULE_INDEX_FIELDS
+                and set(entry) != _HASHED_RULE_INDEX_FIELDS
+            ):
+                raise ValueError("rule index entry is invalid")
+            filename = entry["file"]
+            if (
+                type(filename) is not str
+                or not filename.endswith(".json")
+                or Path(filename).name != filename
+            ):
+                raise ValueError("rule index filename is invalid")
+            data = (root / filename).read_bytes()
+            expected_hash = entry.get("sha256")
+            if require_hashes and expected_hash is None:
+                raise ValueError("rule index must pin every rule sha256")
+            if expected_hash is not None:
+                if (
+                    type(expected_hash) is not str
+                    or _SHA256.fullmatch(expected_hash) is None
+                ):
+                    raise ValueError("rule index sha256 is invalid")
+                if hashlib.sha256(data).hexdigest() != expected_hash:
+                    raise ValueError(f"rule sha256 mismatch: {filename}")
+            payload = json.loads(data)
             if not isinstance(payload, dict) or set(payload) != RULE_PAYLOAD_KEYS:
                 raise ValueError("rule payload must contain exactly the supported keys")
             if payload["effectiveFrom"] != entry["effectiveFrom"]:
                 raise ValueError(
-                    f"index and payload effectiveFrom differ for {entry['file']}"
+                    f"index and payload effectiveFrom differ for {filename}"
                 )
             source_refs = payload["sourceRefs"]
             if not isinstance(source_refs, list):

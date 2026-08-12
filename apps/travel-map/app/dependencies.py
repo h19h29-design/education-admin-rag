@@ -10,7 +10,7 @@ import orjson
 
 from app.cache import TtlLruCache
 from app.institutions.store import InstitutionStore
-from app.policy.coverage import CoverageService
+from app.policy.coverage import CoverageService, verify_geodata_resources
 from app.policy.engine import PolicyEngine
 from app.policy.rules import RuleRepository
 from app.providers.kakao_local import KakaoLocalClient
@@ -80,19 +80,20 @@ def build_production_dependencies(settings: Settings) -> AppDependencies:
     snapshot_root = resources / "institution-snapshots"
     if not snapshot_root.is_dir():
         raise RuntimeError("verified institution snapshot is unavailable")
-    seoul_path = resources / "geodata/seoul.geojson"
-    support_path = resources / "geodata/seoul-plus-12km.geojson"
-    seoul_geojson = _verified_geojson_bytes(seoul_path)
-    support_geojson = _verified_geojson_bytes(support_path)
+    geodata = verify_geodata_resources(resources / "geodata", verify_source=False)
+    seoul_geojson = _verified_geojson_bytes(geodata.seoul_geojson, "seoul.geojson")
+    support_geojson = _verified_geojson_bytes(
+        geodata.support_geojson,
+        "seoul-plus-12km.geojson",
+    )
     route_providers = build_route_providers(settings)
     return AppDependencies(
         settings=settings,
         institutions=InstitutionStore.load(snapshot_root),
-        coverage=CoverageService.from_geojson(
-            seoul_path=seoul_path,
-            buffer_distance_m=12_000,
+        coverage=CoverageService.from_resources(resources / "geodata", verify_source=False),
+        policy=PolicyEngine(
+            RuleRepository.from_directory(resources / "rules", require_hashes=True)
         ),
-        policy=PolicyEngine(RuleRepository.from_directory(resources / "rules")),
         route_orchestrator=RouteOrchestrator(
             route_providers,
             max_concurrency=settings.route_max_concurrency,
@@ -112,11 +113,11 @@ def build_production_dependencies(settings: Settings) -> AppDependencies:
     )
 
 
-def _verified_geojson_bytes(path: Path) -> bytes:
+def _verified_geojson_bytes(data: bytes, label: str) -> bytes:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"verified geodata is unavailable: {path.name}") from exc
+        payload = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"verified geodata is unavailable: {label}") from exc
     if (
         type(payload) is not dict
         or payload.get("type") != "FeatureCollection"
@@ -124,5 +125,5 @@ def _verified_geojson_bytes(path: Path) -> bytes:
         or not payload["features"]
         or any(type(feature) is not dict for feature in payload["features"])
     ):
-        raise RuntimeError(f"verified geodata is invalid: {path.name}")
+        raise RuntimeError(f"verified geodata is invalid: {label}")
     return orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
