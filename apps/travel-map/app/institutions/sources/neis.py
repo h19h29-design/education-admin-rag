@@ -201,8 +201,7 @@ def parse_neis_rows(
     selectable_rows = [
         row
         for row in rows
-        if _required_string_from_object(row, "SCHUL_KND_SC_NM")
-        not in _NONSELECTABLE_TYPES
+        if _required_school_kind_label(row) not in _NONSELECTABLE_TYPES
     ]
     return tuple(
         _parse_row(row, unclassified_policy=unclassified_policy)[0]
@@ -275,7 +274,7 @@ def _parse_row(
             raise SourceDataError("NEIS row is not in the B10 source region")
         school_code = _required_string(row, "SD_SCHUL_CODE")
         foundation = _FOUNDATION_TYPES[_required_string(row, "FOND_SC_NM")]
-        raw_kind = _required_string(row, "SCHUL_KND_SC_NM")
+        raw_kind = _required_school_kind_label(row)
         if raw_kind in _INSTITUTION_TYPES:
             institution_type = _INSTITUTION_TYPES[raw_kind]
             source_kind_label = None
@@ -318,6 +317,17 @@ def _required_string_from_object(row: object, name: str) -> str:
     if type(row) is not dict:
         raise SourceDataError("NEIS row must be an object")
     return _required_string(row, name)
+
+
+def _required_school_kind_label(row: object) -> str:
+    if type(row) is not dict:
+        raise SourceDataError("NEIS row must be an object")
+    value = row.get("SCHUL_KND_SC_NM")
+    if type(value) is not str or not value or value != value.strip():
+        raise SourceDataError(
+            "NEIS school kind label must be a nonblank exact string"
+        )
+    return value
 
 
 def _district_from_address(address: str) -> str:

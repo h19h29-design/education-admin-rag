@@ -308,6 +308,36 @@ def test_neis_unclassified_policy_rejects_tuple_subclass_whitelist_spoof() -> No
         )
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["sha256", "reviewed_as_of", "reviewer_role"],
+)
+def test_neis_unclassified_policy_rejects_spoofed_string_metadata(
+    field: str,
+) -> None:
+    class SpoofedReviewedString(str):
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        def __ne__(self, other: object) -> bool:
+            return False
+
+    values = {
+        "sha256": PINNED_POLICY_SHA256,
+        "reviewed_as_of": "2026-08-13",
+        "reviewer_role": "data-steward",
+    }
+    values[field] = SpoofedReviewedString("unreviewed")
+
+    with pytest.raises(SourceDataError, match="reviewed"):
+        NeisUnclassifiedPolicy(
+            counts=REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts,
+            sha256=values["sha256"],
+            reviewed_as_of=values["reviewed_as_of"],
+            reviewer_role=values["reviewer_role"],
+        )
+
+
 def test_neis_unclassified_policy_rejects_oversized_file_before_content_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -518,6 +548,34 @@ async def test_neis_rejects_quarantine_count_drift(
                 unclassified_policy=policy,
                 page_size=len(source_types),
             ).fetch()
+
+
+@pytest.mark.asyncio
+async def test_neis_rejects_school_kind_whitespace_before_candidate_or_pointer_mutation(
+    tmp_path: Path,
+) -> None:
+    source_types = list(reviewed_neis_source_types())
+    source_types[source_types.index("평생학교(고)-2년6학기")] += " "
+    payload = neis_payload_rows(*source_types)
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    pointer = snapshot_root / "current.json"
+    original_pointer = b'{"snapshotId":"approved-before-fetch"}\n'
+    pointer.write_bytes(original_pointer)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(SourceDataError, match="school kind|unsupported"):
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
+
+    assert not (snapshot_root / ".whitespace.candidate").exists()
+    assert pointer.read_bytes() == original_pointer
 
 
 def test_neis_rejects_unknown_lifelong_school_label_before_candidate_creation() -> None:

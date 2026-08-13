@@ -46,6 +46,9 @@ class NeisUnclassifiedPolicy:
     def __post_init__(self) -> None:
         if (
             not _is_canonical_counts(self.counts)
+            or type(self.sha256) is not str
+            or type(self.reviewed_as_of) is not str
+            or type(self.reviewer_role) is not str
             or self.counts != _REVIEWED_COUNTS
             or self.sha256 != PINNED_POLICY_SHA256
             or self.reviewed_as_of != _REVIEWED_AS_OF
