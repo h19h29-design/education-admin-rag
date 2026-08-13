@@ -21,7 +21,7 @@
 
 ## 분류 및 격리 계약
 
-NEIS 정규화 단계는 위 네 개 원본 유형만 `UNCLASSIFIED_SCHOOL`로 변환한다. `SourceInstitutionRecord`는 정규화 유형과 별도로 `source_kind_label`을 갖는다. 이 필드는 NEIS 레코드에서만 사용하며 정규화 해시에 결합한다. 원천 분류명은 관리자 감사 및 provenance 무결성 용도일 뿐, 공개 API나 이용자 UI에 노출하지 않는다.
+NEIS 정규화 단계는 위 네 개 원본 유형만 `UNCLASSIFIED_SCHOOL`로 변환한다. `SourceInstitutionRecord`는 정규화 유형과 별도로 `source_kind_label`을 갖는다. 이 필드는 NEIS 레코드의 동기화·후보 생성 안에서만 사용하고 snapshot 기관 JSONL에는 저장하지 않는다. 대신 정렬된 유형별 집계와 검수 리소스 해시를 source provenance·signed transaction·review digest에 결합한다. 원천 분류명은 관리자 감사 및 provenance 무결성 용도일 뿐, 공개 API나 이용자 UI에 노출하지 않는다.
 
 새로운 미분류 유형, 기대 건수와 다른 건수, 허용 리소스의 스키마·해시 변경은 모두 원천 단계에서 실패한다. 조용히 새 유형을 더 많이 격리하거나 기존 학교 범주로 편입할 수 없다.
 
