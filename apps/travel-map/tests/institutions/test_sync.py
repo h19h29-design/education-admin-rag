@@ -1198,6 +1198,86 @@ def test_same_digest_published_retry_is_idempotent(tmp_path: Path) -> None:
     assert (tmp_path / "current.json").read_bytes() == pointer_before
 
 
+# Production break caught: changing and reattesting a candidate after its digest
+# comparison can otherwise publish data the reviewer did not approve.
+def test_approval_rechecks_digest_after_post_comparison_candidate_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="digest-race-baseline",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="digest-race-candidate",
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    review_digest = packet["reviewDigest"]
+    assert isinstance(review_digest, str)
+    real_compare_digest = sync_module.hmac.compare_digest
+    changed = False
+
+    def change_after_review_comparison(left: object, right: object) -> bool:
+        nonlocal changed
+        result = real_compare_digest(left, right)
+        if not changed and left == review_digest and right == review_digest:
+            manifest_path = candidate.candidate_path / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["createdAt"] = "2099-01-01T00:00:00Z"
+            sync_module._write_json(manifest_path, manifest)
+            transaction_path = (
+                tmp_path / ".sync-transactions" / f"{candidate.snapshot_id}.json"
+            )
+            transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+            transaction["manifestSha256"] = sync_module._manifest_section_sha256(
+                manifest
+            )
+            transaction.pop("signature")
+            sync_module._write_signed_transaction(
+                tmp_path,
+                transaction,
+                replace_existing=True,
+            )
+            changed = True
+        return result
+
+    monkeypatch.setattr(
+        sync_module.hmac,
+        "compare_digest",
+        change_after_review_comparison,
+    )
+
+    with pytest.raises(SnapshotQualityError, match="review digest"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=review_digest,
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+    rebuilt = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    assert changed is True
+    assert rebuilt["reviewDigest"] != review_digest
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+    assert verify_snapshot(tmp_path).manifest.snapshot_id == baseline.snapshot_id
+
+
 def test_automatic_promotion_symbol_is_not_public(
     tmp_path: Path,
 ) -> None:
@@ -1527,8 +1607,8 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
 
     lines = capsys.readouterr().out.splitlines()
     assert lines[-1] == (
-        '{"snapshotId": "candidate-only-cli", '
-        '"status": "CANDIDATE_REVIEW_REQUIRED"}'
+        '{"snapshotId":"candidate-only-cli",'
+        '"status":"CANDIDATE_REVIEW_REQUIRED"}'
     )
     assert (snapshot_root / ".candidate-only-cli.candidate").is_dir()
     assert not (snapshot_root / "current.json").exists()

@@ -214,6 +214,7 @@ async def _run_with_keys(
             },
             ensure_ascii=False,
             sort_keys=True,
+            separators=(",", ":"),
         )
     )
 

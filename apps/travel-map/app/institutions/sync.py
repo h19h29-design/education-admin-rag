@@ -682,6 +682,23 @@ def build_candidate_review_packet(
         coverage=coverage,
         allow_final_recovery=True,
     )
+    return _review_packet_from_loaded_candidate(
+        snapshot_id=snapshot_id,
+        candidate=candidate,
+        manifest=manifest,
+        institutions=institutions,
+        sites=sites,
+    )
+
+
+def _review_packet_from_loaded_candidate(
+    *,
+    snapshot_id: str,
+    candidate: SnapshotBuildResult,
+    manifest: dict[str, object],
+    institutions: list[Institution],
+    sites: list[InstitutionSite],
+) -> dict[str, object]:
     source_entries = cast(list[dict[str, object]], manifest["sources"])
     source_counts: dict[str, object] = {}
     source_observation_counts: dict[str, object] = {}
@@ -812,7 +829,12 @@ def approve_candidate_snapshot(
         recomputed_digest = cast(str, packet["reviewDigest"])
         if not hmac.compare_digest(review_digest, recomputed_digest):
             raise SnapshotQualityError("review digest does not match candidate")
-        _promote_snapshot_locked(snapshot_id, root, coverage=coverage)
+        _promote_snapshot_locked(
+            snapshot_id,
+            root,
+            coverage=coverage,
+            expected_review_digest=review_digest,
+        )
         try:
             verified = verify_snapshot(root)
         except (OSError, ValueError) as exc:
@@ -931,14 +953,25 @@ def _promote_snapshot_locked(
     output_root: Path,
     *,
     coverage: CoverageService,
+    expected_review_digest: str,
 ) -> None:
     root = _validated_snapshot_root(Path(output_root))
-    candidate, manifest, _, _, transaction = _load_reviewable_candidate(
+    candidate, manifest, institutions, sites, transaction = _load_reviewable_candidate(
         snapshot_id=snapshot_id,
         root=root,
         coverage=coverage,
         allow_final_recovery=True,
     )
+    final_packet = _review_packet_from_loaded_candidate(
+        snapshot_id=snapshot_id,
+        candidate=candidate,
+        manifest=manifest,
+        institutions=institutions,
+        sites=sites,
+    )
+    final_digest = cast(str, final_packet["reviewDigest"])
+    if not hmac.compare_digest(expected_review_digest, final_digest):
+        raise SnapshotQualityError("review digest does not match candidate")
     selected_path = candidate.candidate_path
     expected_candidate_name = f".{snapshot_id}.candidate"
     candidate_path = root / expected_candidate_name
