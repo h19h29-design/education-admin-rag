@@ -670,15 +670,125 @@ def build_candidate_snapshot(
     )
 
 
-def promote_snapshot(
-    candidate: SnapshotBuildResult,
-    output_root: Path,
+def build_candidate_review_packet(
     *,
+    snapshot_id: str,
+    snapshot_root: Path,
     coverage: CoverageService,
-) -> None:
-    if _SAFE_SNAPSHOT_ID.fullmatch(candidate.snapshot_id) is None:
+) -> dict[str, object]:
+    candidate, manifest, institutions, sites, _ = _load_reviewable_candidate(
+        snapshot_id=snapshot_id,
+        root=Path(snapshot_root),
+        coverage=coverage,
+        allow_final_recovery=True,
+    )
+    source_entries = cast(list[dict[str, object]], manifest["sources"])
+    source_counts: dict[str, object] = {}
+    source_observation_counts: dict[str, object] = {}
+    normalized_observation_counts: dict[str, object] = {}
+    preserved_observation_counts: dict[str, object] = {}
+    for entry in sorted(source_entries, key=lambda item: cast(str, item["source"])):
+        source = cast(str, entry["source"])
+        source_counts[source] = {
+            "fetched": entry["fetchedRowCount"],
+            "normalized": entry["normalizedRowCount"],
+            "preserved": entry["preservedRowCount"],
+            "output": entry["rowCount"],
+        }
+        source_observation_counts[source] = dict(
+            cast(dict[str, int], entry["sourceObservationDateCounts"])
+        )
+        normalized_observation_counts[source] = dict(
+            cast(dict[str, int], entry["normalizedObservationDateCounts"])
+        )
+        preserved_observation_counts[source] = dict(
+            cast(dict[str, int], entry["preservedObservationDateCounts"])
+        )
+    district_counts = {district: 0 for district in _SEOUL_DISTRICTS}
+    for site in sites:
+        if site.is_default and site.district in district_counts:
+            district_counts[site.district] += 1
+    candidate_manifest = dict(manifest)
+    candidate_manifest["approved"] = False
+    candidate_manifest["approvedAt"] = None
+    candidate_manifest["approvedByRole"] = None
+    if manifest.get("approved") is False:
+        manifest_bytes = _validated_snapshot_file(
+            candidate.candidate_path / "manifest.json",
+            candidate.candidate_path,
+            "manifest.json",
+        ).read_bytes()
+    else:
+        manifest_bytes = (
+            json.dumps(
+                candidate_manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    packet: dict[str, object] = {
+        "status": "CANDIDATE_REVIEW_REQUIRED",
+        "snapshotId": snapshot_id,
+        "createdAt": manifest["createdAt"],
+        "snapshotAsOf": manifest["snapshotAsOf"],
+        "previousSnapshotId": cast(dict[str, object], manifest["diff"])[
+            "previousSnapshotId"
+        ],
+        "sourceCounts": source_counts,
+        "sourceObservationDateCounts": source_observation_counts,
+        "normalizedObservationDateCounts": normalized_observation_counts,
+        "preservedObservationDateCounts": preserved_observation_counts,
+        "institutionTypeCounts": dict(
+            cast(dict[str, int], manifest["countsByType"])
+        ),
+        "foundationCounts": dict(
+            cast(dict[str, int], manifest["countsByFoundation"])
+        ),
+        "districtCounts": district_counts,
+        "statusCounts": dict(cast(dict[str, int], manifest["countsByStatus"])),
+        "coordinateQualityCounts": dict(
+            cast(dict[str, int], manifest["coordinateQualityCounts"])
+        ),
+        "quarantinedInstitutionIds": sorted(
+            institution.institution_id
+            for institution in institutions
+            if institution.status is InstitutionStatus.REVIEW_REQUIRED
+        ),
+        "quarantinedSiteIds": sorted(
+            site.site_id
+            for site in sites
+            if site.status is InstitutionStatus.REVIEW_REQUIRED
+        ),
+        "diff": dict(cast(dict[str, object], manifest["diff"])),
+        "institutionsSha256": manifest["institutionsSha256"],
+        "sitesSha256": manifest["sitesSha256"],
+        "candidateManifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "sourceProvenanceSha256": _manifest_section_sha256(manifest["sources"]),
+        "enrichmentProvenanceSha256": _manifest_section_sha256(
+            manifest["enrichments"]
+        ),
+    }
+    packet["reviewDigest"] = _manifest_section_sha256(packet)
+    return packet
+
+
+def approve_candidate_snapshot(
+    *,
+    snapshot_id: str,
+    review_digest: str,
+    reviewer_role: str,
+    snapshot_root: Path,
+    coverage: CoverageService,
+) -> str:
+    if _SAFE_SNAPSHOT_ID.fullmatch(snapshot_id) is None:
         raise SnapshotQualityError("snapshot ID is unsafe")
-    root = _validated_snapshot_root(Path(output_root))
+    if type(review_digest) is not str or _SHA256.fullmatch(review_digest) is None:
+        raise SnapshotQualityError("review digest must be exact lowercase SHA-256")
+    if reviewer_role != "data-steward":
+        raise SnapshotQualityError("reviewer role must be data-steward")
+    root = _validated_snapshot_root(Path(snapshot_root))
     lock_path = root / ".promotion.lock"
     flags = os.O_CREAT | os.O_RDWR
     if hasattr(os, "O_NOFOLLOW"):
@@ -694,7 +804,22 @@ def promote_snapshot(
         ):
             raise SnapshotQualityError("promotion lock must be a regular root file")
         fcntl.flock(descriptor, fcntl.LOCK_EX)
-        _promote_snapshot_locked(candidate, root, coverage=coverage)
+        packet = build_candidate_review_packet(
+            snapshot_id=snapshot_id,
+            snapshot_root=root,
+            coverage=coverage,
+        )
+        recomputed_digest = cast(str, packet["reviewDigest"])
+        if not hmac.compare_digest(review_digest, recomputed_digest):
+            raise SnapshotQualityError("review digest does not match candidate")
+        _promote_snapshot_locked(snapshot_id, root, coverage=coverage)
+        try:
+            verified = verify_snapshot(root)
+        except (OSError, ValueError) as exc:
+            raise SnapshotQualityError("approved snapshot verification failed") from exc
+        if verified.manifest.snapshot_id != snapshot_id:
+            raise SnapshotQualityError("approved snapshot verification failed")
+        return recomputed_digest
     finally:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -702,37 +827,34 @@ def promote_snapshot(
             os.close(descriptor)
 
 
-def _promote_snapshot_locked(
-    candidate: SnapshotBuildResult,
-    output_root: Path,
+def _load_reviewable_candidate(
     *,
+    snapshot_id: str,
+    root: Path,
     coverage: CoverageService,
-) -> None:
-    if _SAFE_SNAPSHOT_ID.fullmatch(candidate.snapshot_id) is None:
+    allow_final_recovery: bool = False,
+) -> tuple[
+    SnapshotBuildResult,
+    dict[str, object],
+    list[Institution],
+    list[InstitutionSite],
+    dict[str, object],
+]:
+    if _SAFE_SNAPSHOT_ID.fullmatch(snapshot_id) is None:
         raise SnapshotQualityError("snapshot ID is unsafe")
-    root = _validated_snapshot_root(Path(output_root))
-    candidate_path = Path(candidate.candidate_path)
-    expected_candidate_name = f".{candidate.snapshot_id}.candidate"
-    try:
-        candidate_parent = candidate_path.parent.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise SnapshotQualityError("candidate path parent is invalid") from exc
-    if (
-        candidate_path.name != expected_candidate_name
-        or candidate_parent != root
-    ):
-        raise SnapshotQualityError("candidate path is outside the snapshot root")
+    root = _validated_snapshot_root(Path(root))
+    expected_candidate_name = f".{snapshot_id}.candidate"
+    candidate_path = root / expected_candidate_name
     if candidate_path.is_symlink():
         raise SnapshotQualityError("candidate path must not be a symlink")
-    transaction = _load_build_transaction(root, candidate.snapshot_id)
+    transaction = _load_build_transaction(root, snapshot_id)
     transaction_issues = transaction.get("issues")
     if type(transaction_issues) is not list:
         raise SnapshotQualityError("build transaction issues are invalid")
     if transaction_issues:
         raise SnapshotQualityError("; ".join(cast(list[str], transaction_issues)))
     phase = cast(str, transaction["phase"])
-    candidate_path = root / expected_candidate_name
-    final_path = root / candidate.snapshot_id
+    final_path = root / snapshot_id
     if final_path.is_symlink():
         raise SnapshotQualityError("final snapshot path must not be a symlink")
     current_path = root / "current.json"
@@ -741,6 +863,8 @@ def _promote_snapshot_locked(
     if candidate_path.exists() and final_path.exists():
         raise SnapshotQualityError("candidate and final snapshot both exist")
     selected_path = candidate_path if candidate_path.exists() else final_path
+    if selected_path == final_path and not allow_final_recovery:
+        raise SnapshotQualityError("candidate snapshot is missing")
     if not selected_path.is_dir():
         raise SnapshotQualityError("candidate snapshot is missing")
     manifest_path = _validated_snapshot_file(
@@ -788,15 +912,40 @@ def _promote_snapshot_locked(
         _validate_approved_manifest_schema(manifest)
     else:
         raise SnapshotQualityError("recoverable final manifest approval is invalid")
-    institutions, sites = _recheck_candidate(
-        selected_path,
-        manifest,
-        candidate.snapshot_id,
-    )
+    institutions, sites = _recheck_candidate(selected_path, manifest, snapshot_id)
     _recheck_promotion_quality(root, manifest, institutions, sites, coverage)
     _recheck_source_provenance(manifest, institutions, sites)
     _recheck_enrichment_provenance(manifest, institutions, sites)
     _transaction_attests_manifest(transaction, manifest)
+    candidate = SnapshotBuildResult(
+        snapshot_id=snapshot_id,
+        candidate_path=selected_path,
+        approved=False,
+        issues=(),
+    )
+    return candidate, manifest, institutions, sites, transaction
+
+
+def _promote_snapshot_locked(
+    snapshot_id: str,
+    output_root: Path,
+    *,
+    coverage: CoverageService,
+) -> None:
+    root = _validated_snapshot_root(Path(output_root))
+    candidate, manifest, _, _, transaction = _load_reviewable_candidate(
+        snapshot_id=snapshot_id,
+        root=root,
+        coverage=coverage,
+        allow_final_recovery=True,
+    )
+    selected_path = candidate.candidate_path
+    expected_candidate_name = f".{snapshot_id}.candidate"
+    candidate_path = root / expected_candidate_name
+    final_path = root / snapshot_id
+    current_path = root / "current.json"
+    phase = cast(str, transaction["phase"])
+    manifest_path = selected_path / "manifest.json"
     for file_name in ("manifest.json", "institutions.jsonl", "sites.jsonl"):
         _fsync_file(selected_path / file_name)
     _fsync_directory(selected_path)
@@ -857,7 +1006,7 @@ def _promote_snapshot_locked(
     _transaction_attests_manifest(transaction, manifest)
 
     try:
-        verify_snapshot_directory(root, candidate.snapshot_id)
+        verify_snapshot_directory(root, snapshot_id)
     except SnapshotIntegrityError as exc:
         raise SnapshotQualityError(
             "strict snapshot verification failed before pointer publication"
@@ -876,7 +1025,7 @@ def _promote_snapshot_locked(
             raise SnapshotQualityError(
                 "published build transaction pointer is invalid"
             ) from exc
-        if verified.manifest.snapshot_id != candidate.snapshot_id:
+        if verified.manifest.snapshot_id != snapshot_id:
             raise SnapshotQualityError(
                 "published build transaction pointer is invalid"
             )
@@ -899,7 +1048,7 @@ def _promote_snapshot_locked(
     )
     _write_json(
         temporary_pointer,
-        {"snapshotId": candidate.snapshot_id},
+        {"snapshotId": snapshot_id},
         durable=True,
     )
     os.replace(temporary_pointer, current_path)

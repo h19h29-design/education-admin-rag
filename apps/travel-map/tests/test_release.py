@@ -10,6 +10,16 @@ from types import SimpleNamespace
 import pytest
 from app.contracts import TripPreviewResponse
 from app.institutions.snapshot import verify_snapshot
+from app.institutions.sources.common import (
+    SourceInstitutionRecord,
+    SourceProvenance,
+    normalized_records_sha256,
+)
+from app.institutions.sync import (
+    approve_candidate_snapshot,
+    build_candidate_review_packet,
+    build_candidate_snapshot,
+)
 from app.policy.coverage import CoverageService
 from app.policy.models import CoverageState
 from app.policy.rules import RuleRepository
@@ -157,6 +167,88 @@ def test_release_context_contains_only_the_current_verified_snapshot(
     assert not (context_root / "resources/institution-sources").exists()
     assert not (context_root / "tests").exists()
     assert not (context_root / "e2e").exists()
+
+
+def test_release_context_blocks_candidate_until_exact_digest_approval(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "travel-map"
+    shutil.copytree(ROOT, source_root)
+    snapshot_root = source_root / "resources/institution-snapshots"
+    snapshot_root.mkdir()
+    records = (
+        SourceInstitutionRecord(
+            institution_id="neis:B10:7010001",
+            official_name="검증학교",
+            institution_type="ELEMENTARY_SCHOOL",
+            foundation_type="PUBLIC",
+            education_office="서울특별시교육청",
+            road_address="서울특별시 중구 검증로 1",
+            district="중구",
+            latitude=37.56,
+            longitude=126.97,
+            source="NEIS",
+            source_region_code="B10",
+            source_as_of="2026-08-12",
+            coordinate_quality="MANUALLY_VERIFIED",
+        ),
+    )
+    provenance = SourceProvenance(
+        source="NEIS",
+        endpoint="https://open.neis.go.kr/hub/schoolInfo",
+        license_name="PUBLIC_DATA_NO_USE_RESTRICTION",
+        attribution="Ministry of Education NEIS education data",
+        fetched_at="2026-08-12T09:00:00Z",
+        source_as_of="2026-08-12",
+        source_observation_date_counts=(("2026-08-12", 1),),
+        normalized_observation_date_counts=(("2026-08-12", 1),),
+        raw_sha256="a" * 64,
+        page_count=1,
+        row_count=1,
+        fetched_row_count=1,
+        request_region_code="B10",
+        normalized_sha256=normalized_records_sha256(records),
+    )
+    coverage = CoverageService.from_geojson(
+        seoul_path=source_root / "resources/geodata/seoul.geojson",
+        buffer_distance_m=12_000,
+    )
+    build_candidate_snapshot(
+        records=records,
+        previous=None,
+        output_root=snapshot_root,
+        snapshot_id="release-review-candidate",
+        coverage=coverage,
+        source_provenance={"NEIS": provenance},
+    )
+    module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
+    blocked_context = tmp_path / "blocked-context"
+
+    with pytest.raises(ValueError, match="snapshot pointer|current"):
+        module["stage_release_context"](source_root, blocked_context)
+
+    assert not blocked_context.exists()
+    packet = build_candidate_review_packet(
+        snapshot_id="release-review-candidate",
+        snapshot_root=snapshot_root,
+        coverage=coverage,
+    )
+    digest = packet["reviewDigest"]
+    assert isinstance(digest, str)
+    approve_candidate_snapshot(
+        snapshot_id="release-review-candidate",
+        review_digest=digest,
+        reviewer_role="data-steward",
+        snapshot_root=snapshot_root,
+        coverage=coverage,
+    )
+
+    staged_id = module["stage_release_context"](
+        source_root,
+        tmp_path / "approved-context",
+    )
+
+    assert staged_id == "release-review-candidate"
 
 
 def test_release_context_omits_unlisted_files_from_selected_snapshot_and_rules(

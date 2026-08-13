@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -63,7 +64,6 @@ from app.institutions.sync import (
     emit_sync_preflight_audit,
     enrichment_records_sha256,
     geocode_missing_records,
-    promote_snapshot,
     reconcile_selectable_school_counts,
 )
 from app.policy.coverage import CoverageService
@@ -920,6 +920,298 @@ def test_mixed_vintage_neis_candidate_keeps_row_dates_and_manifest_histogram(
     )
 
 
+# Production break caught: a human-review artifact that changes between reads or
+# exposes institution rows, source payload material, or the transaction secret.
+def test_review_packet_is_deterministic_and_only_contains_safe_aggregates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sync_module.secrets,
+        "token_bytes",
+        lambda size: b"test-secret".ljust(size, b"!")[:size],
+    )
+    dates = (
+        ["2026-04-23"] * 1_413
+        + ["2026-05-17"]
+        + ["2026-06-07"]
+    )
+    records = tuple(
+        replace(
+            source_record(institution_id=f"neis:B10:{7010000 + index}"),
+            source_as_of=source_date,
+        )
+        for index, source_date in enumerate(dates)
+    )
+    provenance = replace(
+        source_provenance_for(records)["NEIS"],
+        page_count=2,
+    )
+    build_test_candidate(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="mixed-vintage-review",
+        source_provenance={"NEIS": provenance},
+    )
+
+    first = sync_module.build_candidate_review_packet(
+        snapshot_id="mixed-vintage-review",
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    second = sync_module.build_candidate_review_packet(
+        snapshot_id="mixed-vintage-review",
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+
+    assert first == second
+    assert set(first) == {
+        "status",
+        "snapshotId",
+        "createdAt",
+        "snapshotAsOf",
+        "previousSnapshotId",
+        "sourceCounts",
+        "sourceObservationDateCounts",
+        "normalizedObservationDateCounts",
+        "preservedObservationDateCounts",
+        "institutionTypeCounts",
+        "foundationCounts",
+        "districtCounts",
+        "statusCounts",
+        "coordinateQualityCounts",
+        "quarantinedInstitutionIds",
+        "quarantinedSiteIds",
+        "diff",
+        "institutionsSha256",
+        "sitesSha256",
+        "candidateManifestSha256",
+        "sourceProvenanceSha256",
+        "enrichmentProvenanceSha256",
+        "reviewDigest",
+    }
+    assert first["status"] == "CANDIDATE_REVIEW_REQUIRED"
+    assert first["normalizedObservationDateCounts"] == {
+        "NEIS": {
+            "2026-04-23": 1_413,
+            "2026-05-17": 1,
+            "2026-06-07": 1,
+        }
+    }
+    assert isinstance(first["reviewDigest"], str)
+    assert re.fullmatch(r"[0-9a-f]{64}", first["reviewDigest"])
+    digest_body = {key: value for key, value in first.items() if key != "reviewDigest"}
+    assert first["reviewDigest"] == hashlib.sha256(
+        json.dumps(
+            digest_body,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert len(first["districtCounts"]) == 25
+    assert not (tmp_path / ".promotion.lock").exists()
+    serialized = json.dumps(first, ensure_ascii=False, sort_keys=True)
+    for forbidden in (
+        "officialName",
+        "roadAddress",
+        "latitude",
+        "longitude",
+        "test-secret",
+        "signature",
+        "endpoint",
+        "attribution",
+        "rawSha256",
+        "fetchedAt",
+    ):
+        assert forbidden not in serialized
+
+
+# Production break caught: accepting a visually plausible but noncanonical review
+# digest and mutating the selected snapshot without exact human authorization.
+def test_approval_requires_exact_digest_role_and_unchanged_candidate(
+    tmp_path: Path,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="approval-contract",
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+
+    with pytest.raises(SnapshotQualityError, match="review digest"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest="A" * 64,
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+    assert isinstance(packet["reviewDigest"], str)
+    assert re.fullmatch(r"[0-9a-f]{64}", packet["reviewDigest"])
+    assert not (tmp_path / "current.json").exists()
+
+
+@pytest.mark.parametrize(
+    "review_digest",
+    ("a" * 63, "a" * 65, "g" * 64, "A" * 64, "a" * 63 + "\n"),
+)
+def test_approval_rejects_every_noncanonical_review_digest_without_mutation(
+    tmp_path: Path,
+    review_digest: str,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="invalid-review-digest",
+    )
+
+    with pytest.raises(SnapshotQualityError, match="review digest"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=review_digest,
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+    assert not (tmp_path / "current.json").exists()
+    assert not (tmp_path / ".promotion.lock").exists()
+
+
+def test_approval_rejects_wrong_role_without_mutation(tmp_path: Path) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="invalid-review-role",
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+
+    with pytest.raises(SnapshotQualityError, match="reviewer role"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=packet["reviewDigest"],
+            reviewer_role="operator",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+    assert not (tmp_path / "current.json").exists()
+    assert not (tmp_path / ".promotion.lock").exists()
+
+
+def test_approval_rejects_candidate_changed_after_review_without_pointer_change(
+    tmp_path: Path,
+) -> None:
+    baseline = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="review-baseline",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="changed-after-review",
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["createdAt"] = "2026-08-13T12:00:00Z"
+    sync_module._write_json(manifest_path, manifest)
+    transaction_path = (
+        tmp_path / ".sync-transactions" / f"{candidate.snapshot_id}.json"
+    )
+    transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+    transaction["manifestSha256"] = sync_module._manifest_section_sha256(manifest)
+    transaction.pop("signature")
+    sync_module._write_signed_transaction(
+        tmp_path,
+        transaction,
+        replace_existing=True,
+    )
+
+    with pytest.raises(SnapshotQualityError, match="review digest"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=packet["reviewDigest"],
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+
+
+def test_same_digest_published_retry_is_idempotent(tmp_path: Path) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="same-digest-retry",
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    review_digest = packet["reviewDigest"]
+    assert isinstance(review_digest, str)
+
+    assert sync_module.approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=review_digest,
+        reviewer_role="data-steward",
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    ) == review_digest
+    pointer_before = (tmp_path / "current.json").read_bytes()
+
+    assert sync_module.approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=review_digest,
+        reviewer_role="data-steward",
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    ) == review_digest
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+
+
+def test_automatic_promotion_symbol_is_not_public(
+    tmp_path: Path,
+) -> None:
+    build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="automatic-promotion-disabled",
+    )
+
+    assert not hasattr(sync_module, "promote_snapshot")
+    assert not (tmp_path / "current.json").exists()
+
+
 def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1064,6 +1356,182 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
     assert audit["reconciliation"]["passed"] is False
     assert audit["passed"] is False
     assert not snapshot_root.exists()
+
+
+@pytest.mark.asyncio
+async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script_path = Path("apps/travel-map/scripts/sync-institutions.py")
+    spec = importlib.util.spec_from_file_location(
+        "sync_institutions_candidate_cli",
+        script_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert not hasattr(module, "promote_snapshot")
+
+    neis_records = (source_record(),)
+    neis_provenance = source_provenance_for(neis_records)["NEIS"]
+
+    class FakeAsyncClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class FakeNeisSource:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def fetch(self) -> SourceFetchResult:
+            return SourceFetchResult(neis_records, neis_provenance)
+
+    class FakeKindergartenSource:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def fetch(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                records=(),
+                provenance=SimpleNamespace(source="KINDERGARTEN_INFO"),
+            )
+
+    class FakeStandardSource:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def fetch(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                locations=(),
+                provenance=standard_enrichment_provenance(matched_row_count=0),
+            )
+
+    class FakeSenSource:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def load(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                records=(),
+                provenance=SimpleNamespace(source="SEN_REVIEWED_CSV"),
+            )
+
+    class FakeKakaoClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def clear_credentials(self) -> None:
+            pass
+
+        def provenance(self) -> EnrichmentProvenance:
+            return EnrichmentProvenance(
+                source="KAKAO_LOCAL_GEOCODING",
+                endpoint="https://dapi.kakao.com/v2/local/search/address.json",
+                license_name="KAKAO_LOCAL_API_TERMS",
+                attribution="Kakao Local API",
+                fetched_at="2026-08-13T09:00:00Z",
+                source_as_of="2026-08-13",
+                raw_sha256="c" * 64,
+                normalized_sha256=hashlib.sha256(b"").hexdigest(),
+                request_region_code="SEOUL_ADDRESS_BATCH",
+                request_timing=None,
+                page_count=0,
+                fetched_row_count=0,
+                matched_row_count=0,
+                matched_normalized_sha256=hashlib.sha256(b"").hexdigest(),
+            )
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_id = "candidate-only-cli"
+
+    def fake_build_candidate_snapshot(**_kwargs: object) -> SnapshotBuildResult:
+        snapshot_root.mkdir()
+        candidate_path = snapshot_root / f".{snapshot_id}.candidate"
+        candidate_path.mkdir()
+        return SnapshotBuildResult(
+            snapshot_id=snapshot_id,
+            candidate_path=candidate_path,
+            approved=False,
+            issues=(),
+        )
+
+    def forbidden_promotion(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("synchronizer must not auto-promote a candidate")
+
+    async def identity_records(
+        records: tuple[SourceInstitutionRecord, ...],
+        _client: object,
+    ) -> tuple[SourceInstitutionRecord, ...]:
+        return records
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(module, "NeisSource", FakeNeisSource)
+    monkeypatch.setattr(module, "KindergartenSource", FakeKindergartenSource)
+    monkeypatch.setattr(module, "StandardSchoolLocationSource", FakeStandardSource)
+    monkeypatch.setattr(module, "SenCsvSource", FakeSenSource)
+    monkeypatch.setattr(module, "KakaoLocalClient", FakeKakaoClient)
+    monkeypatch.setattr(module, "geocode_missing_records", identity_records)
+    monkeypatch.setattr(
+        module,
+        "load_reviewed_school_counts",
+        lambda _path: object(),
+    )
+    monkeypatch.setattr(
+        module,
+        "build_candidate_snapshot",
+        fake_build_candidate_snapshot,
+    )
+    monkeypatch.setattr(module, "promote_snapshot", forbidden_promotion, raising=False)
+    monkeypatch.setattr(
+        module,
+        "reconcile_selectable_school_counts",
+        lambda *_args, **_kwargs: {"passed": True},
+    )
+    monkeypatch.setattr(
+        module,
+        "build_sync_preflight_audit",
+        lambda *_args, **_kwargs: {"passed": True},
+    )
+    monkeypatch.setattr(
+        module,
+        "emit_sync_preflight_audit",
+        lambda audit: print(json.dumps(audit, sort_keys=True)),
+    )
+    args = argparse.Namespace(
+        sen_csv=tmp_path / "sen.csv",
+        region_codes=tmp_path / "regions.csv",
+        school_counts=tmp_path / "counts.csv",
+        snapshot_root=snapshot_root,
+        geodata_root=Path("apps/travel-map/resources/geodata"),
+        timing="20261",
+        snapshot_id=snapshot_id,
+    )
+
+    await module._run_with_keys(
+        args,
+        {
+            "NEIS_API_KEY": "neis-test",
+            "KINDERGARTEN_API_KEY": "kindergarten-test",
+            "KAKAO_REST_API_KEY": "kakao-test",
+        },
+        [],
+    )
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-1] == (
+        '{"snapshotId": "candidate-only-cli", '
+        '"status": "CANDIDATE_REVIEW_REQUIRED"}'
+    )
+    assert (snapshot_root / ".candidate-only-cli.candidate").is_dir()
+    assert not (snapshot_root / "current.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -2279,42 +2747,50 @@ def test_concurrent_promotions_from_same_previous_are_serialized(
         snapshot_id="concurrent-second",
         coverage=TEST_COVERAGE,
     )
-    real_quality = sync_module._recheck_promotion_quality
+    first_packet = sync_module.build_candidate_review_packet(
+        snapshot_id=first.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    second_packet = sync_module.build_candidate_review_packet(
+        snapshot_id=second.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    real_packet_builder = sync_module.build_candidate_review_packet
     first_entered = threading.Event()
     release_first = threading.Event()
     second_entered = threading.Event()
-    call_lock = threading.Lock()
-    call_count = 0
 
-    def controlled_quality(*args, **kwargs):  # type: ignore[no-untyped-def]
-        nonlocal call_count
-        with call_lock:
-            call_count += 1
-            call_number = call_count
-        if call_number == 1:
+    def controlled_packet_builder(*args, **kwargs):  # type: ignore[no-untyped-def]
+        if kwargs["snapshot_id"] == first.snapshot_id:
             first_entered.set()
             assert release_first.wait(timeout=2)
         else:
             second_entered.set()
-        return real_quality(*args, **kwargs)
+        return real_packet_builder(*args, **kwargs)
 
     monkeypatch.setattr(
         sync_module,
-        "_recheck_promotion_quality",
-        controlled_quality,
+        "build_candidate_review_packet",
+        controlled_packet_builder,
     )
     with ThreadPoolExecutor(max_workers=2) as executor:
         first_future = executor.submit(
-            promote_snapshot,
-            first,
-            tmp_path,
+            sync_module.approve_candidate_snapshot,
+            snapshot_id=first.snapshot_id,
+            review_digest=first_packet["reviewDigest"],
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
             coverage=TEST_COVERAGE,
         )
         assert first_entered.wait(timeout=2)
         second_future = executor.submit(
-            promote_snapshot,
-            second,
-            tmp_path,
+            sync_module.approve_candidate_snapshot,
+            snapshot_id=second.snapshot_id,
+            review_digest=second_packet["reviewDigest"],
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
             coverage=TEST_COVERAGE,
         )
         assert not second_entered.wait(timeout=0.2)
@@ -2525,7 +3001,7 @@ def test_promotion_rejects_candidate_from_another_snapshot_root(
         coverage=TEST_COVERAGE,
     )
 
-    with pytest.raises(SnapshotQualityError, match="candidate path"):
+    with pytest.raises(SnapshotQualityError, match="transaction|candidate"):
         promote_snapshot(candidate, target_root, coverage=TEST_COVERAGE)
     assert candidate.candidate_path.is_dir()
     assert not (target_root / "current.json").exists()
@@ -3772,6 +4248,28 @@ def build_test_candidate(
         coverage=coverage,
         source_provenance=selected_provenance,
         enrichment_provenance=enrichment_provenance,
+    )
+
+
+def promote_snapshot(
+    candidate: SnapshotBuildResult,
+    output_root: Path,
+    *,
+    coverage: CoverageService,
+) -> str:
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=output_root,
+        coverage=coverage,
+    )
+    review_digest = packet["reviewDigest"]
+    assert isinstance(review_digest, str)
+    return sync_module.approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=review_digest,
+        reviewer_role="data-steward",
+        snapshot_root=output_root,
+        coverage=coverage,
     )
 
 
