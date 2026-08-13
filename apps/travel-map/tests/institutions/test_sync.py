@@ -280,6 +280,30 @@ def test_neis_unclassified_policy_rejects_caller_supplied_contract_drift(
         )
 
 
+def test_neis_unclassified_policy_rejects_tuple_subclass_whitelist_spoof() -> None:
+    class SpoofedReviewedPair(tuple):
+        def __eq__(self, other: object) -> bool:
+            return type(other) is tuple and len(other) == 2
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return iter(("unreviewed-kind", 18))
+
+    counts = (
+        SpoofedReviewedPair(("unreviewed-kind", 18)),
+        ("평생학교(고)-3년6학기", 4),
+        ("평생학교(중)-2년6학기", 5),
+        ("평생학교(초)-3년6학기", 2),
+    )
+
+    with pytest.raises(SourceDataError, match="reviewed"):
+        NeisUnclassifiedPolicy(
+            counts=counts,
+            sha256=PINNED_POLICY_SHA256,
+            reviewed_as_of="2026-08-13",
+            reviewer_role="data-steward",
+        )
+
+
 def test_neis_unclassified_policy_rejects_oversized_file_before_content_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

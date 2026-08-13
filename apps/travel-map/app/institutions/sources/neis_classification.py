@@ -45,7 +45,7 @@ class NeisUnclassifiedPolicy:
 
     def __post_init__(self) -> None:
         if (
-            type(self.counts) is not tuple
+            not _is_canonical_counts(self.counts)
             or self.counts != _REVIEWED_COUNTS
             or self.sha256 != PINNED_POLICY_SHA256
             or self.reviewed_as_of != _REVIEWED_AS_OF
@@ -58,6 +58,18 @@ class NeisUnclassifiedPolicy:
     @property
     def labels(self) -> frozenset[str]:
         return frozenset(label for label, _ in self.counts)
+
+
+def _is_canonical_counts(counts: object) -> bool:
+    if type(counts) is not tuple:
+        return False
+    return all(
+        type(entry) is tuple
+        and len(entry) == 2
+        and type(entry[0]) is str
+        and type(entry[1]) is int
+        for entry in counts
+    )
 
 
 def load_neis_unclassified_policy(path: Path) -> NeisUnclassifiedPolicy:
