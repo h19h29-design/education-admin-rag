@@ -19,6 +19,7 @@ from app.institutions.models import (
     Institution,
     InstitutionSite,
     InstitutionStatus,
+    SchoolCountReconciliation,
     SnapshotManifest,
 )
 from app.institutions.snapshot import (
@@ -245,6 +246,41 @@ class SnapshotBuildResult:
 
 _POPULATION_SOURCES = frozenset({"NEIS", "KINDERGARTEN_INFO"})
 _POPULATION_MISMATCH = "source population profile does not match fetched data"
+_REVIEWED_POPULATION_PROFILE_SHA256 = (
+    "e904a254ab4f0fa264a0ec3894827e6bebbb2b94ab263bf635594c812dd7df06"
+)
+_REVIEWED_SOURCE_CATEGORY_COUNTS = {
+    "KINDERGARTEN_INFO": {"KINDERGARTEN_TOTAL": 706},
+    "NEIS": {
+        "각종학교(고)": 13,
+        "각종학교(중)": 7,
+        "각종학교(초)": 1,
+        "고등기술학교": 1,
+        "고등학교": 319,
+        "공동실습소": 1,
+        "방송통신고등학교": 5,
+        "방송통신중학교": 1,
+        "외국인학교": 17,
+        "중학교": 390,
+        "초등학교": 610,
+        "특수학교": 32,
+        "평생학교(고)-2년6학기": 7,
+        "평생학교(고)-3년6학기": 4,
+        "평생학교(중)-2년6학기": 5,
+        "평생학교(초)-3년6학기": 2,
+    },
+}
+_REVIEWED_NORMALIZED_TYPE_COUNTS = {
+    "KINDERGARTEN_INFO": {"KINDERGARTEN": 706},
+    "NEIS": {
+        "ELEMENTARY_SCHOOL": 610,
+        "HIGH_SCHOOL": 324,
+        "MIDDLE_SCHOOL": 391,
+        "MISC_SCHOOL": 39,
+        "SPECIAL_SCHOOL": 32,
+        "UNCLASSIFIED_SCHOOL": 18,
+    },
+}
 _SCHOOL_COUNT_CATEGORIES = frozenset(
     {
         "ELEMENTARY_SCHOOL",
@@ -481,7 +517,12 @@ def reconcile_selectable_school_counts(
             raise SnapshotQualityError(
                 "source population profile binding is invalid"
             )
-        sources[source] = {"roleCounts": role_counts}
+        fetched_count = cast(int, provenance.fetched_row_count)
+        sources[source] = {
+            "fetchedCount": fetched_count,
+            "normalizedCount": provenance.row_count,
+            "roleCounts": role_counts,
+        }
 
     if (
         not benchmark.counts
@@ -583,6 +624,56 @@ def reconcile_selectable_school_counts(
         "categories": categories,
         "passed": not source_drift,
     }
+
+
+def _validate_bound_school_count_reconciliation(
+    value: Mapping[str, object],
+    source_provenance: Mapping[str, SourceProvenance],
+) -> dict[str, object]:
+    if type(value) is not dict:
+        raise SnapshotQualityError("school count reconciliation is invalid")
+    try:
+        parsed = SchoolCountReconciliation.model_validate(value)
+    except ValidationError as exc:
+        raise SnapshotQualityError("school count reconciliation is invalid") from exc
+    present_population_sources = set(source_provenance) & _POPULATION_SOURCES
+    if present_population_sources and not set(source_provenance).issuperset(
+        _POPULATION_SOURCES
+    ):
+        raise SnapshotQualityError(
+            "school count reconciliation does not match source provenance"
+        )
+    for source_name in sorted(present_population_sources):
+        provenance = source_provenance[source_name]
+        summary = parsed.sources[source_name]
+        if (
+            provenance.source != source_name
+            or provenance.fetched_row_count != summary.fetched_count
+            or provenance.row_count != summary.normalized_count
+            or provenance.source_population_profile_sha256
+            != parsed.profile_sha256
+            or not _is_exact_population_counts(
+                provenance.source_population_role_counts,
+                summary.role_counts,
+            )
+            or not _is_exact_population_counts(
+                provenance.source_category_counts,
+                _REVIEWED_SOURCE_CATEGORY_COUNTS[source_name],
+            )
+        ):
+            raise SnapshotQualityError(
+                "school count reconciliation does not match source provenance"
+            )
+    for source_name, provenance in source_provenance.items():
+        if source_name not in _POPULATION_SOURCES and (
+            provenance.source_category_counts
+            or provenance.source_population_role_counts
+            or provenance.source_population_profile_sha256 is not None
+        ):
+            raise SnapshotQualityError(
+                "school count reconciliation does not match source provenance"
+            )
+    return cast(dict[str, object], parsed.model_dump(by_alias=True))
 
 
 def build_sync_preflight_audit(
@@ -707,13 +798,26 @@ def _is_safe_reconciliation(
     }
     for source, role_keys in expected_role_keys.items():
         source_item = sources[source]
-        if not _has_exact_fields(source_item, frozenset({"roleCounts"})):
+        if not _has_exact_fields(
+            source_item,
+            frozenset({"fetchedCount", "normalizedCount", "roleCounts"}),
+        ):
             return False
         role_counts = source_item["roleCounts"]
-        if not _is_exact_string_int_mapping(
-            role_counts,
-            allowed_keys=role_keys,
-        ) or set(role_counts) != role_keys:
+        if (
+            type(source_item["fetchedCount"]) is not int
+            or source_item["fetchedCount"] <= 0
+            or type(source_item["normalizedCount"]) is not int
+            or source_item["normalizedCount"] <= 0
+            or not _is_exact_string_int_mapping(
+                role_counts,
+                allowed_keys=role_keys,
+            )
+            or set(role_counts) != role_keys
+            or sum(role_counts.values()) != source_item["fetchedCount"]
+            or source_item["normalizedCount"]
+            != source_item["fetchedCount"] - role_counts.get("NONSELECTABLE", 0)
+        ):
             return False
     categories = value["categories"]
     if not _has_exact_fields(categories, _SCHOOL_COUNT_CATEGORIES):
@@ -868,6 +972,7 @@ def build_candidate_snapshot(
     snapshot_id: str,
     coverage: CoverageService | None = None,
     source_provenance: Mapping[str, SourceProvenance] | None = None,
+    school_count_reconciliation: Mapping[str, object],
     enrichment_provenance: tuple[EnrichmentProvenance, ...] = (),
 ) -> SnapshotBuildResult:
     if _SAFE_SNAPSHOT_ID.fullmatch(snapshot_id) is None:
@@ -914,6 +1019,10 @@ def build_candidate_snapshot(
             provenance,
             current_by_source[source_name],
         )
+    canonical_reconciliation = _validate_bound_school_count_reconciliation(
+        school_count_reconciliation,
+        source_provenance,
+    )
     _validate_enrichment_provenance(records, enrichment_provenance)
 
     institutions, sites = _build_current_records(records, snapshot_id, coverage)
@@ -983,6 +1092,15 @@ def build_candidate_snapshot(
                 ),
                 unclassified_school_policy_sha256=(
                     prior.unclassified_school_policy_sha256
+                ),
+                source_category_counts=tuple(
+                    prior.source_category_counts.items()
+                ),
+                source_population_role_counts=tuple(
+                    prior.source_population_role_counts.items()
+                ),
+                source_population_profile_sha256=(
+                    prior.source_population_profile_sha256
                 ),
             )
 
@@ -1070,6 +1188,7 @@ def build_candidate_snapshot(
             effective_enrichment_provenance[source]
             for source in sorted(effective_enrichment_provenance)
         ),
+        school_count_reconciliation=canonical_reconciliation,
     )
     _write_json(candidate_path / "manifest.json", manifest)
     for file_name in ("manifest.json", "institutions.jsonl", "sites.jsonl"):
@@ -1209,6 +1328,11 @@ def _review_packet_from_loaded_candidate(
             manifest["enrichments"]
         ),
     }
+    reconciliation = cast(dict[str, object], manifest["schoolCountReconciliation"])
+    packet["schoolCountReconciliation"] = reconciliation
+    packet["schoolCountReconciliationSha256"] = _manifest_section_sha256(
+        reconciliation
+    )
     neis_entry = next(
         (
             entry
@@ -1374,6 +1498,7 @@ def _load_reviewable_candidate(
     institutions, sites = _recheck_candidate(selected_path, manifest, snapshot_id)
     _recheck_promotion_quality(root, manifest, institutions, sites, coverage)
     _recheck_source_provenance(manifest, institutions, sites)
+    _recheck_school_count_reconciliation(manifest, institutions)
     _recheck_enrichment_provenance(manifest, institutions, sites)
     _transaction_attests_manifest(transaction, manifest)
     candidate = SnapshotBuildResult(
@@ -1695,7 +1820,7 @@ def _validate_source_record(record: SourceInstitutionRecord) -> None:
     if record.institution_type == "UNCLASSIFIED_SCHOOL":
         if record.source != "NEIS" or not record.source_kind_label:
             raise SnapshotQualityError("unclassified school source label is invalid")
-    elif record.source_kind_label is not None:
+    elif record.source != "NEIS" and record.source_kind_label is not None:
         raise SnapshotQualityError("source kind label is reserved for unclassified schools")
     if record.foundation_type not in _ALLOWED_FOUNDATION_TYPES:
         raise SnapshotQualityError("unsupported foundation type")
@@ -1777,6 +1902,43 @@ def _validate_source_provenance(
         raise SnapshotQualityError(
             "source provenance source_as_of is not canonical"
         )
+    expected_population_categories = _REVIEWED_SOURCE_CATEGORY_COUNTS.get(
+        source_name
+    )
+    if expected_population_categories is None:
+        if (
+            provenance.source_category_counts
+            or provenance.source_population_role_counts
+            or provenance.source_population_profile_sha256 is not None
+        ):
+            raise SnapshotQualityError(
+                "source population provenance is reserved for NEIS/KGI"
+            )
+    else:
+        expected_roles = {
+            "KINDERGARTEN_INFO": {"BENCHMARK": 706},
+            "NEIS": {
+                "BENCHMARK": 1_373,
+                "NONSELECTABLE": 1,
+                "QUARANTINED": 18,
+                "SUPPLEMENTARY": 23,
+            },
+        }[source_name]
+        if (
+            not _is_exact_population_counts(
+                provenance.source_category_counts,
+                expected_population_categories,
+            )
+            or not _is_exact_population_counts(
+                provenance.source_population_role_counts,
+                expected_roles,
+            )
+            or provenance.source_population_profile_sha256
+            != _REVIEWED_POPULATION_PROFILE_SHA256
+        ):
+            raise SnapshotQualityError(
+                "source population provenance does not match reviewed profile"
+            )
     if (
         provenance.endpoint != _SOURCE_ENDPOINTS[source_name]
         or provenance.license_name != _SOURCE_LICENSES[source_name]
@@ -2208,6 +2370,7 @@ def _candidate_manifest(
     source_provenance: Mapping[str, SourceProvenance] | None,
     source_records: tuple[SourceInstitutionRecord, ...],
     enrichment_provenance: tuple[EnrichmentProvenance, ...],
+    school_count_reconciliation: Mapping[str, object],
 ) -> dict[str, object]:
     by_source: dict[str, list[Institution]] = defaultdict(list)
     for institution in institutions:
@@ -2283,6 +2446,15 @@ def _candidate_manifest(
                 ),
                 "unclassifiedSchoolPolicySha256": (
                     provenance.unclassified_school_policy_sha256
+                ),
+                "sourceCategoryCounts": dict(
+                    provenance.source_category_counts
+                ),
+                "sourcePopulationRoleCounts": dict(
+                    provenance.source_population_role_counts
+                ),
+                "sourcePopulationProfileSha256": (
+                    provenance.source_population_profile_sha256
                 ),
             }
         )
@@ -2383,6 +2555,7 @@ def _candidate_manifest(
         "coordinateQualityCounts": dict(
             Counter(item.coordinate_quality for item in sites)
         ),
+        "schoolCountReconciliation": dict(school_count_reconciliation),
         "diff": {
             "previousSnapshotId": (
                 previous.manifest.snapshot_id if previous is not None else None
@@ -3071,6 +3244,77 @@ def _recheck_source_provenance(
             raise SnapshotQualityError(
                 "candidate source provenance count is invalid"
             )
+
+
+def _recheck_school_count_reconciliation(
+    manifest: dict[str, object],
+    institutions: list[Institution],
+) -> None:
+    reconciliation_value = manifest.get("schoolCountReconciliation")
+    try:
+        reconciliation = SchoolCountReconciliation.model_validate(
+            reconciliation_value
+        )
+    except ValidationError as exc:
+        raise SnapshotQualityError(
+            "candidate school count reconciliation is invalid"
+        ) from exc
+    source_entries = manifest.get("sources")
+    if type(source_entries) is not list:
+        raise SnapshotQualityError(
+            "candidate school count reconciliation is invalid"
+        )
+    source_names = {
+        entry.get("source") for entry in source_entries if type(entry) is dict
+    }
+    if not source_names & _POPULATION_SOURCES:
+        return
+    entries = {
+        entry.get("source"): entry
+        for entry in source_entries
+        if type(entry) is dict and type(entry.get("source")) is str
+    }
+    for source_name, summary in reconciliation.sources.items():
+        entry = entries.get(source_name)
+        if (
+            type(entry) is not dict
+            or entry.get("fetchedRowCount") != summary.fetched_count
+            or entry.get("normalizedRowCount") != summary.normalized_count
+            or entry.get("sourcePopulationRoleCounts") != summary.role_counts
+            or entry.get("sourcePopulationProfileSha256")
+            != reconciliation.profile_sha256
+            or entry.get("sourceCategoryCounts")
+            != _REVIEWED_SOURCE_CATEGORY_COUNTS[source_name]
+        ):
+            raise SnapshotQualityError(
+                "candidate reconciliation does not match source provenance"
+            )
+    current_by_source: dict[str, list[Institution]] = defaultdict(list)
+    for institution in institutions:
+        if institution.status is not InstitutionStatus.MISSING_FROM_SOURCE:
+            current_by_source[institution.source].append(institution)
+    for source_name, expected_counts in _REVIEWED_NORMALIZED_TYPE_COUNTS.items():
+        rows = current_by_source[source_name]
+        actual_counts = dict(
+            sorted(Counter(row.institution_type for row in rows).items())
+        )
+        if actual_counts != expected_counts:
+            raise SnapshotQualityError(
+                "candidate normalized population does not match reconciliation"
+            )
+    quarantined = [
+        row
+        for row in current_by_source["NEIS"]
+        if row.institution_type == "UNCLASSIFIED_SCHOOL"
+    ]
+    if len(quarantined) != 18 or any(
+        row.status is not InstitutionStatus.REVIEW_REQUIRED
+        or row.status_source != "OFFICIAL_CLASSIFICATION_PENDING"
+        for row in quarantined
+    ):
+        raise SnapshotQualityError(
+            "candidate normalized population status does not match reconciliation"
+        )
 
 
 def _persisted_unclassified_provenance_matches(

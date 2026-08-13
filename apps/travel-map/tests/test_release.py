@@ -64,6 +64,20 @@ def test_verified_resource_success_uses_the_existing_test_fixture_only() -> None
     assert coverage is not None
 
 
+# Production break caught: the schema-level TEST_NEIS exception escaping into a
+# Docker release merely because its synthetic snapshot is internally consistent.
+def test_release_context_rejects_test_fixture_population_exception(
+    tmp_path: Path,
+) -> None:
+    source_root = _release_source_with_current_snapshot(tmp_path)
+    module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
+
+    with pytest.raises(ValueError, match="test institution snapshot"):
+        module["stage_release_context"](source_root, tmp_path / "context")
+
+    assert not (tmp_path / "context").exists()
+
+
 # Production break caught: a syntactically valid normalized boundary changed
 # after review can pass JSON parsing and still alter the support area at startup.
 @pytest.mark.parametrize(
@@ -151,7 +165,11 @@ def test_release_context_contains_only_the_current_verified_snapshot(
     module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
     stage_release_context = module["stage_release_context"]
     context_root = tmp_path / "context"
-    staged_snapshot_id = stage_release_context(source_root, context_root)
+    staged_snapshot_id = stage_release_context(
+        source_root,
+        context_root,
+        allow_test_fixture=True,
+    )
 
     assert staged_snapshot_id == "fixture-001"
     context_snapshots = context_root / "resources/institution-snapshots"
@@ -293,7 +311,11 @@ def test_release_context_omits_unlisted_files_from_selected_snapshot_and_rules(
 
     module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
     context_root = tmp_path / "context"
-    module["stage_release_context"](source_root, context_root)
+    module["stage_release_context"](
+        source_root,
+        context_root,
+        allow_test_fixture=True,
+    )
 
     staged_snapshot = context_root / "resources/institution-snapshots/fixture-001"
     staged_rules = context_root / "resources/rules"
@@ -332,7 +354,11 @@ def test_release_context_allowlists_only_production_app_files(tmp_path: Path) ->
 
     module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
     context_root = tmp_path / "context"
-    module["stage_release_context"](source_root, context_root)
+    module["stage_release_context"](
+        source_root,
+        context_root,
+        allow_test_fixture=True,
+    )
 
     staged_app = context_root / "app"
     assert (context_root / ".dockerignore").is_file()
@@ -364,7 +390,11 @@ def test_release_context_omits_every_hidden_application_path(tmp_path: Path) -> 
 
     module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
     context_root = tmp_path / "context"
-    module["stage_release_context"](source_root, context_root)
+    module["stage_release_context"](
+        source_root,
+        context_root,
+        allow_test_fixture=True,
+    )
 
     staged_app = context_root / "app"
     assert (staged_app / "main.py").is_file()
@@ -386,7 +416,11 @@ def test_release_context_rejects_an_application_symlink(tmp_path: Path) -> None:
     module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
 
     with pytest.raises(ValueError, match="symlink"):
-        module["stage_release_context"](source_root, tmp_path / "context")
+        module["stage_release_context"](
+            source_root,
+            tmp_path / "context",
+            allow_test_fixture=True,
+        )
 
 
 # Production break caught: enabling a billed live check by accident or allowing

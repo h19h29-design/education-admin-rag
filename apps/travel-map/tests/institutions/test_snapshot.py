@@ -2,15 +2,172 @@ import hashlib
 import json
 import re
 import shutil
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import pytest
-from app.institutions.models import Institution, InstitutionSite, SnapshotDiff
+from app.institutions.models import (
+    Institution,
+    InstitutionSite,
+    SchoolCountReconciliation,
+    SnapshotDiff,
+)
 from app.institutions.snapshot import SnapshotIntegrityError, verify_snapshot
 from pydantic import ValidationError
 
 SNAPSHOT_ROOT = Path("apps/travel-map/tests/fixtures/institutions/snapshot")
+REVIEWED_SCHOOL_COUNT_RECONCILIATION = {
+    "profileStatus": "TEMPORARY_PRELIMINARY_VARIANCE",
+    "profileSha256": (
+        "e904a254ab4f0fa264a0ec3894827e6bebbb2b94ab263bf635594c812dd7df06"
+    ),
+    "benchmarkSha256": (
+        "36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332"
+    ),
+    "sources": {
+        "KINDERGARTEN_INFO": {
+            "fetchedCount": 706,
+            "normalizedCount": 706,
+            "roleCounts": {"BENCHMARK": 706},
+        },
+        "NEIS": {
+            "fetchedCount": 1415,
+            "normalizedCount": 1414,
+            "roleCounts": {
+                "BENCHMARK": 1373,
+                "NONSELECTABLE": 1,
+                "QUARANTINED": 18,
+                "SUPPLEMENTARY": 23,
+            },
+        },
+    },
+    "categories": {
+        "ELEMENTARY_SCHOOL": {
+            "expectedCount": 609,
+            "actualCount": 610,
+            "deltaCount": 1,
+            "status": "REVIEWED_VARIANCE",
+        },
+        "HIGH_SCHOOL": {
+            "expectedCount": 319,
+            "actualCount": 319,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        },
+        "KINDERGARTEN": {
+            "expectedCount": 724,
+            "actualCount": 706,
+            "deltaCount": -18,
+            "status": "REVIEWED_VARIANCE",
+        },
+        "MIDDLE_SCHOOL": {
+            "expectedCount": 390,
+            "actualCount": 390,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        },
+        "MISC_SCHOOL": {
+            "expectedCount": 18,
+            "actualCount": 22,
+            "deltaCount": 4,
+            "status": "REVIEWED_VARIANCE",
+        },
+        "SPECIAL_SCHOOL": {
+            "expectedCount": 32,
+            "actualCount": 32,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        },
+    },
+    "passed": True,
+}
+
+
+def test_school_count_reconciliation_accepts_only_reviewed_camel_case_shape() -> None:
+    parsed = SchoolCountReconciliation.model_validate(
+        REVIEWED_SCHOOL_COUNT_RECONCILIATION
+    )
+
+    assert parsed.profile_sha256 == REVIEWED_SCHOOL_COUNT_RECONCILIATION[
+        "profileSha256"
+    ]
+
+
+# Production break caught: an internal snake_case spelling bypassing the exact
+# signed JSON contract even though no producer emits that spelling.
+def test_school_count_reconciliation_rejects_snake_case_field() -> None:
+    payload = deepcopy(REVIEWED_SCHOOL_COUNT_RECONCILIATION)
+    payload["profile_status"] = payload.pop("profileStatus")
+
+    with pytest.raises(ValidationError):
+        SchoolCountReconciliation.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("passed",), False),
+        (("profileSha256",), "f" * 64),
+        (("benchmarkSha256",), "f" * 64),
+        (("sources", "NEIS", "fetchedCount"), True),
+        (("sources", "NEIS", "normalizedCount"), 1415),
+        (("sources", "NEIS", "roleCounts", "QUARANTINED"), 17),
+        (("categories", "ELEMENTARY_SCHOOL", "actualCount"), 609),
+        (("categories", "ELEMENTARY_SCHOOL", "deltaCount"), 0),
+        (("categories", "ELEMENTARY_SCHOOL", "status"), "MATCHED"),
+    ],
+)
+def test_school_count_reconciliation_rejects_unreviewed_values(
+    path: tuple[str, ...],
+    value: object,
+) -> None:
+    payload = deepcopy(REVIEWED_SCHOOL_COUNT_RECONCILIATION)
+    selected: dict[str, Any] = payload
+    for name in path[:-1]:
+        selected = selected[name]
+    selected[path[-1]] = value
+
+    with pytest.raises(ValidationError):
+        SchoolCountReconciliation.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("sources",),
+        ("sources", "NEIS", "roleCounts"),
+        ("categories",),
+    ],
+)
+def test_school_count_reconciliation_rejects_unsorted_mapping_keys(
+    path: tuple[str, ...],
+) -> None:
+    payload = deepcopy(REVIEWED_SCHOOL_COUNT_RECONCILIATION)
+    selected: dict[str, Any] = payload
+    for name in path:
+        selected = selected[name]
+    reversed_items = reversed(tuple(selected.items()))
+    replacement = dict(reversed_items)
+    parent: dict[str, Any] = payload
+    for name in path[:-1]:
+        parent = parent[name]
+    parent[path[-1]] = replacement
+
+    with pytest.raises(ValidationError):
+        SchoolCountReconciliation.model_validate(payload)
+
+
+# Production break caught: treating the explicitly identified synthetic fixture
+# exception as an ordinary production snapshot schema omission.
+def test_snapshot_accepts_only_identified_test_fixture_without_reconciliation() -> None:
+    snapshot = verify_snapshot(SNAPSHOT_ROOT)
+
+    assert snapshot.manifest.school_count_reconciliation is None
+    assert snapshot.manifest.approved_by_role == "TEST_FIXTURE_REVIEWER"
+    assert snapshot.manifest.sources[0].source_category_counts == {}
+    assert snapshot.manifest.sources[0].source_population_role_counts == {}
+    assert snapshot.manifest.sources[0].source_population_profile_sha256 is None
 
 
 # Production break caught: accepting source provenance that omits the required

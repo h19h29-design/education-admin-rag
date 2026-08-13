@@ -28,7 +28,10 @@
       "preservedRowCount": 1,
       "rowCount": 10,
       "unclassifiedSchoolKindCounts": {},
-      "unclassifiedSchoolPolicySha256": null
+      "unclassifiedSchoolPolicySha256": null,
+      "sourceCategoryCounts": {},
+      "sourcePopulationRoleCounts": {},
+      "sourcePopulationProfileSha256": null
     }
   ],
   "enrichments": [],
@@ -43,6 +46,7 @@
   "countsByFoundation": {"PUBLIC": 10},
   "countsByStatus": {"ACTIVE": 6, "CLOSED": 1, "MISSING_FROM_SOURCE": 1, "REVIEW_REQUIRED": 1, "TEMPORARILY_CLOSED": 1},
   "coordinateQualityCounts": {"ENTRANCE": 10, "ROOFTOP": 2},
+  "schoolCountReconciliation": null,
   "diff": {
     "previousSnapshotId": null,
     "addedCount": 10,

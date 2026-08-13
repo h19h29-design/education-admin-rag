@@ -1,7 +1,7 @@
 import re
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
@@ -17,6 +17,50 @@ _NAMESPACED_ID_PATTERN = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
     r"(?::[A-Za-z0-9][A-Za-z0-9_-]{0,63})*"
 )
+_POPULATION_PROFILE_SHA256 = (
+    "e904a254ab4f0fa264a0ec3894827e6bebbb2b94ab263bf635594c812dd7df06"
+)
+_SCHOOL_COUNT_BENCHMARK_SHA256 = (
+    "36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332"
+)
+_SOURCE_CATEGORY_COUNTS = {
+    "KINDERGARTEN_INFO": {"KINDERGARTEN_TOTAL": 706},
+    "NEIS": {
+        "각종학교(고)": 13,
+        "각종학교(중)": 7,
+        "각종학교(초)": 1,
+        "고등기술학교": 1,
+        "고등학교": 319,
+        "공동실습소": 1,
+        "방송통신고등학교": 5,
+        "방송통신중학교": 1,
+        "외국인학교": 17,
+        "중학교": 390,
+        "초등학교": 610,
+        "특수학교": 32,
+        "평생학교(고)-2년6학기": 7,
+        "평생학교(고)-3년6학기": 4,
+        "평생학교(중)-2년6학기": 5,
+        "평생학교(초)-3년6학기": 2,
+    },
+}
+_SOURCE_POPULATION_ROLE_COUNTS = {
+    "KINDERGARTEN_INFO": {"BENCHMARK": 706},
+    "NEIS": {
+        "BENCHMARK": 1_373,
+        "NONSELECTABLE": 1,
+        "QUARANTINED": 18,
+        "SUPPLEMENTARY": 23,
+    },
+}
+_SCHOOL_COUNT_CATEGORY_RESULTS = {
+    "ELEMENTARY_SCHOOL": (609, 610, 1),
+    "HIGH_SCHOOL": (319, 319, 0),
+    "KINDERGARTEN": (724, 706, -18),
+    "MIDDLE_SCHOOL": (390, 390, 0),
+    "MISC_SCHOOL": (18, 22, 4),
+    "SPECIAL_SCHOOL": (32, 32, 0),
+}
 
 
 class InstitutionStatus(StrEnum):
@@ -34,6 +78,14 @@ class _StrictSnapshotModel(BaseModel):
         strict=True,
         populate_by_name=True,
         alias_generator=to_camel,
+    )
+
+
+class _StrictManifestContractModel(_StrictSnapshotModel):
+    model_config = ConfigDict(
+        populate_by_name=False,
+        validate_by_alias=True,
+        validate_by_name=False,
     )
 
 
@@ -236,7 +288,104 @@ class InstitutionSearchItem(_StrictSnapshotModel):
     snapshot_as_of: str
 
 
-class SourceSnapshotInfo(_StrictSnapshotModel):
+def _require_sorted_positive_count_map(
+    values: dict[str, int],
+    label: str,
+) -> dict[str, int]:
+    if (
+        type(values) is not dict
+        or list(values) != sorted(values)
+        or any(type(name) is not str or not name.strip() for name in values)
+        or any(type(count) is not int or count <= 0 for count in values.values())
+    ):
+        raise ValueError(f"{label} must be sorted positive counts")
+    return values
+
+
+class SchoolCountCategoryResult(_StrictManifestContractModel):
+    expected_count: int = Field(ge=0)
+    actual_count: int = Field(ge=0)
+    delta_count: int
+    status: Literal["MATCHED", "REVIEWED_VARIANCE"]
+
+    @model_validator(mode="after")
+    def delta_and_status_match(self) -> Self:
+        if self.actual_count - self.expected_count != self.delta_count:
+            raise ValueError("school count delta is inconsistent")
+        expected_status = (
+            "MATCHED" if self.delta_count == 0 else "REVIEWED_VARIANCE"
+        )
+        if self.status != expected_status:
+            raise ValueError("school count status is inconsistent")
+        return self
+
+
+class SchoolCountSourceSummary(_StrictManifestContractModel):
+    fetched_count: int = Field(ge=1)
+    normalized_count: int = Field(ge=1)
+    role_counts: dict[str, int]
+
+    @field_validator("role_counts")
+    @classmethod
+    def roles_are_canonical(cls, values: dict[str, int]) -> dict[str, int]:
+        return _require_sorted_positive_count_map(values, "roleCounts")
+
+    @model_validator(mode="after")
+    def totals_are_consistent(self) -> Self:
+        if sum(self.role_counts.values()) != self.fetched_count:
+            raise ValueError("source role counts must sum to fetchedCount")
+        if self.normalized_count != self.fetched_count - self.role_counts.get(
+            "NONSELECTABLE", 0
+        ):
+            raise ValueError("normalizedCount must exclude only NONSELECTABLE")
+        return self
+
+
+class SchoolCountReconciliation(_StrictManifestContractModel):
+    profile_status: Literal["TEMPORARY_PRELIMINARY_VARIANCE"]
+    profile_sha256: str
+    benchmark_sha256: str
+    sources: dict[str, SchoolCountSourceSummary]
+    categories: dict[str, SchoolCountCategoryResult]
+    passed: Literal[True]
+
+    @field_validator("profile_sha256", "benchmark_sha256")
+    @classmethod
+    def hashes_are_lowercase_sha256(cls, value: str) -> str:
+        return _require_sha256(value)
+
+    @model_validator(mode="after")
+    def matches_reviewed_contract(self) -> Self:
+        if (
+            self.profile_sha256 != _POPULATION_PROFILE_SHA256
+            or self.benchmark_sha256 != _SCHOOL_COUNT_BENCHMARK_SHA256
+            or list(self.sources) != sorted(_SOURCE_POPULATION_ROLE_COUNTS)
+            or list(self.categories) != sorted(_SCHOOL_COUNT_CATEGORY_RESULTS)
+        ):
+            raise ValueError("school count reconciliation is not reviewed")
+        for source, expected_roles in _SOURCE_POPULATION_ROLE_COUNTS.items():
+            summary = self.sources.get(source)
+            expected_fetched = sum(expected_roles.values())
+            if (
+                summary is None
+                or summary.role_counts != expected_roles
+                or summary.fetched_count != expected_fetched
+                or summary.normalized_count
+                != expected_fetched - expected_roles.get("NONSELECTABLE", 0)
+            ):
+                raise ValueError("school count source summary is not reviewed")
+        for category, expected in _SCHOOL_COUNT_CATEGORY_RESULTS.items():
+            result = self.categories.get(category)
+            if result is None or (
+                result.expected_count,
+                result.actual_count,
+                result.delta_count,
+            ) != expected:
+                raise ValueError("school count category result is not reviewed")
+        return self
+
+
+class SourceSnapshotInfo(_StrictManifestContractModel):
     source: str
     endpoint: str
     license_name: str
@@ -258,6 +407,9 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
     row_count: int = Field(ge=0)
     unclassified_school_kind_counts: dict[str, int]
     unclassified_school_policy_sha256: str | None
+    source_category_counts: dict[str, int]
+    source_population_role_counts: dict[str, int]
+    source_population_profile_sha256: str | None
 
     @field_validator(
         "source",
@@ -298,6 +450,24 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
     @field_validator("unclassified_school_policy_sha256")
     @classmethod
     def unclassified_policy_hash_is_lowercase_sha256(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        return None if value is None else _require_sha256(value)
+
+    @field_validator("source_category_counts", "source_population_role_counts")
+    @classmethod
+    def population_counts_are_canonical(
+        cls,
+        values: dict[str, int],
+    ) -> dict[str, int]:
+        if values == {}:
+            return values
+        return _require_sorted_positive_count_map(values, "source population counts")
+
+    @field_validator("source_population_profile_sha256")
+    @classmethod
+    def population_profile_hash_is_lowercase_sha256(
         cls,
         value: str | None,
     ) -> str | None:
@@ -385,6 +555,27 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
             raise ValueError(
                 "preservedObservationDateCounts must sum to preservedRowCount"
             )
+        expected_categories = _SOURCE_CATEGORY_COUNTS.get(self.source)
+        expected_roles = _SOURCE_POPULATION_ROLE_COUNTS.get(self.source)
+        if expected_categories is None or expected_roles is None:
+            if (
+                self.source_category_counts
+                or self.source_population_role_counts
+                or self.source_population_profile_sha256 is not None
+            ):
+                raise ValueError("source population fields are reserved for NEIS/KGI")
+        elif (
+            self.source_category_counts != expected_categories
+            or self.source_population_role_counts != expected_roles
+            or self.source_population_profile_sha256 != _POPULATION_PROFILE_SHA256
+            or sum(self.source_category_counts.values()) != self.fetched_row_count
+            or sum(self.source_population_role_counts.values())
+            != self.fetched_row_count
+            or self.fetched_row_count
+            - self.source_population_role_counts.get("NONSELECTABLE", 0)
+            != self.normalized_row_count
+        ):
+            raise ValueError("source population provenance is not reviewed")
         return self
 
     @field_validator("request_timing")
@@ -511,7 +702,7 @@ class PossibleInstitutionMatch(_StrictSnapshotModel):
         return _require_nonblank(value)
 
 
-class SnapshotManifest(_StrictSnapshotModel):
+class SnapshotManifest(_StrictManifestContractModel):
     schema_version: int
     snapshot_id: str
     created_at: str
@@ -532,6 +723,7 @@ class SnapshotManifest(_StrictSnapshotModel):
     counts_by_foundation: dict[str, int]
     counts_by_status: dict[str, int]
     coordinate_quality_counts: dict[str, int]
+    school_count_reconciliation: SchoolCountReconciliation | None
     diff: SnapshotDiff
 
     @field_validator("snapshot_id", "created_at", "snapshot_as_of")
@@ -570,6 +762,37 @@ class SnapshotManifest(_StrictSnapshotModel):
             raise ValueError("approvedByRole must be nonblank")
         if not self.sources:
             raise ValueError("sources must be nonempty")
+        source_names = {source.source for source in self.sources}
+        test_fixture_exception = (
+            source_names == {"TEST_NEIS"}
+            and self.approved_by_role == "TEST_FIXTURE_REVIEWER"
+            and self.school_count_reconciliation is None
+            and all(
+                not source.source_category_counts
+                and not source.source_population_role_counts
+                and source.source_population_profile_sha256 is None
+                for source in self.sources
+            )
+        )
+        if self.school_count_reconciliation is None and not test_fixture_exception:
+            raise ValueError("schoolCountReconciliation is required")
+        if source_names & set(_SOURCE_POPULATION_ROLE_COUNTS):
+            if self.school_count_reconciliation is None:
+                raise ValueError("production school sources require reconciliation")
+            manifest_sources = {source.source: source for source in self.sources}
+            for source_name, summary in self.school_count_reconciliation.sources.items():
+                source = manifest_sources.get(source_name)
+                if (
+                    source is None
+                    or source.fetched_row_count != summary.fetched_count
+                    or source.normalized_row_count != summary.normalized_count
+                    or source.source_population_role_counts != summary.role_counts
+                    or source.source_population_profile_sha256
+                    != self.school_count_reconciliation.profile_sha256
+                ):
+                    raise ValueError(
+                        "schoolCountReconciliation does not match source provenance"
+                    )
         created_at = _parse_rfc3339_timestamp(self.created_at)
         approved_at = _parse_rfc3339_timestamp(self.approved_at)
         if created_at > approved_at:

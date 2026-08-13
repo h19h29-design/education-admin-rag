@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
+from typing import cast
 
 import app.institutions.sources.kindergarten as kindergarten_module
 import app.institutions.sources.neis as neis_module
@@ -86,6 +87,7 @@ from app.institutions.sync import (
     reconcile_selectable_school_counts,
 )
 from app.policy.coverage import CoverageService
+from app.policy.models import CoverageState
 from app.providers.kakao_local import KakaoLocalClient
 
 SOURCE_FIXTURES = Path("apps/travel-map/tests/fixtures/institutions/sources")
@@ -94,6 +96,14 @@ TEST_COVERAGE = CoverageService.from_geojson(
     seoul_path="apps/travel-map/resources/geodata/seoul.geojson",
     buffer_distance_m=12_000,
 )
+
+
+class _AlwaysSeoulCoverage:
+    def classify(self, _coordinate: object) -> CoverageState:
+        return CoverageState.SEOUL
+
+
+FAST_TEST_COVERAGE = cast(CoverageService, _AlwaysSeoulCoverage())
 REVIEWED_NEIS_UNCLASSIFIED_POLICY = NeisUnclassifiedPolicy(
     counts=(
         ("평생학교(고)-2년6학기", 7),
@@ -133,6 +143,226 @@ def test_school_count_population_profile_loads_exact_reviewed_contract() -> None
         "QUARANTINED": 18,
         "SUPPLEMENTARY": 23,
     }
+
+
+# Production break caught: reconciliation shown during preflight can be omitted
+# from the signed candidate and changed before a data steward reviews it.
+def test_candidate_binds_population_provenance_and_school_count_reconciliation(
+    tmp_path: Path,
+) -> None:
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    candidate = build_candidate_snapshot(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="reviewed-school-count-candidate",
+        coverage=TEST_COVERAGE,
+        source_provenance=bound,
+        school_count_reconciliation=reconciliation,
+    )
+    manifest = json.loads(
+        (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert manifest["schoolCountReconciliation"] == reconciliation
+    by_source = {entry["source"]: entry for entry in manifest["sources"]}
+    for source in ("KINDERGARTEN_INFO", "NEIS"):
+        assert by_source[source]["sourceCategoryCounts"] == dict(
+            bound[source].source_category_counts
+        )
+        assert by_source[source]["sourcePopulationRoleCounts"] == dict(
+            bound[source].source_population_role_counts
+        )
+        assert (
+            by_source[source]["sourcePopulationProfileSha256"]
+            == PINNED_POPULATION_PROFILE_SHA256
+        )
+
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    assert packet["schoolCountReconciliation"] == reconciliation
+    assert packet["schoolCountReconciliationSha256"] == (
+        sync_module._manifest_section_sha256(reconciliation)
+    )
+    packet_text = json.dumps(packet, ensure_ascii=False, sort_keys=True)
+    assert records[0].official_name not in packet_text
+    assert records[0].road_address not in packet_text
+
+
+# Production break caught: an attacker who can rewrite public snapshot metadata
+# and re-sign the transaction can alter the reviewed population after digest review.
+def test_final_approval_replays_population_and_reconciliation_before_pointer_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+    candidate = build_candidate_snapshot(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="school-count-replay-attacks",
+        coverage=FAST_TEST_COVERAGE,
+        source_provenance=bound,
+        school_count_reconciliation=reconciliation,
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=FAST_TEST_COVERAGE,
+    )
+    reviewed_digest = packet["reviewDigest"]
+    assert isinstance(reviewed_digest, str)
+    manifest_path = candidate.candidate_path / "manifest.json"
+    original_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    pointer = tmp_path / "current.json"
+    original_pointer = pointer.read_bytes() if pointer.exists() else None
+    tampered = copy.deepcopy(original_manifest)
+    neis_source = next(
+        entry for entry in tampered["sources"] if entry["source"] == "NEIS"
+    )
+    neis_source["sourceCategoryCounts"]["초등학교"] = 609
+    sync_module._write_json(manifest_path, tampered)
+    resign_candidate(candidate, tmp_path)
+    signed_transaction = sync_module._load_build_transaction(
+        tmp_path,
+        candidate.snapshot_id,
+    )
+    sync_module._transaction_attests_manifest(signed_transaction, tampered)
+
+    with pytest.raises(SnapshotQualityError, match="schema"):
+        sync_module._validate_unapproved_manifest_schema(tampered)
+    assert (pointer.read_bytes() if pointer.exists() else None) == original_pointer
+
+    sync_module._write_json(manifest_path, original_manifest)
+    resign_candidate(candidate, tmp_path)
+
+    institution_path = candidate.candidate_path / "institutions.jsonl"
+    original_institution_bytes = institution_path.read_bytes()
+    persisted = [
+        json.loads(line)
+        for line in institution_path.read_text(encoding="utf-8").splitlines()
+    ]
+    elementary = next(
+        row
+        for row in persisted
+        if row["source"] == "NEIS"
+        and row["institutionType"] == "ELEMENTARY_SCHOOL"
+    )
+    elementary["institutionType"] = "MIDDLE_SCHOOL"
+    changed_institutions = [
+        Institution.model_validate_json(json.dumps(row, ensure_ascii=False))
+        for row in persisted
+    ]
+    changed_bytes = sync_module._jsonl_bytes(changed_institutions)
+    institution_path.write_bytes(changed_bytes)
+    sites = [
+        InstitutionSite.model_validate_json(line)
+        for line in (candidate.candidate_path / "sites.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    sites_by_parent: dict[str, list[InstitutionSite]] = {
+        institution.institution_id: [] for institution in changed_institutions
+    }
+    for site in sites:
+        sites_by_parent[site.institution_id].append(site)
+    tampered_manifest = copy.deepcopy(original_manifest)
+    tampered_manifest["institutionsSha256"] = hashlib.sha256(changed_bytes).hexdigest()
+    tampered_manifest["countsByType"]["ELEMENTARY_SCHOOL"] -= 1
+    tampered_manifest["countsByType"]["MIDDLE_SCHOOL"] += 1
+    neis_entry = next(
+        entry for entry in tampered_manifest["sources"] if entry["source"] == "NEIS"
+    )
+    neis_rows = [
+        row for row in changed_institutions if row.source == "NEIS"
+    ]
+    neis_entry["sourceNormalizedSha256"] = (
+        sync_module._normalized_persisted_source_sha256(
+            neis_rows,
+            sites_by_parent,
+            before_enrichment=True,
+        )
+    )
+    neis_entry["normalizedSha256"] = sync_module._normalized_persisted_source_sha256(
+        neis_rows,
+        sites_by_parent,
+    )
+    sync_module._write_json(manifest_path, tampered_manifest)
+    resign_candidate(candidate, tmp_path)
+
+    with pytest.raises(SnapshotQualityError, match="population|reconciliation"):
+        sync_module.build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=FAST_TEST_COVERAGE,
+        )
+    assert (pointer.read_bytes() if pointer.exists() else None) == original_pointer
+
+    institution_path.write_bytes(original_institution_bytes)
+    sync_module._write_json(manifest_path, original_manifest)
+    resign_candidate(candidate, tmp_path)
+    real_replace = os.replace
+    pointer_failure_pending = True
+
+    def fail_pointer_once(source: str | Path, destination: str | Path) -> None:
+        nonlocal pointer_failure_pending
+        if Path(destination).name == "current.json" and pointer_failure_pending:
+            pointer_failure_pending = False
+            raise OSError("simulated pointer failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_pointer_once)
+    with pytest.raises(OSError, match="simulated pointer failure"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=reviewed_digest,
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=FAST_TEST_COVERAGE,
+        )
+    assert not pointer.exists()
+
+    replayed_digest = sync_module.approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=reviewed_digest,
+        reviewer_role="data-steward",
+        snapshot_root=tmp_path,
+        coverage=FAST_TEST_COVERAGE,
+    )
+    idempotent_digest = sync_module.approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=reviewed_digest,
+        reviewer_role="data-steward",
+        snapshot_root=tmp_path,
+        coverage=FAST_TEST_COVERAGE,
+    )
+    assert replayed_digest == idempotent_digest == reviewed_digest
 
 
 @pytest.mark.parametrize(
@@ -1073,6 +1303,7 @@ def test_unresolved_sen_main_and_branch_are_both_persisted_for_review(
         snapshot_id="unresolved-sen-multisite",
         coverage=TEST_COVERAGE,
         source_provenance={result.provenance.source: result.provenance},
+        school_count_reconciliation=reviewed_reconciliation_contract(),
     )
 
     assert candidate.issues == (
@@ -1140,11 +1371,21 @@ def test_reviewed_sen_multisite_survives_snapshot_and_store(
         )
         for record in sen_result.records
     )
-    neis_records = tuple(
-        source_record(institution_id=f"neis:B10:7011{index:03d}")
-        for index in range(9)
-    ) + quarantined_neis_records("neis:B10:reviewed-sen-quarantine")
-    records = geocoded_sen + neis_records
+    profile, benchmark, population_records, population_provenance = (
+        reviewed_population_fixture()
+    )
+    bound_population = sync_module.bind_school_count_population_profile(
+        population_provenance,
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        population_records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound_population,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+    records = geocoded_sen + population_records
     geocoded_count = sum(
         record.coordinate_quality == "GEOCODED"
         for record in records
@@ -1172,22 +1413,22 @@ def test_reviewed_sen_multisite_survives_snapshot_and_store(
             "GEOCODED",
         ),
     )
-    neis_provenance = source_provenance_for(neis_records)["NEIS"]
     candidate = build_candidate_snapshot(
         records=records,
         previous=None,
         output_root=tmp_path,
         snapshot_id="reviewed-sen-multisite",
-        coverage=TEST_COVERAGE,
+        coverage=FAST_TEST_COVERAGE,
         source_provenance={
+            **bound_population,
             sen_result.provenance.source: sen_result.provenance,
-            neis_provenance.source: neis_provenance,
         },
+        school_count_reconciliation=reconciliation,
         enrichment_provenance=(kakao,),
     )
 
     assert candidate.issues == ()
-    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    promote_snapshot(candidate, tmp_path, coverage=FAST_TEST_COVERAGE)
     store = InstitutionStore.load(tmp_path)
 
     matches = store.search("강서도서관")
@@ -1220,6 +1461,7 @@ def test_reviewed_sen_provenance_is_accepted_by_candidate_builder(
         snapshot_id="sen-provenance-contract",
         coverage=TEST_COVERAGE,
         source_provenance={result.provenance.source: result.provenance},
+        school_count_reconciliation=reviewed_reconciliation_contract(),
     )
 
     assert candidate.issues == (
@@ -1250,6 +1492,7 @@ def test_reviewed_sen_provenance_rejects_valid_looking_wrong_raw_digest(
             snapshot_id="sen-wrong-raw-digest",
             coverage=TEST_COVERAGE,
             source_provenance={forged.source: forged},
+            school_count_reconciliation=reviewed_reconciliation_contract(),
         )
 
 
@@ -3915,6 +4158,7 @@ def test_candidate_requires_seoul_coverage_service(tmp_path: Path) -> None:
             previous=None,
             output_root=tmp_path,
             snapshot_id="missing-coverage",
+            school_count_reconciliation={},
         )
 
 
@@ -3926,6 +4170,7 @@ def test_candidate_requires_explicit_source_provenance(tmp_path: Path) -> None:
             output_root=tmp_path,
             snapshot_id="missing-provenance",
             coverage=TEST_COVERAGE,
+            school_count_reconciliation={},
         )
 
 
@@ -6102,6 +6347,7 @@ def build_test_candidate(
     coverage: CoverageService | None = TEST_COVERAGE,
     source_provenance: Mapping[str, SourceProvenance] | None = None,
     enrichment_provenance: tuple[EnrichmentProvenance, ...] = (),
+    school_count_reconciliation: Mapping[str, object] | None = None,
     include_neis_quarantine: bool = True,
 ) -> SnapshotBuildResult:
     if (
@@ -6124,8 +6370,57 @@ def build_test_candidate(
         snapshot_id=snapshot_id,
         coverage=coverage,
         source_provenance=selected_provenance,
+        school_count_reconciliation=(
+            school_count_reconciliation
+            if school_count_reconciliation is not None
+            else reviewed_reconciliation_contract()
+        ),
         enrichment_provenance=enrichment_provenance,
     )
+
+
+def reviewed_reconciliation_contract() -> dict[str, object]:
+    return {
+        "profileStatus": "TEMPORARY_PRELIMINARY_VARIANCE",
+        "profileSha256": PINNED_POPULATION_PROFILE_SHA256,
+        "benchmarkSha256": (
+            "36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332"
+        ),
+        "sources": {
+            "KINDERGARTEN_INFO": {
+                "fetchedCount": 706,
+                "normalizedCount": 706,
+                "roleCounts": {"BENCHMARK": 706},
+            },
+            "NEIS": {
+                "fetchedCount": 1_415,
+                "normalizedCount": 1_414,
+                "roleCounts": {
+                    "BENCHMARK": 1_373,
+                    "NONSELECTABLE": 1,
+                    "QUARANTINED": 18,
+                    "SUPPLEMENTARY": 23,
+                },
+            },
+        },
+        "categories": {
+            name: {
+                "expectedCount": expected,
+                "actualCount": actual,
+                "deltaCount": delta,
+                "status": "MATCHED" if delta == 0 else "REVIEWED_VARIANCE",
+            }
+            for name, (expected, actual, delta) in {
+                "ELEMENTARY_SCHOOL": (609, 610, 1),
+                "HIGH_SCHOOL": (319, 319, 0),
+                "KINDERGARTEN": (724, 706, -18),
+                "MIDDLE_SCHOOL": (390, 390, 0),
+                "MISC_SCHOOL": (18, 22, 4),
+                "SPECIAL_SCHOOL": (32, 32, 0),
+            }.items()
+        },
+        "passed": True,
+    }
 
 
 def promote_snapshot(
@@ -6533,6 +6828,7 @@ def reviewed_population_fixture() -> tuple[
                             else f"neis:B10:{sequence:07d}"
                         )
                     ),
+                    official_name=f"검증학교-{sequence:07d}",
                     institution_type=row.normalized_type,
                     source=row.source,
                     source_region_code=(
@@ -6551,6 +6847,7 @@ def reviewed_population_fixture() -> tuple[
     kindergarten = provenance["KINDERGARTEN_INFO"]
     provenance["NEIS"] = replace(
         neis,
+        page_count=2,
         source_as_of="2026-06-07",
         source_observation_date_counts=(("2026-06-07", 1_415),),
         normalized_observation_date_counts=(("2026-06-07", 1_414),),

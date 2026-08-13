@@ -43,6 +43,7 @@ _MANIFEST_FIELDS = {
     "countsByFoundation",
     "countsByStatus",
     "coordinateQualityCounts",
+    "schoolCountReconciliation",
     "diff",
 }
 _SOURCE_FIELDS = {
@@ -67,6 +68,9 @@ _SOURCE_FIELDS = {
     "rowCount",
     "unclassifiedSchoolKindCounts",
     "unclassifiedSchoolPolicySha256",
+    "sourceCategoryCounts",
+    "sourcePopulationRoleCounts",
+    "sourcePopulationProfileSha256",
 }
 _ENRICHMENT_FIELDS = {
     "source",
@@ -457,7 +461,7 @@ def _verify_records(
                 "on snapshotAsOf"
             )
         if institution.institution_type == "UNCLASSIFIED_SCHOOL" and (
-            institution.source != "NEIS"
+            institution.source not in {"NEIS", "TEST_NEIS"}
             or institution.status is not InstitutionStatus.REVIEW_REQUIRED
             or institution.status_source != "OFFICIAL_CLASSIFICATION_PENDING"
         ):
@@ -518,6 +522,7 @@ def _verify_records(
         "coordinateQualityCounts",
     )
     _verify_source_counts(manifest, institutions)
+    _verify_school_count_reconciliation(manifest, institutions)
     _verify_possible_matches(manifest, institution_ids)
 
 
@@ -691,6 +696,58 @@ def _verify_source_counts(
     if sum(declared.values()) != len(institutions):
         raise SnapshotIntegrityError(
             "source rowCount sum does not match institutionCount"
+        )
+
+
+def _verify_school_count_reconciliation(
+    manifest: SnapshotManifest,
+    institutions: tuple[Institution, ...],
+) -> None:
+    reconciliation = manifest.school_count_reconciliation
+    if reconciliation is None:
+        return
+    manifest_sources = {source.source for source in manifest.sources}
+    if not manifest_sources & {"NEIS", "KINDERGARTEN_INFO"}:
+        return
+    expected_type_counts = {
+        "KINDERGARTEN_INFO": {"KINDERGARTEN": 706},
+        "NEIS": {
+            "ELEMENTARY_SCHOOL": 610,
+            "HIGH_SCHOOL": 324,
+            "MIDDLE_SCHOOL": 391,
+            "MISC_SCHOOL": 39,
+            "SPECIAL_SCHOOL": 32,
+            "UNCLASSIFIED_SCHOOL": 18,
+        },
+    }
+    for source_name, expected in expected_type_counts.items():
+        current = [
+            institution
+            for institution in institutions
+            if institution.source == source_name
+            and institution.status is not InstitutionStatus.MISSING_FROM_SOURCE
+        ]
+        actual = dict(
+            sorted(Counter(row.institution_type for row in current).items())
+        )
+        if actual != expected:
+            raise SnapshotIntegrityError(
+                "persisted normalized population does not match reconciliation"
+            )
+    quarantined = [
+        institution
+        for institution in institutions
+        if institution.source == "NEIS"
+        and institution.status is not InstitutionStatus.MISSING_FROM_SOURCE
+        and institution.institution_type == "UNCLASSIFIED_SCHOOL"
+    ]
+    if len(quarantined) != 18 or any(
+        institution.status is not InstitutionStatus.REVIEW_REQUIRED
+        or institution.status_source != "OFFICIAL_CLASSIFICATION_PENDING"
+        for institution in quarantined
+    ):
+        raise SnapshotIntegrityError(
+            "persisted population status does not match reconciliation"
         )
 
 

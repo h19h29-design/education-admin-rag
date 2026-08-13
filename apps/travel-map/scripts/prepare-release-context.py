@@ -51,7 +51,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def stage_release_context(source_root: Path, destination: Path) -> str:
+def stage_release_context(
+    source_root: Path,
+    destination: Path,
+    *,
+    allow_test_fixture: bool = False,
+) -> str:
     """Verify release artifacts then copy only files Docker is allowed to receive."""
 
     source = _resolve_directory(source_root, "source")
@@ -60,6 +65,23 @@ def stage_release_context(source_root: Path, destination: Path) -> str:
 
     resources = source / "resources"
     verified_snapshot = verify_snapshot(resources / "institution-snapshots")
+    is_test_fixture = (
+        verified_snapshot.manifest.approved_by_role == "TEST_FIXTURE_REVIEWER"
+        and {source.source for source in verified_snapshot.manifest.sources}
+        == {"TEST_NEIS"}
+        and verified_snapshot.manifest.school_count_reconciliation is None
+    )
+    if is_test_fixture and not allow_test_fixture:
+        raise ValueError("test institution snapshot cannot stage for production")
+    if not is_test_fixture and (
+        verified_snapshot.manifest.approved_by_role != "data-steward"
+        or verified_snapshot.manifest.school_count_reconciliation is None
+        or any(
+            source.source == "TEST_NEIS"
+            for source in verified_snapshot.manifest.sources
+        )
+    ):
+        raise ValueError("institution snapshot is not approved for production")
     verify_geodata_resources(resources / "geodata", verify_source=True)
     RuleRepository.from_directory(resources / "rules", require_hashes=True)
 

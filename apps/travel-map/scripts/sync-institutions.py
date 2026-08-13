@@ -240,6 +240,7 @@ async def _run_with_keys(
         snapshot_id=snapshot_id,
         coverage=coverage,
         source_provenance=source_provenance,
+        school_count_reconciliation=reconciliation,
         enrichment_provenance=enrichments,
     )
     if candidate.issues:
