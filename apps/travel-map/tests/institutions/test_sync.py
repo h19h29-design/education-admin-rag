@@ -2194,6 +2194,9 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
         sen_csv=SOURCE_RESOURCES / "sen-institutions.csv",
         region_codes=SOURCE_RESOURCES / "kindergarten-region-codes.csv",
         school_counts=SOURCE_RESOURCES / "sen-annual-school-counts.csv",
+        neis_unclassified_policy=(
+            SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+        ),
         snapshot_root=snapshot_root,
         geodata_root=Path("apps/travel-map/resources/geodata"),
         timing="20261",
@@ -2220,6 +2223,23 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
     assert not snapshot_root.exists()
 
 
+def test_sync_cli_defaults_to_the_reviewed_neis_unclassified_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script_path = Path("apps/travel-map/scripts/sync-institutions.py")
+    spec = importlib.util.spec_from_file_location("sync_institutions_cli_args", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(sys, "argv", [str(script_path)])
+
+    args = module.parse_args()
+
+    assert args.neis_unclassified_policy == (
+        SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    )
+
+
 @pytest.mark.asyncio
 async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
     tmp_path: Path,
@@ -2238,10 +2258,11 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
 
     neis_records = (source_record(),)
     neis_provenance = source_provenance_for(neis_records)["NEIS"]
+    loaded_policy = False
 
     class FakeAsyncClient:
         def __init__(self, **_kwargs: object) -> None:
-            pass
+            assert loaded_policy, "policy must load before network clients"
 
         async def __aenter__(self) -> object:
             return self
@@ -2250,8 +2271,13 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
             return None
 
     class FakeNeisSource:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
+        def __init__(
+            self,
+            *,
+            unclassified_policy: NeisUnclassifiedPolicy,
+            **_kwargs: object,
+        ) -> None:
+            assert unclassified_policy is REVIEWED_NEIS_UNCLASSIFIED_POLICY
 
         async def fetch(self) -> SourceFetchResult:
             return SourceFetchResult(neis_records, neis_provenance)
@@ -2341,6 +2367,20 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
     monkeypatch.setattr(module, "SenCsvSource", FakeSenSource)
     monkeypatch.setattr(module, "KakaoLocalClient", FakeKakaoClient)
     monkeypatch.setattr(module, "geocode_missing_records", identity_records)
+    def load_policy(path: Path) -> NeisUnclassifiedPolicy:
+        nonlocal loaded_policy
+        assert path == (
+            SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+        )
+        loaded_policy = True
+        return REVIEWED_NEIS_UNCLASSIFIED_POLICY
+
+    monkeypatch.setattr(
+        module,
+        "load_neis_unclassified_policy",
+        load_policy,
+        raising=False,
+    )
     monkeypatch.setattr(
         module,
         "load_reviewed_school_counts",
@@ -2352,15 +2392,25 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
         fake_build_candidate_snapshot,
     )
     monkeypatch.setattr(module, "promote_snapshot", forbidden_promotion, raising=False)
-    monkeypatch.setattr(
-        module,
-        "reconcile_selectable_school_counts",
-        lambda *_args, **_kwargs: {"passed": True},
-    )
+    def reconcile(
+        *_args: object,
+        unclassified_policy: NeisUnclassifiedPolicy,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        assert unclassified_policy is REVIEWED_NEIS_UNCLASSIFIED_POLICY
+        return {
+            "passed": True,
+            "unclassifiedSchoolKindCounts": dict(unclassified_policy.counts),
+        }
+
+    monkeypatch.setattr(module, "reconcile_selectable_school_counts", reconcile)
     monkeypatch.setattr(
         module,
         "build_sync_preflight_audit",
-        lambda *_args, **_kwargs: {"passed": True},
+        lambda *_args, reconciliation, **_kwargs: {
+            "passed": True,
+            "reconciliation": reconciliation,
+        },
     )
     monkeypatch.setattr(
         module,
@@ -2371,6 +2421,9 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
         sen_csv=tmp_path / "sen.csv",
         region_codes=tmp_path / "regions.csv",
         school_counts=tmp_path / "counts.csv",
+        neis_unclassified_policy=(
+            SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+        ),
         snapshot_root=snapshot_root,
         geodata_root=Path("apps/travel-map/resources/geodata"),
         timing="20261",
@@ -2388,6 +2441,10 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
     )
 
     lines = capsys.readouterr().out.splitlines()
+    preflight = json.loads(lines[0])
+    assert preflight["reconciliation"]["unclassifiedSchoolKindCounts"] == dict(
+        REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
+    )
     assert lines[-1] == (
         '{"snapshotId":"candidate-only-cli",'
         '"status":"CANDIDATE_REVIEW_REQUIRED"}'

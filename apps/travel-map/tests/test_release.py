@@ -4,6 +4,7 @@ import runpy
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from app.institutions.sources.common import (
     SourceProvenance,
     normalized_records_sha256,
 )
+from app.institutions.sources.neis_classification import PINNED_POLICY_SHA256
 from app.institutions.sync import (
     approve_candidate_snapshot,
     build_candidate_review_packet,
@@ -176,21 +178,44 @@ def test_release_context_blocks_candidate_until_exact_digest_approval(
     shutil.copytree(ROOT, source_root)
     snapshot_root = source_root / "resources/institution-snapshots"
     snapshot_root.mkdir()
+    selectable_record = SourceInstitutionRecord(
+        institution_id="neis:B10:7010001",
+        official_name="검증학교",
+        institution_type="ELEMENTARY_SCHOOL",
+        foundation_type="PUBLIC",
+        education_office="서울특별시교육청",
+        road_address="서울특별시 중구 검증로 1",
+        district="중구",
+        latitude=37.56,
+        longitude=126.97,
+        source="NEIS",
+        source_region_code="B10",
+        source_as_of="2026-08-12",
+        coordinate_quality="MANUALLY_VERIFIED",
+    )
+    unclassified_counts = (
+        ("평생학교(고)-2년6학기", 7),
+        ("평생학교(고)-3년6학기", 4),
+        ("평생학교(중)-2년6학기", 5),
+        ("평생학교(초)-3년6학기", 2),
+    )
     records = (
-        SourceInstitutionRecord(
-            institution_id="neis:B10:7010001",
-            official_name="검증학교",
-            institution_type="ELEMENTARY_SCHOOL",
-            foundation_type="PUBLIC",
-            education_office="서울특별시교육청",
-            road_address="서울특별시 중구 검증로 1",
-            district="중구",
-            latitude=37.56,
-            longitude=126.97,
-            source="NEIS",
-            source_region_code="B10",
-            source_as_of="2026-08-12",
-            coordinate_quality="MANUALLY_VERIFIED",
+        selectable_record,
+        *(
+            replace(
+                selectable_record,
+                institution_id=f"neis:B10:quarantine-{index:02d}",
+                institution_type="UNCLASSIFIED_SCHOOL",
+                source_kind_label=label,
+            )
+            for index, label in enumerate(
+                (
+                    label
+                    for label, count in unclassified_counts
+                    for _ in range(count)
+                ),
+                start=1,
+            )
         ),
     )
     provenance = SourceProvenance(
@@ -200,14 +225,16 @@ def test_release_context_blocks_candidate_until_exact_digest_approval(
         attribution="Ministry of Education NEIS education data",
         fetched_at="2026-08-12T09:00:00Z",
         source_as_of="2026-08-12",
-        source_observation_date_counts=(("2026-08-12", 1),),
-        normalized_observation_date_counts=(("2026-08-12", 1),),
+        source_observation_date_counts=(("2026-08-12", 19),),
+        normalized_observation_date_counts=(("2026-08-12", 19),),
         raw_sha256="a" * 64,
         page_count=1,
-        row_count=1,
-        fetched_row_count=1,
+        row_count=19,
+        fetched_row_count=19,
         request_region_code="B10",
         normalized_sha256=normalized_records_sha256(records),
+        unclassified_school_kind_counts=unclassified_counts,
+        unclassified_school_policy_sha256=PINNED_POLICY_SHA256,
     )
     coverage = CoverageService.from_geojson(
         seoul_path=source_root / "resources/geodata/seoul.geojson",
@@ -235,6 +262,8 @@ def test_release_context_blocks_candidate_until_exact_digest_approval(
     )
     digest = packet["reviewDigest"]
     assert isinstance(digest, str)
+    assert packet["unclassifiedSchoolKindCounts"] == dict(unclassified_counts)
+    assert packet["unclassifiedSchoolPolicySha256"] == PINNED_POLICY_SHA256
     approve_candidate_snapshot(
         snapshot_id="release-review-candidate",
         review_digest=digest,

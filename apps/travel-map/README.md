@@ -85,6 +85,26 @@ Release remains blocked until step 3 publishes the independently reviewed
 digest. A missing or invalid approved snapshot is a release blocker, never
 permission to substitute a sample catalog.
 
+### NEIS lifelong-school quarantine review
+
+The sync command loads the reviewed NEIS quarantine policy from
+`resources/institution-sources/neis-unclassified-school-kinds.csv`. Its current
+total is 18 and it contains exactly these labels and counts:
+
+- `평생학교(고)-2년6학기`: 7
+- `평생학교(고)-3년6학기`: 4
+- `평생학교(중)-2년6학기`: 5
+- `평생학교(초)-3년6학기`: 2
+
+These entries must remain `UNCLASSIFIED_SCHOOL` with `REVIEW_REQUIRED` status;
+they are quarantine records, not selectable schools. Before copying the review
+digest in step 3, inspect the pre-promotion audit's
+`reconciliation.unclassifiedSchoolKindCounts` and confirm it matches the four
+labels above. A new label or any count drift fails closed: stop the workflow,
+do not approve the candidate, and investigate the official source. When
+official classification or revised statistics become available, make a new
+reviewed policy change before resuming synchronization.
+
 ## Live smoke and manual approval
 
 The live smoke runs exactly three bounded cases only after opt-in, a valid approved snapshot, and all runtime provider credentials:

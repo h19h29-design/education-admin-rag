@@ -13,6 +13,9 @@ from app.institutions.snapshot import verify_snapshot
 from app.institutions.sources.common import EnrichmentProvenance, SourceDataError
 from app.institutions.sources.kindergarten import KindergartenSource
 from app.institutions.sources.neis import NeisSource
+from app.institutions.sources.neis_classification import (
+    load_neis_unclassified_policy,
+)
 from app.institutions.sources.sen import SenCsvSource
 from app.institutions.sources.sen_counts import load_reviewed_school_counts
 from app.institutions.sources.standard_school import (
@@ -71,6 +74,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--neis-unclassified-policy",
+        type=Path,
+        default=Path(
+            "apps/travel-map/resources/institution-sources/"
+            "neis-unclassified-school-kinds.csv"
+        ),
+    )
+    parser.add_argument(
         "--snapshot-root",
         type=Path,
         default=Path("apps/travel-map/resources/institution-snapshots"),
@@ -106,9 +117,14 @@ async def _run_with_keys(
         NeisSource | KindergartenSource | KakaoLocalClient
     ],
 ) -> None:
+    policy = load_neis_unclassified_policy(args.neis_unclassified_policy)
     timeout = httpx.Timeout(5.0, connect=2.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
-        neis_source = NeisSource(api_key=keys["NEIS_API_KEY"], client=http)
+        neis_source = NeisSource(
+            api_key=keys["NEIS_API_KEY"],
+            client=http,
+            unclassified_policy=policy,
+        )
         credential_holders.append(neis_source)
         kindergarten_source = KindergartenSource(
             api_key=keys["KINDERGARTEN_API_KEY"],
@@ -135,6 +151,7 @@ async def _run_with_keys(
         reconciliation = reconcile_selectable_school_counts(
             neis_result.records + kindergarten_result.records,
             benchmark=benchmark,
+            unclassified_policy=policy,
         )
         all_records = (
             neis_records + kindergarten_result.records + sen_result.records
