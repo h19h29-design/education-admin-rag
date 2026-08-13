@@ -1,7 +1,9 @@
 import hashlib
 import json
+from collections import Counter
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
@@ -9,6 +11,70 @@ import httpx
 
 class SourceDataError(ValueError):
     """Raised when an official source response cannot be trusted."""
+
+
+ObservationDateCounts = tuple[tuple[str, int], ...]
+
+
+def validate_observation_date_counts(
+    counts: ObservationDateCounts,
+    *,
+    expected_total: int,
+    label: str,
+) -> None:
+    if type(counts) is not tuple:
+        raise SourceDataError(f"{label} must be a tuple")
+    dates: list[str] = []
+    total = 0
+    for entry in counts:
+        if type(entry) is not tuple or len(entry) != 2:
+            raise SourceDataError(f"{label} entries must be date/count pairs")
+        source_date, count = entry
+        if type(source_date) is not str or not source_date.strip():
+            raise SourceDataError(f"{label} dates must be nonblank ISO dates")
+        try:
+            if date.fromisoformat(source_date).isoformat() != source_date:
+                raise ValueError
+        except ValueError:
+            raise SourceDataError(f"{label} dates must be valid ISO dates") from None
+        if type(count) is not int or count <= 0:
+            raise SourceDataError(f"{label} counts must be positive integers")
+        dates.append(source_date)
+        total += count
+    if len(dates) != len(set(dates)):
+        raise SourceDataError(f"{label} dates must not be duplicated")
+    if dates != sorted(dates):
+        raise SourceDataError(f"{label} dates must be lexicographically sorted")
+    if total != expected_total:
+        raise SourceDataError(f"{label} total does not match expected row count")
+
+
+def observation_date_counts(dates: Iterable[str]) -> ObservationDateCounts:
+    if isinstance(dates, Mapping):
+        raise SourceDataError("source observation dates must be an iterable of dates")
+    values = Counter(dates)
+    result = tuple(sorted(values.items()))
+    validate_observation_date_counts(
+        result,
+        expected_total=sum(values.values()),
+        label="source observation dates",
+    )
+    return result
+
+
+def observation_counts_as_dict(
+    counts: ObservationDateCounts,
+) -> dict[str, int]:
+    validate_observation_date_counts(
+        counts,
+        expected_total=sum(count for _, count in counts),
+        label="observation dates",
+    )
+    return dict(counts)
+
+
+def source_as_of_for(counts: ObservationDateCounts) -> str | None:
+    return counts[0][0] if len(counts) == 1 else None
 
 
 @dataclass(frozen=True)
@@ -48,7 +114,9 @@ class SourceProvenance:
     license_name: str
     attribution: str
     fetched_at: str
-    source_as_of: str
+    source_as_of: str | None
+    source_observation_date_counts: ObservationDateCounts
+    normalized_observation_date_counts: ObservationDateCounts
     raw_sha256: str
     page_count: int
     row_count: int

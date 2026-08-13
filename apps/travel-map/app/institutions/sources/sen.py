@@ -13,6 +13,7 @@ from app.institutions.sources.common import (
     SourceInstitutionSiteRecord,
     SourceProvenance,
     normalized_records_sha256,
+    observation_date_counts,
     utc_now,
 )
 
@@ -94,6 +95,12 @@ class SenCsvSource:
         actual_counts = Counter(record.institution_type for record in records)
         if actual_counts != Counter(self._expected_type_counts):
             raise SourceDataError("SEN CSV organization totals do not match official counts")
+        raw_counts = observation_date_counts(
+            metadata["source_as_of"] for _ in range(fetched_row_count)
+        )
+        normalized_counts = observation_date_counts(
+            metadata["source_as_of"] for _ in records
+        )
         return SourceFetchResult(
             records=records,
             provenance=SourceProvenance(
@@ -103,6 +110,8 @@ class SenCsvSource:
                 attribution=metadata["attribution"],
                 fetched_at=utc_now(),
                 source_as_of=metadata["source_as_of"],
+                source_observation_date_counts=raw_counts,
+                normalized_observation_date_counts=normalized_counts,
                 raw_sha256=metadata["source_sha256"],
                 page_count=1,
                 row_count=len(records),

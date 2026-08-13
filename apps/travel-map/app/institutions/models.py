@@ -242,7 +242,10 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
     license_name: str
     attribution: str
     fetched_at: str
-    source_as_of: str
+    source_as_of: str | None
+    source_observation_date_counts: dict[str, int]
+    normalized_observation_date_counts: dict[str, int]
+    preserved_observation_date_counts: dict[str, int]
     raw_sha256: str
     source_normalized_sha256: str
     normalized_sha256: str
@@ -260,7 +263,6 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
         "license_name",
         "attribution",
         "fetched_at",
-        "source_as_of",
         "request_region_code",
     )
     @classmethod
@@ -278,9 +280,30 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
 
     @field_validator("source_as_of")
     @classmethod
-    def source_date_is_iso_date(cls, value: str) -> str:
+    def source_date_is_iso_date(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         _parse_iso_date(value)
         return value
+
+    @field_validator(
+        "source_observation_date_counts",
+        "normalized_observation_date_counts",
+        "preserved_observation_date_counts",
+    )
+    @classmethod
+    def observation_date_counts_are_canonical(
+        cls,
+        values: dict[str, int],
+    ) -> dict[str, int]:
+        entries = list(values.items())
+        if list(values) != sorted(values):
+            raise ValueError("observation date count keys must be sorted")
+        for source_date, count in entries:
+            _parse_iso_date(source_date)
+            if type(count) is not int or count <= 0:
+                raise ValueError("observation date counts must be positive integers")
+        return values
 
     @field_validator("fetched_at")
     @classmethod
@@ -290,10 +313,27 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
 
     @model_validator(mode="after")
     def source_date_is_not_after_fetch(self) -> Self:
-        if _parse_iso_date(self.source_as_of) > _parse_rfc3339_timestamp(
-            self.fetched_at
-        ).date():
+        raw_dates = list(self.source_observation_date_counts)
+        canonical_source_as_of = raw_dates[0] if len(raw_dates) == 1 else None
+        if self.source_as_of != canonical_source_as_of:
+            raise ValueError(
+                "sourceAsOf must equal the sole sourceObservationDateCounts date "
+                "and must be null for mixed dates"
+            )
+        fetched_date = _parse_rfc3339_timestamp(self.fetched_at).date()
+        if self.source_as_of is not None and _parse_iso_date(
+            self.source_as_of
+        ) > fetched_date:
             raise ValueError("sourceAsOf must not be later than fetchedAt date")
+        observation_dates = {
+            *self.source_observation_date_counts,
+            *self.normalized_observation_date_counts,
+            *self.preserved_observation_date_counts,
+        }
+        if any(_parse_iso_date(value) > fetched_date for value in observation_dates):
+            raise ValueError(
+                "observation dates must not be later than fetchedAt date"
+            )
         if self.page_count <= 0 or self.fetched_row_count <= 0:
             raise ValueError("source page/fetched counts must be positive")
         if self.normalized_row_count > self.fetched_row_count:
@@ -301,6 +341,24 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
         if self.normalized_row_count + self.preserved_row_count != self.row_count:
             raise ValueError(
                 "normalizedRowCount + preservedRowCount must equal rowCount"
+            )
+        if sum(self.source_observation_date_counts.values()) != self.fetched_row_count:
+            raise ValueError(
+                "sourceObservationDateCounts must sum to fetchedRowCount"
+            )
+        if (
+            sum(self.normalized_observation_date_counts.values())
+            != self.normalized_row_count
+        ):
+            raise ValueError(
+                "normalizedObservationDateCounts must sum to normalizedRowCount"
+            )
+        if (
+            sum(self.preserved_observation_date_counts.values())
+            != self.preserved_row_count
+        ):
+            raise ValueError(
+                "preservedObservationDateCounts must sum to preservedRowCount"
             )
         return self
 
@@ -500,10 +558,26 @@ class SnapshotManifest(_StrictSnapshotModel):
                     f"source {source.source} fetchedAt must not be later than "
                     "manifest createdAt"
                 )
-            if _parse_iso_date(source.source_as_of) > snapshot_as_of:
+            if (
+                source.source_as_of is not None
+                and _parse_iso_date(source.source_as_of) > snapshot_as_of
+            ):
                 raise ValueError(
                     f"source {source.source} sourceAsOf must not be later than "
                     "manifest snapshotAsOf"
+                )
+            source_observation_dates = {
+                *source.source_observation_date_counts,
+                *source.normalized_observation_date_counts,
+                *source.preserved_observation_date_counts,
+            }
+            if any(
+                _parse_iso_date(value) > snapshot_as_of
+                for value in source_observation_dates
+            ):
+                raise ValueError(
+                    f"source {source.source} observation date must not be later "
+                    "than manifest snapshotAsOf"
                 )
         for enrichment in self.enrichments:
             if _parse_rfc3339_timestamp(enrichment.fetched_at) > created_at:

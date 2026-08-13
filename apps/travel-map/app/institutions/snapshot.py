@@ -10,7 +10,12 @@ from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from app.institutions.models import Institution, InstitutionSite, SnapshotManifest
+from app.institutions.models import (
+    Institution,
+    InstitutionSite,
+    InstitutionStatus,
+    SnapshotManifest,
+)
 
 _SAFE_SNAPSHOT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _MANIFEST_FIELDS = {
@@ -43,6 +48,9 @@ _SOURCE_FIELDS = {
     "attribution",
     "fetchedAt",
     "sourceAsOf",
+    "sourceObservationDateCounts",
+    "normalizedObservationDateCounts",
+    "preservedObservationDateCounts",
     "rawSha256",
     "sourceNormalizedSha256",
     "normalizedSha256",
@@ -604,18 +612,49 @@ def _verify_source_counts(
                 f"source {source.source} normalized/preserved row counts "
                 "do not match rowCount"
             )
-    source_dates = {
-        source.source: source.source_as_of for source in manifest.sources
-    }
-    for institution in institutions:
-        if institution.source_as_of != source_dates[institution.source]:
-            raise SnapshotIntegrityError(
-                f"institution {institution.institution_id} sourceAsOf does not "
-                f"match manifest source {institution.source}"
-            )
+    for source in manifest.sources:
+        current = [
+            item
+            for item in institutions
+            if item.source == source.source
+            and item.status is not InstitutionStatus.MISSING_FROM_SOURCE
+        ]
+        preserved = [
+            item
+            for item in institutions
+            if item.source == source.source
+            and item.status is InstitutionStatus.MISSING_FROM_SOURCE
+        ]
+        _assert_observation_histogram(
+            source.normalized_observation_date_counts,
+            current,
+            source=source.source,
+            label="normalized",
+        )
+        _assert_observation_histogram(
+            source.preserved_observation_date_counts,
+            preserved,
+            source=source.source,
+            label="preserved",
+        )
     if sum(declared.values()) != len(institutions):
         raise SnapshotIntegrityError(
             "source rowCount sum does not match institutionCount"
+        )
+
+
+def _assert_observation_histogram(
+    declared: dict[str, int],
+    rows: list[Institution],
+    *,
+    source: str,
+    label: str,
+) -> None:
+    actual = dict(sorted(Counter(item.source_as_of for item in rows).items()))
+    if declared != actual:
+        raise SnapshotIntegrityError(
+            f"source {source} {label} observation date counts do not match "
+            "institution records"
         )
 
 

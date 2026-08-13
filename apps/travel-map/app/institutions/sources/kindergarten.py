@@ -13,6 +13,7 @@ from app.institutions.sources.common import (
     SourceProvenance,
     get_json_with_retry,
     normalized_records_sha256,
+    observation_date_counts,
     utc_now,
 )
 
@@ -138,6 +139,8 @@ class KindergartenSource:
         ids = [record.institution_id for record in records]
         if len(ids) != len(set(ids)):
             raise SourceDataError("kindergarten source returned duplicate identifiers")
+        source_as_of = _timing_as_date(self._timing)
+        counts = observation_date_counts(source_as_of for _ in records)
         return SourceFetchResult(
             records=tuple(records),
             provenance=SourceProvenance(
@@ -146,7 +149,9 @@ class KindergartenSource:
                 license_name="PUBLIC_DATA_PORTAL_TERMS",
                 attribution="Ministry of Education Kindergarten Info",
                 fetched_at=utc_now(),
-                source_as_of=_timing_as_date(self._timing),
+                source_as_of=source_as_of,
+                source_observation_date_counts=counts,
+                normalized_observation_date_counts=counts,
                 raw_sha256=hashlib.sha256(b"".join(pages)).hexdigest(),
                 page_count=len(pages),
                 row_count=len(records),

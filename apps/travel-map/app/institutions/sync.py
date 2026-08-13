@@ -30,10 +30,15 @@ from app.institutions.snapshot import (
 )
 from app.institutions.sources.common import (
     EnrichmentProvenance,
+    SourceDataError,
     SourceInstitutionRecord,
     SourceInstitutionSiteRecord,
     SourceProvenance,
     normalized_records_sha256,
+    observation_counts_as_dict,
+    observation_date_counts,
+    source_as_of_for,
+    validate_observation_date_counts,
 )
 from app.institutions.sources.sen_counts import ReviewedSchoolCounts
 from app.institutions.sources.standard_school import (
@@ -268,9 +273,16 @@ def reconcile_selectable_school_counts(
         actual_source_as_of = sorted(
             {record.source_as_of for record in matching_records}
         )
+        actual_source_observation_date_counts = dict(
+            sorted(
+                Counter(
+                    record.source_as_of for record in matching_records
+                ).items()
+            )
+        )
         source_validation_passed = (
             actual_sources == [expected_source]
-            and len(actual_source_as_of) == 1
+            and bool(actual_source_as_of)
         )
         evidence = benchmark.category_evidence[institution_type]
         categories[institution_type] = {
@@ -282,6 +294,9 @@ def reconcile_selectable_school_counts(
             "expectedSource": expected_source,
             "actualSources": actual_sources,
             "actualSourceAsOf": actual_source_as_of,
+            "actualSourceObservationDateCounts": (
+                actual_source_observation_date_counts
+            ),
             "sourceValidationPassed": source_validation_passed,
             "sourceUrl": evidence.source_url,
             "sourceAsOf": evidence.source_as_of,
@@ -471,13 +486,6 @@ def build_candidate_snapshot(
     issues: list[str] = []
     for record in records:
         _validate_source_record(record)
-    source_dates: dict[str, set[str]] = defaultdict(set)
-    for record in records:
-        source_dates[record.source].add(record.source_as_of)
-    if any(len(dates) != 1 for dates in source_dates.values()):
-        raise SnapshotQualityError(
-            "each source must have one exact source_as_of"
-        )
     if source_provenance is None:
         raise SnapshotQualityError("source provenance is required")
     expected_sources = {record.source for record in records}
@@ -545,9 +553,13 @@ def build_candidate_snapshot(
                 attribution=prior.attribution,
                 fetched_at=prior.fetched_at,
                 source_as_of=prior.source_as_of,
+                source_observation_date_counts=tuple(
+                    prior.source_observation_date_counts.items()
+                ),
+                normalized_observation_date_counts=(),
                 raw_sha256=prior.raw_sha256,
                 page_count=prior.page_count,
-                row_count=prior.normalized_row_count,
+                row_count=0,
                 fetched_row_count=prior.fetched_row_count,
                 request_region_code=prior.request_region_code,
                 request_timing=prior.request_timing,
@@ -609,6 +621,11 @@ def build_candidate_snapshot(
     snapshot_as_of = max(
         (
             [item.source_as_of for item in institutions]
+            + [
+                source_date
+                for item in effective_source_provenance.values()
+                for source_date, _ in item.source_observation_date_counts
+            ]
             + [
                 item.source_as_of
                 for item in effective_enrichment_provenance.values()
@@ -1080,7 +1097,6 @@ def _validate_source_provenance(
     provenance: SourceProvenance,
     records: list[SourceInstitutionRecord],
 ) -> None:
-    source_dates = {record.source_as_of for record in records}
     fetched_row_count = provenance.fetched_row_count
     checked_fetched_row_count = (
         fetched_row_count if type(fetched_row_count) is int else -1
@@ -1089,13 +1105,39 @@ def _validate_source_provenance(
     expected_normalized_hash = normalized_records_sha256(
         [_record_before_enrichment(record) for record in records]
     )
+    try:
+        validate_observation_date_counts(
+            provenance.source_observation_date_counts,
+            expected_total=checked_fetched_row_count,
+            label="raw observation",
+        )
+        validate_observation_date_counts(
+            provenance.normalized_observation_date_counts,
+            expected_total=len(records),
+            label="normalized observation",
+        )
+        normalized_counts = observation_date_counts(
+            record.source_as_of for record in records
+        )
+    except SourceDataError as exc:
+        raise SnapshotQualityError(
+            "source provenance observation dates are invalid"
+        ) from exc
+    if normalized_counts != provenance.normalized_observation_date_counts:
+        raise SnapshotQualityError(
+            "source provenance observation dates do not match normalized rows"
+        )
+    if provenance.source_as_of != source_as_of_for(
+        provenance.source_observation_date_counts
+    ):
+        raise SnapshotQualityError(
+            "source provenance source_as_of is not canonical"
+        )
     if (
         provenance.endpoint != _SOURCE_ENDPOINTS[source_name]
         or provenance.license_name != _SOURCE_LICENSES[source_name]
         or provenance.attribution != _SOURCE_ATTRIBUTIONS[source_name]
         or provenance.request_region_code != _EXPECTED_REGION_CODES[source_name]
-        or provenance.source_as_of not in source_dates
-        or len(source_dates) != 1
         or not _source_pagination_is_valid(
             source_name,
             provenance.page_count,
@@ -1139,10 +1181,15 @@ def _validate_source_provenance(
             if provenance.fetched_at.endswith("Z")
             else provenance.fetched_at
         )
-        source_date = datetime.fromisoformat(provenance.source_as_of)
+        source_dates = tuple(
+            datetime.fromisoformat(source_date)
+            for source_date, _ in provenance.source_observation_date_counts
+        )
     except ValueError as exc:
         raise SnapshotQualityError("source provenance dates are invalid") from exc
-    if fetched_at.tzinfo is None or source_date.date() > fetched_at.date():
+    if fetched_at.tzinfo is None or any(
+        source_date.date() > fetched_at.date() for source_date in source_dates
+    ):
         raise SnapshotQualityError("source provenance chronology is invalid")
 
 
@@ -1423,9 +1470,6 @@ def _preserve_missing_records(
 ) -> tuple[list[Institution], list[InstitutionSite]]:
     current_ids = {item.institution_id for item in institutions}
     current_site_ids = {item.site_id for item in sites}
-    source_dates = {
-        item.source: item.source_as_of for item in institutions
-    }
     for old in previous.institutions:
         if old.institution_id in current_ids:
             sites.extend(
@@ -1437,14 +1481,12 @@ def _preserve_missing_records(
                 and old_site.site_id not in current_site_ids
             )
             continue
-        source_as_of = source_dates.get(old.source, old.source_as_of)
         institutions.append(
             old.model_copy(
                 update={
                     "status": InstitutionStatus.MISSING_FROM_SOURCE,
                     "status_source": "MISSING_FROM_SOURCE_GATE",
                     "last_seen_snapshot": snapshot_id,
-                    "source_as_of": source_as_of,
                 }
             )
         )
@@ -1481,12 +1523,8 @@ def _candidate_manifest(
     sites_by_parent: dict[str, list[InstitutionSite]] = defaultdict(list)
     for site in sites:
         sites_by_parent[site.institution_id].append(site)
-    current_by_source: dict[str, list[SourceInstitutionRecord]] = defaultdict(list)
-    for record in source_records:
-        current_by_source[record.source].append(record)
     sources = []
     for source_name, source_rows in sorted(by_source.items()):
-        source_as_of = max(row.source_as_of for row in source_rows)
         if source_provenance is None or source_name not in source_provenance:
             raise SnapshotQualityError(
                 "source provenance is required for every output source"
@@ -1494,6 +1532,26 @@ def _candidate_manifest(
         provenance = source_provenance[source_name]
         if provenance.fetched_row_count is None:
             raise SnapshotQualityError("source fetched row count is required")
+        current_rows = [
+            row
+            for row in source_rows
+            if row.status is not InstitutionStatus.MISSING_FROM_SOURCE
+        ]
+        preserved_rows = [
+            row
+            for row in source_rows
+            if row.status is InstitutionStatus.MISSING_FROM_SOURCE
+        ]
+        normalized_counts = observation_date_counts(
+            row.source_as_of for row in current_rows
+        )
+        preserved_counts = observation_date_counts(
+            row.source_as_of for row in preserved_rows
+        )
+        if normalized_counts != provenance.normalized_observation_date_counts:
+            raise SnapshotQualityError(
+                "source provenance observation dates do not match output rows"
+            )
         sources.append(
             {
                 "source": source_name,
@@ -1501,7 +1559,18 @@ def _candidate_manifest(
                 "licenseName": provenance.license_name,
                 "attribution": provenance.attribution,
                 "fetchedAt": provenance.fetched_at,
-                "sourceAsOf": source_as_of,
+                "sourceAsOf": source_as_of_for(
+                    provenance.source_observation_date_counts
+                ),
+                "sourceObservationDateCounts": observation_counts_as_dict(
+                    provenance.source_observation_date_counts
+                ),
+                "normalizedObservationDateCounts": observation_counts_as_dict(
+                    normalized_counts
+                ),
+                "preservedObservationDateCounts": observation_counts_as_dict(
+                    preserved_counts
+                ),
                 "rawSha256": provenance.raw_sha256,
                 "sourceNormalizedSha256": provenance.normalized_sha256,
                 "normalizedSha256": (
@@ -1514,10 +1583,8 @@ def _candidate_manifest(
                 "requestTiming": provenance.request_timing,
                 "pageCount": provenance.page_count,
                 "fetchedRowCount": provenance.fetched_row_count,
-                "normalizedRowCount": len(current_by_source[source_name]),
-                "preservedRowCount": (
-                    len(source_rows) - len(current_by_source[source_name])
-                ),
+                "normalizedRowCount": len(current_rows),
+                "preservedRowCount": len(preserved_rows),
                 "rowCount": len(source_rows),
             }
         )
@@ -2176,8 +2243,63 @@ def _recheck_source_provenance(
             if row.status is not InstitutionStatus.MISSING_FROM_SOURCE
         ]
         preserved_count = len(rows) - current_count
-        source_dates = {row.source_as_of for row in rows}
         timing = entry.get("requestTiming")
+        raw_counts_value = entry.get("sourceObservationDateCounts")
+        normalized_counts_value = entry.get("normalizedObservationDateCounts")
+        preserved_counts_value = entry.get("preservedObservationDateCounts")
+        if (
+            type(raw_counts_value) is not dict
+            or type(normalized_counts_value) is not dict
+            or type(preserved_counts_value) is not dict
+        ):
+            raise SnapshotQualityError(
+                "candidate source observation date counts are invalid"
+            )
+        raw_counts = tuple(raw_counts_value.items())
+        normalized_counts = tuple(normalized_counts_value.items())
+        preserved_counts = tuple(preserved_counts_value.items())
+        fetched_row_count_value = entry.get("fetchedRowCount")
+        checked_fetched_row_count = (
+            fetched_row_count_value
+            if type(fetched_row_count_value) is int
+            else -1
+        )
+        try:
+            validate_observation_date_counts(
+                raw_counts,
+                expected_total=checked_fetched_row_count,
+                label="candidate raw observation",
+            )
+            validate_observation_date_counts(
+                normalized_counts,
+                expected_total=current_count,
+                label="candidate normalized observation",
+            )
+            validate_observation_date_counts(
+                preserved_counts,
+                expected_total=preserved_count,
+                label="candidate preserved observation",
+            )
+            actual_normalized_counts = observation_date_counts(
+                row.source_as_of for row in current_rows
+            )
+            actual_preserved_counts = observation_date_counts(
+                row.source_as_of
+                for row in rows
+                if row.status is InstitutionStatus.MISSING_FROM_SOURCE
+            )
+        except SourceDataError as exc:
+            raise SnapshotQualityError(
+                "candidate source observation date counts are invalid"
+            ) from exc
+        if (
+            normalized_counts != actual_normalized_counts
+            or preserved_counts != actual_preserved_counts
+            or entry.get("sourceAsOf") != source_as_of_for(raw_counts)
+        ):
+            raise SnapshotQualityError(
+                "candidate source observation dates do not match persisted rows"
+            )
         source_normalized_matches = current_count == 0 or (
             entry.get("sourceNormalizedSha256")
             == _normalized_persisted_source_sha256(
@@ -2191,8 +2313,6 @@ def _recheck_source_provenance(
             or entry.get("licenseName") != _SOURCE_LICENSES[source]
             or entry.get("attribution") != _SOURCE_ATTRIBUTIONS[source]
             or entry.get("requestRegionCode") != _EXPECTED_REGION_CODES[source]
-            or entry.get("sourceAsOf") not in source_dates
-            or len(source_dates) != 1
             or not _source_pagination_is_valid(
                 source,
                 entry.get("pageCount"),

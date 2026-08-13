@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import traceback
+from collections import Counter
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -32,6 +33,8 @@ from app.institutions.sources.common import (
     SourceProvenance,
     get_json_with_retry,
     normalized_records_sha256,
+    observation_date_counts,
+    source_as_of_for,
 )
 from app.institutions.sources.kindergarten import (
     KindergartenSource,
@@ -196,19 +199,17 @@ def test_neis_explicitly_excludes_nonselectable_joint_training_center() -> None:
     assert parse_neis_rows(payload) == ()
 
 
-# Production break caught: collapsing two raw vintages on one API page to the later
-# date and presenting the page as one coherent source snapshot.
-def test_neis_rejects_multiple_raw_load_dates_within_one_page() -> None:
+# Production break caught: collapsing two raw vintages on one API page to one date.
+def test_neis_preserves_mixed_load_dates_within_one_page() -> None:
     payload = load_json("neis-school-info.json")
     rows = payload["schoolInfo"][1]["row"]  # type: ignore[index]
-    rows[0]["LOAD_DTM"] = "20260809"
-    rows[1]["LOAD_DTM"] = "20260810"
+    rows[0]["LOAD_DTM"] = "20260423"
+    rows[1]["LOAD_DTM"] = "20260607"
 
-    with pytest.raises(
-        SourceDataError,
-        match="^NEIS page contains multiple raw LOAD_DTM dates$",
-    ):
-        parse_neis_rows(payload)
+    assert [row.source_as_of for row in parse_neis_rows(payload)] == [
+        "2026-04-23",
+        "2026-06-07",
+    ]
 
 
 # Production break caught: treating a filtered-out row as if its vintage cannot
@@ -841,6 +842,84 @@ def test_school_reconciliation_rejects_actual_source_contamination() -> None:
     assert audit["passed"] is False
 
 
+# Production break caught: treating a valid mixed-vintage NEIS population as
+# contaminated merely because its raw rows were loaded on multiple dates.
+def test_school_reconciliation_allows_multi_vintage_neis_but_requires_neis_only() -> None:
+    records = mixed_neis_records()
+    benchmark = reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 4})
+
+    audit = reconcile_selectable_school_counts(records, benchmark=benchmark)
+    category = audit["categories"]["ELEMENTARY_SCHOOL"]
+
+    assert category["actualSourceAsOf"] == [
+        "2026-04-23",
+        "2026-05-17",
+        "2026-06-07",
+    ]
+    assert category["actualSourceObservationDateCounts"] == {
+        "2026-04-23": 2,
+        "2026-05-17": 1,
+        "2026-06-07": 1,
+    }
+    assert category["sourceValidationPassed"] is True
+
+
+# Production break caught: collapsing a production-shaped mixed NEIS candidate's
+# row dates or publishing a source entry that omits their measured distribution.
+def test_mixed_vintage_neis_candidate_keeps_row_dates_and_manifest_histogram(
+    tmp_path: Path,
+) -> None:
+    dates = (
+        ["2026-04-23"] * 1_413
+        + ["2026-05-17"]
+        + ["2026-06-07"]
+    )
+    records = tuple(
+        replace(
+            source_record(institution_id=f"neis:B10:{7010000 + index}"),
+            source_as_of=source_date,
+        )
+        for index, source_date in enumerate(dates)
+    )
+    provenance = replace(
+        source_provenance_for(records)["NEIS"],
+        page_count=2,
+    )
+
+    candidate = build_test_candidate(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="mixed-vintage-neis",
+        source_provenance={"NEIS": provenance},
+    )
+    manifest = json.loads(
+        (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
+    )
+    neis = next(item for item in manifest["sources"] if item["source"] == "NEIS")
+
+    assert neis["sourceAsOf"] is None
+    assert neis["sourceObservationDateCounts"] == {
+        "2026-04-23": 1_413,
+        "2026-05-17": 1,
+        "2026-06-07": 1,
+    }
+    assert (
+        neis["normalizedObservationDateCounts"]
+        == neis["sourceObservationDateCounts"]
+    )
+    assert neis["preservedObservationDateCounts"] == {}
+    persisted_dates = Counter(
+        json.loads(line)["sourceAsOf"]
+        for line in (candidate.candidate_path / "institutions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    assert persisted_dates == Counter(
+        {"2026-04-23": 1_413, "2026-05-17": 1, "2026-06-07": 1}
+    )
+
+
 def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -896,7 +975,9 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
         license_name="PUBLIC_DATA_PORTAL_TERMS",
         attribution="Ministry of Education Kindergarten Info",
         fetched_at="2026-08-10T09:00:00Z",
-        source_as_of="2026-03-10",
+        source_as_of=None,
+        source_observation_date_counts=(),
+        normalized_observation_date_counts=(),
         raw_sha256="b" * 64,
         page_count=25,
         row_count=0,
@@ -1258,6 +1339,8 @@ async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
         excluded = dict(first)
         excluded["SD_SCHUL_CODE"] = "7010999"
         excluded["SCHUL_KND_SC_NM"] = "\uacf5\ub3d9\uc2e4\uc2b5\uc18c"
+        first["LOAD_DTM"] = "20260423"
+        excluded["LOAD_DTM"] = "20260607"
         sections[0]["head"][0]["list_total_count"] = 2
         sections[1]["row"] = [first, excluded]
         return httpx.Response(200, json=payload)
@@ -1275,34 +1358,53 @@ async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
     assert result.provenance.page_count == 1
     assert result.provenance.fetched_row_count == 2
     assert result.provenance.row_count == 1
+    assert result.provenance.source_as_of is None
+    assert result.provenance.source_observation_date_counts == (
+        ("2026-04-23", 1),
+        ("2026-06-07", 1),
+    )
+    assert result.provenance.normalized_observation_date_counts == (
+        ("2026-04-23", 1),
+    )
 
 
 @pytest.mark.asyncio
-async def test_neis_source_rejects_mixed_load_dates_across_pages() -> None:
+async def test_neis_fetch_records_raw_and_normalized_mixed_vintage_histograms() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         page = int(request.url.params["pIndex"])
-        payload = neis_payload(source_type="\ucd08\ub4f1\ud559\uad50")
+        payload = load_json("neis-school-info.json")
         sections = payload["schoolInfo"]
         assert type(sections) is list
-        sections[0]["head"][0]["list_total_count"] = 2
-        row = sections[1]["row"][0]
-        row["SD_SCHUL_CODE"] = f"701000{page}"
-        row["LOAD_DTM"] = "20260809" if page == 1 else "20260810"
+        sections[0]["head"][0]["list_total_count"] = 4
+        rows = sections[1]["row"]
+        for index, row in enumerate(rows):
+            row["SD_SCHUL_CODE"] = f"70100{page}{index}"
+        rows[0]["LOAD_DTM"] = "20260423"
+        rows[1]["LOAD_DTM"] = "20260517" if page == 1 else "20260607"
         return httpx.Response(200, json=payload)
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler)
     ) as client:
-        source = NeisSource(api_key="test-key", client=client, page_size=1)
-        with pytest.raises(
-            SourceDataError,
-            match="^NEIS source contains multiple raw LOAD_DTM dates across pages$",
-        ):
-            await source.fetch()
+        result = await NeisSource(
+            api_key="test-key", client=client, page_size=2
+        ).fetch()
+
+    assert result.provenance.source_as_of is None
+    assert result.provenance.source_observation_date_counts == (
+        ("2026-04-23", 2),
+        ("2026-05-17", 1),
+        ("2026-06-07", 1),
+    )
+    assert result.provenance.normalized_observation_date_counts == (
+        ("2026-04-23", 2),
+        ("2026-05-17", 1),
+        ("2026-06-07", 1),
+    )
 
 
 @pytest.mark.asyncio
-async def test_neis_source_rejects_different_date_on_excluded_only_page() -> None:
+async def test_neis_source_preserves_different_date_on_excluded_only_page() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         page = int(request.url.params["pIndex"])
         payload = neis_payload(
@@ -1318,12 +1420,18 @@ async def test_neis_source_rejects_different_date_on_excluded_only_page() -> Non
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler)
     ) as client:
-        source = NeisSource(api_key="test-key", client=client, page_size=1)
-        with pytest.raises(
-            SourceDataError,
-            match="^NEIS source contains multiple raw LOAD_DTM dates across pages$",
-        ):
-            await source.fetch()
+        result = await NeisSource(
+            api_key="test-key", client=client, page_size=1
+        ).fetch()
+
+    assert result.provenance.source_as_of is None
+    assert result.provenance.source_observation_date_counts == (
+        ("2026-08-09", 1),
+        ("2026-08-10", 1),
+    )
+    assert result.provenance.normalized_observation_date_counts == (
+        ("2026-08-10", 1),
+    )
 
 
 @pytest.mark.asyncio
@@ -1888,7 +1996,9 @@ def test_manifest_persists_cross_source_possible_match_pairs(
     )
 
 
-def test_candidate_rejects_mixed_source_dates_before_writing(tmp_path: Path) -> None:
+def test_candidate_rejects_mixed_row_dates_with_single_date_provenance_before_writing(
+    tmp_path: Path,
+) -> None:
     first = source_record(institution_id="neis:B10:7010001")
     second = SourceInstitutionRecord(
         **{
@@ -1897,13 +2007,21 @@ def test_candidate_rejects_mixed_source_dates_before_writing(tmp_path: Path) -> 
         }
     )
 
-    with pytest.raises(SnapshotQualityError, match="source_as_of"):
+    provenance = replace(
+        source_provenance_for((first, second))["NEIS"],
+        source_as_of="2026-08-10",
+        source_observation_date_counts=(("2026-08-10", 2),),
+        normalized_observation_date_counts=(("2026-08-10", 2),),
+    )
+
+    with pytest.raises(SnapshotQualityError, match="observation dates"):
         build_test_candidate(
             records=(first, second),
             previous=None,
             output_root=tmp_path,
             snapshot_id="mixed-source-dates",
             coverage=TEST_COVERAGE,
+            source_provenance={"NEIS": provenance},
         )
     assert not (tmp_path / ".mixed-source-dates.candidate").exists()
 
@@ -2501,6 +2619,129 @@ def test_promotion_recounts_candidate_manifest_before_pointer_change(
     assert not (tmp_path / "current.json").exists()
 
 
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        (
+            "sourceObservationDateCounts",
+            {"2026-04-23": 3, "2026-05-17": 1, "2026-06-07": 1},
+        ),
+        (
+            "normalizedObservationDateCounts",
+            {"2026-04-23": 1, "2026-05-17": 1, "2026-06-07": 1},
+        ),
+        ("preservedObservationDateCounts", {"2026-04-23": 1}),
+    ],
+)
+def test_promotion_rejects_tampered_observation_date_count_before_pointer_change(
+    tmp_path: Path,
+    field_name: str,
+    value: dict[str, int],
+) -> None:
+    baseline = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="histogram-baseline",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    records = mixed_neis_records()
+    candidate = build_test_candidate(
+        records=records,
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id=f"tampered-{field_name}",
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sources"][0][field_name] = value
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SnapshotQualityError):
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+
+
+# Production break caught: accepting a persisted row date that differs from the
+# signed normalized histogram during the final promotion recheck.
+def test_promotion_rejects_tampered_observation_date_before_pointer_change(
+    tmp_path: Path,
+) -> None:
+    baseline = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="date-baseline",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    candidate = build_test_candidate(
+        records=mixed_neis_records(),
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="tampered-row-date",
+    )
+    institutions_path = candidate.candidate_path / "institutions.jsonl"
+    lines = institutions_path.read_text(encoding="utf-8").splitlines()
+    first = json.loads(lines[0])
+    first["sourceAsOf"] = "2026-04-24"
+    lines[0] = json.dumps(first, ensure_ascii=False, separators=(",", ":"))
+    institution_bytes = ("\n".join(lines) + "\n").encode("utf-8")
+    institutions_path.write_bytes(institution_bytes)
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["institutionsSha256"] = hashlib.sha256(institution_bytes).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SnapshotQualityError, match="observation dates"):
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+
+
+# Production break caught: accepting equivalent histogram keys in a noncanonical
+# order after raw JSON tampering.
+def test_promotion_rejects_unsorted_observation_date_keys_before_pointer_change(
+    tmp_path: Path,
+) -> None:
+    baseline = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="order-baseline",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    candidate = build_test_candidate(
+        records=mixed_neis_records(),
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="tampered-key-order",
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    canonical = (
+        '"sourceObservationDateCounts":{"2026-04-23":2,'
+        '"2026-05-17":1,"2026-06-07":1}'
+    )
+    unsorted = (
+        '"sourceObservationDateCounts":{"2026-06-07":1,'
+        '"2026-04-23":2,"2026-05-17":1}'
+    )
+    assert canonical in manifest_text
+    manifest_path.write_text(
+        manifest_text.replace(canonical, unsorted, 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SnapshotQualityError):
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+
+
 def test_promotion_binds_source_digest_to_persisted_site_content(
     tmp_path: Path,
 ) -> None:
@@ -2859,6 +3100,8 @@ def test_manifest_replays_live_source_provenance(tmp_path: Path) -> None:
         attribution="Ministry of Education NEIS education data",
         fetched_at="2026-08-10T09:00:00Z",
         source_as_of="2026-08-10",
+        source_observation_date_counts=(("2026-08-10", 2),),
+        normalized_observation_date_counts=(("2026-08-10", 1),),
         raw_sha256="b" * 64,
         page_count=2,
         row_count=1,
@@ -2988,6 +3231,17 @@ def test_candidate_rejects_untrusted_standard_enrichment(
         ("fetched_row_count", 0),
         ("row_count", 2),
         ("source_as_of", "2026-08-09"),
+        ("source_observation_date_counts", ()),
+        ("source_observation_date_counts", (("2026-08-10", 0),)),
+        (
+            "source_observation_date_counts",
+            (("2026-08-10", 1), ("2026-08-09", 1)),
+        ),
+        (
+            "source_observation_date_counts",
+            (("2026-08-10", 1), ("2026-08-10", 1)),
+        ),
+        ("normalized_observation_date_counts", (("2026-08-09", 1),)),
         ("normalized_sha256", "b" * 64),
         ("raw_sha256", "not-a-sha256"),
     ],
@@ -3559,7 +3813,24 @@ def source_provenance_for(
             license_name=licenses[source],
             attribution=attributions[source],
             fetched_at="2026-08-10T09:00:00Z",
-            source_as_of=max(record.source_as_of for record in source_records),
+            source_as_of=source_as_of_for(
+                observation_date_counts(
+                    record.source_as_of for record in source_records
+                )
+            ),
+            source_observation_date_counts=(
+                (
+                    source_records[0].source_as_of,
+                    len(source_records) + 1,
+                ),
+            )
+            if source == "SEN_REVIEWED_CSV"
+            else observation_date_counts(
+                record.source_as_of for record in source_records
+            ),
+            normalized_observation_date_counts=observation_date_counts(
+                record.source_as_of for record in source_records
+            ),
             raw_sha256=(
                 "69863ac78689fb4b6e9941aabea03c3c1d618ccb26568e844079afd9092eb2c2"
                 if source == "SEN_REVIEWED_CSV"
@@ -3726,4 +3997,15 @@ def source_record(
         source_region_code="B10",
         source_as_of="2026-08-10",
         coordinate_quality="MANUALLY_VERIFIED",
+    )
+
+
+def mixed_neis_records() -> tuple[SourceInstitutionRecord, ...]:
+    dates = ("2026-04-23", "2026-04-23", "2026-05-17", "2026-06-07")
+    return tuple(
+        replace(
+            source_record(institution_id=f"neis:B10:{7010001 + index}"),
+            source_as_of=source_date,
+        )
+        for index, source_date in enumerate(dates)
     )

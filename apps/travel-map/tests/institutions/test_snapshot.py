@@ -295,7 +295,7 @@ def test_snapshot_recomputes_source_row_counts(tmp_path: Path) -> None:
             "normalizedRowCount must not exceed fetchedRowCount",
         ),
         (
-            {"normalizedRowCount": 9},
+            {"normalizedRowCount": 8},
             r"normalizedRowCount \+ preservedRowCount must equal rowCount",
         ),
     ],
@@ -311,6 +311,107 @@ def test_snapshot_rejects_impossible_source_count_relations(
     write_manifest(fixture, manifest)
 
     with pytest.raises(SnapshotIntegrityError, match=message):
+        verify_snapshot(fixture)
+
+
+# Production break caught: accepting noncanonical raw observation histograms that
+# cannot be bound exactly to the fetched source rows.
+@pytest.mark.parametrize(
+    ("counts", "match"),
+    [
+        ({"2026-08-01": 0}, "positive"),
+        ({"2026-08-01": 9}, "fetchedRowCount"),
+    ],
+)
+def test_snapshot_rejects_invalid_source_observation_date_counts(
+    tmp_path: Path,
+    counts: dict[str, int],
+    match: str,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    source = manifest["sources"][0]
+    source["sourceObservationDateCounts"] = counts
+    source["normalizedObservationDateCounts"] = {"2026-08-01": 9}
+    source["preservedObservationDateCounts"] = {"2026-08-01": 1}
+    write_manifest(fixture, manifest)
+
+    with pytest.raises(SnapshotIntegrityError, match=match):
+        verify_snapshot(fixture)
+
+
+# Production break caught: accepting an ordered-map histogram whose raw JSON key
+# order is noncanonical even though the date/count pairs are otherwise valid.
+def test_snapshot_rejects_unsorted_source_observation_date_count_keys(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    source = manifest["sources"][0]
+    source["sourceAsOf"] = None
+    source["sourceObservationDateCounts"] = {
+        "2026-07-31": 1,
+        "2026-08-01": 9,
+    }
+    write_manifest(fixture, manifest)
+    manifest_path = fixture / "fixture-001" / "manifest.json"
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    canonical = (
+        '"sourceObservationDateCounts":{"2026-07-31":1,"2026-08-01":9}'
+    )
+    unsorted = (
+        '"sourceObservationDateCounts":{"2026-08-01":9,"2026-07-31":1}'
+    )
+    assert canonical in manifest_text
+    manifest_path.write_text(
+        manifest_text.replace(canonical, unsorted, 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SnapshotIntegrityError, match="sorted"):
+        verify_snapshot(fixture)
+
+
+# Production break caught: keeping a single sourceAsOf label for a mixed raw fetch.
+def test_snapshot_rejects_mixed_dates_with_non_null_source_as_of(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    source = manifest["sources"][0]
+    source["sourceObservationDateCounts"] = {
+        "2026-07-31": 1,
+        "2026-08-01": 9,
+    }
+    source["normalizedObservationDateCounts"] = {"2026-08-01": 10}
+    source["preservedObservationDateCounts"] = {}
+    write_manifest(fixture, manifest)
+
+    with pytest.raises(SnapshotIntegrityError, match="sourceAsOf"):
+        verify_snapshot(fixture)
+
+
+# Production break caught: trusting a declared normalized histogram after the
+# persisted institution row dates have changed.
+def test_snapshot_rejects_row_dates_that_do_not_match_normalized_histogram(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    source = manifest["sources"][0]
+    source["sourceObservationDateCounts"] = {"2026-08-01": 10}
+    source["normalizedObservationDateCounts"] = {"2026-08-01": 9}
+    source["preservedObservationDateCounts"] = {"2026-08-01": 1}
+    write_manifest(fixture, manifest)
+    change_jsonl_record(
+        fixture,
+        "institutions.jsonl",
+        record_index=0,
+        field_name="sourceAsOf",
+        value="2026-07-31",
+    )
+
+    with pytest.raises(SnapshotIntegrityError, match="observation date counts"):
         verify_snapshot(fixture)
 
 
@@ -685,11 +786,36 @@ def test_snapshot_rejects_source_as_of_after_fetch(tmp_path: Path) -> None:
     fixture = copy_fixture_snapshot(tmp_path)
     manifest = read_manifest(fixture)
     manifest["sources"][0]["sourceAsOf"] = "2026-08-02"
+    manifest["sources"][0]["sourceObservationDateCounts"] = {"2026-08-02": 10}
+    manifest["sources"][0]["normalizedObservationDateCounts"] = {"2026-08-02": 9}
+    manifest["sources"][0]["preservedObservationDateCounts"] = {"2026-08-02": 1}
     write_manifest(fixture, manifest)
 
     with pytest.raises(
         SnapshotIntegrityError,
         match="sourceAsOf must not be later than fetchedAt date",
+    ):
+        verify_snapshot(fixture)
+
+
+# Production break caught: bypassing fetch chronology by setting sourceAsOf to
+# null while one raw mixed-vintage histogram key is later than fetchedAt.
+def test_snapshot_rejects_mixed_source_observation_date_after_fetch(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    source = manifest["sources"][0]
+    source["sourceAsOf"] = None
+    source["sourceObservationDateCounts"] = {
+        "2026-08-01": 9,
+        "2026-08-02": 1,
+    }
+    write_manifest(fixture, manifest)
+
+    with pytest.raises(
+        SnapshotIntegrityError,
+        match="observation dates must not be later than fetchedAt date",
     ):
         verify_snapshot(fixture)
 
@@ -739,6 +865,29 @@ def test_snapshot_rejects_source_as_of_after_manifest_snapshot_as_of(
         verify_snapshot(fixture)
 
 
+# Production break caught: bypassing snapshot chronology with null sourceAsOf
+# even though mixed observation histograms are later than snapshotAsOf.
+def test_snapshot_rejects_mixed_observation_date_after_snapshot_as_of(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    manifest["snapshotAsOf"] = "2026-07-31"
+    source = manifest["sources"][0]
+    source["sourceAsOf"] = None
+    source["sourceObservationDateCounts"] = {
+        "2026-07-31": 1,
+        "2026-08-01": 9,
+    }
+    write_manifest(fixture, manifest)
+
+    with pytest.raises(
+        SnapshotIntegrityError,
+        match="observation date must not be later than manifest snapshotAsOf",
+    ):
+        verify_snapshot(fixture)
+
+
 # Production break caught: mixing institution rows from a different source vintage
 # while preserving the same source name and row count.
 def test_snapshot_requires_institution_and_manifest_source_as_of_match(
@@ -755,7 +904,7 @@ def test_snapshot_requires_institution_and_manifest_source_as_of_match(
 
     with pytest.raises(
         SnapshotIntegrityError,
-        match="sourceAsOf does not match manifest source TEST_NEIS",
+        match="normalized observation date counts",
     ):
         verify_snapshot(fixture)
 
