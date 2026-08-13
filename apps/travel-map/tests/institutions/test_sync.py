@@ -95,7 +95,10 @@ def assert_secret_absent_from_app_traceback(
     current = traceback_value
     while current is not None:
         frame = current.tb_frame
-        if "/apps/travel-map/app/" in frame.f_code.co_filename:
+        if (
+            "apps/travel-map/app/" in frame.f_code.co_filename
+            or "apps/travel-map/scripts/" in frame.f_code.co_filename
+        ):
             assert not _contains_secret(frame.f_locals, secret)
         current = current.tb_next
 
@@ -4366,12 +4369,20 @@ def test_review_and_approval_clis_redact_rejected_argument_values(
         "approve-institution-snapshot.py",
     ),
 )
-def test_snapshot_admin_cli_parse_errors_do_not_retain_rejected_values_in_app_frames(
+@pytest.mark.parametrize(
+    "rejected_arguments",
+    (
+        ("--env-file", "rejected-unknown-option-secret-must-not-appear"),
+        ("rejected-positional-secret-must-not-appear",),
+    ),
+)
+def test_snapshot_admin_cli_parse_errors_do_not_retain_rejected_values_in_app_or_script_frames(
     script_name: str,
+    rejected_arguments: tuple[str, ...],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    secret = "rejected-argument-secret-must-not-appear"
+    secret = rejected_arguments[-1]
     required_arguments = ["--snapshot-id", "redacted-argument-check"]
     if script_name.startswith("approve-"):
         required_arguments.extend(
@@ -4388,8 +4399,7 @@ def test_snapshot_admin_cli_parse_errors_do_not_retain_rejected_values_in_app_fr
         [
             f"apps/travel-map/scripts/{script_name}",
             *required_arguments,
-            "--env-file",
-            secret,
+            *rejected_arguments,
         ],
     )
 
