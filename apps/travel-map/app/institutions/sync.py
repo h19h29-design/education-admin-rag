@@ -11,7 +11,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import TypeGuard, TypeVar, cast
 
 from pydantic import BaseModel, ValidationError
 
@@ -245,6 +245,46 @@ class SnapshotBuildResult:
 
 _POPULATION_SOURCES = frozenset({"NEIS", "KINDERGARTEN_INFO"})
 _POPULATION_MISMATCH = "source population profile does not match fetched data"
+_SCHOOL_COUNT_CATEGORIES = frozenset(
+    {
+        "ELEMENTARY_SCHOOL",
+        "HIGH_SCHOOL",
+        "KINDERGARTEN",
+        "MIDDLE_SCHOOL",
+        "MISC_SCHOOL",
+        "SPECIAL_SCHOOL",
+    }
+)
+_RECONCILIATION_FIELDS = frozenset(
+    {
+        "profileStatus",
+        "profileSha256",
+        "benchmarkSha256",
+        "sources",
+        "categories",
+        "passed",
+    }
+)
+_CATEGORY_RECONCILIATION_FIELDS = frozenset(
+    {"expectedCount", "actualCount", "deltaCount", "status"}
+)
+_CATEGORY_RECONCILIATION_STATUSES = frozenset(
+    {"MATCHED", "REVIEWED_VARIANCE", "SOURCE_DRIFT"}
+)
+_SYNC_PREFLIGHT_AUDIT_FIELDS = frozenset(
+    {
+        "auditStage",
+        "passed",
+        "sourceCounts",
+        "typeCounts",
+        "foundationCounts",
+        "districtCounts",
+        "statusCounts",
+        "quarantinedInstitutionIds",
+        "quarantinedSiteIds",
+        "reconciliation",
+    }
+)
 
 
 def _is_exact_population_counts(
@@ -443,68 +483,13 @@ def reconcile_selectable_school_counts(
             )
         sources[source] = {"roleCounts": role_counts}
 
-    profile_rows = {
-        (row.source, row.source_category): row
-        for row in population_profile.rows
-    }
-    normalized_category_counts: Counter[tuple[str, str]] = Counter()
-    for record in records:
-        if record.source == "NEIS":
-            if record.source_kind_label is None:
-                raise SnapshotQualityError(
-                    "normalized school category does not match reviewed profile"
-                )
-            row = profile_rows.get((record.source, record.source_kind_label))
-            if row is None or row.normalized_type != record.institution_type:
-                raise SnapshotQualityError(
-                    "normalized school category does not match reviewed profile"
-                )
-            normalized_category_counts[(record.source, record.source_kind_label)] += 1
-        elif record.source == "KINDERGARTEN_INFO":
-            if (
-                record.institution_type != "KINDERGARTEN"
-                or record.source_kind_label is not None
-                or record.source_as_of
-                != population_profile.kindergarten_source_as_of
-            ):
-                raise SnapshotQualityError(
-                    "kindergarten population does not match reviewed profile"
-                )
-            normalized_category_counts[(record.source, "KINDERGARTEN_TOTAL")] += 1
-        else:
-            raise SnapshotQualityError(
-                "school population contains an unrelated source"
-            )
-    for row in population_profile.rows:
-        expected = 0 if row.reconciliation_role == "NONSELECTABLE" else row.observed_count
-        if normalized_category_counts[(row.source, row.source_category)] != expected:
-            raise SnapshotQualityError(
-                "normalized school population does not match reviewed profile"
-            )
-    if (
-        dict(
-            sorted(
-                Counter(
-                    record.source_kind_label
-                    for record in records
-                    if record.source == "NEIS"
-                    and record.institution_type == "UNCLASSIFIED_SCHOOL"
-                    and record.source_kind_label is not None
-                ).items()
-            )
-        )
-        != dict(unclassified_policy.counts)
-    ):
-        raise SnapshotQualityError(
-            "school population quarantine does not match reviewed profile"
-        )
-
     if (
         not benchmark.counts
         or any(
             type(expected) is not int or expected <= 0
             for expected in benchmark.counts.values()
         )
+        or set(benchmark.counts) != _SCHOOL_COUNT_CATEGORIES
         or set(benchmark.counts)
         != set(dict(population_profile.approved_variances))
         or set(benchmark.counts) != set(benchmark.category_evidence)
@@ -519,6 +504,54 @@ def reconcile_selectable_school_counts(
         raise SnapshotQualityError(
             "school count benchmark does not match reviewed profile"
         )
+
+    profile_rows = {
+        (row.source, row.source_category): row
+        for row in population_profile.rows
+    }
+    normalized_category_counts: Counter[tuple[str, str]] = Counter()
+    source_drift = False
+    for record in records:
+        if record.source == "NEIS":
+            if record.source_kind_label is None:
+                source_drift = True
+                continue
+            row = profile_rows.get((record.source, record.source_kind_label))
+            if row is None or row.normalized_type != record.institution_type:
+                source_drift = True
+                continue
+            normalized_category_counts[(record.source, record.source_kind_label)] += 1
+        elif record.source == "KINDERGARTEN_INFO":
+            if (
+                record.institution_type != "KINDERGARTEN"
+                or record.source_kind_label is not None
+                or record.source_as_of
+                != population_profile.kindergarten_source_as_of
+            ):
+                source_drift = True
+                continue
+            normalized_category_counts[(record.source, "KINDERGARTEN_TOTAL")] += 1
+        else:
+            source_drift = True
+    for row in population_profile.rows:
+        expected = 0 if row.reconciliation_role == "NONSELECTABLE" else row.observed_count
+        if normalized_category_counts[(row.source, row.source_category)] != expected:
+            source_drift = True
+    if (
+        dict(
+            sorted(
+                Counter(
+                    record.source_kind_label
+                    for record in records
+                    if record.source == "NEIS"
+                    and record.institution_type == "UNCLASSIFIED_SCHOOL"
+                    and record.source_kind_label is not None
+                ).items()
+            )
+        )
+        != dict(unclassified_policy.counts)
+    ):
+        source_drift = True
     actual_counts: Counter[str] = Counter()
     for row in population_profile.rows:
         if row.reconciliation_role == "BENCHMARK" and row.benchmark_type is not None:
@@ -536,7 +569,11 @@ def reconcile_selectable_school_counts(
             "expectedCount": expected_count,
             "actualCount": actual_count,
             "deltaCount": delta,
-            "status": "MATCHED" if delta == 0 else "REVIEWED_VARIANCE",
+            "status": (
+                "SOURCE_DRIFT"
+                if source_drift
+                else "MATCHED" if delta == 0 else "REVIEWED_VARIANCE"
+            ),
         }
     return {
         "profileStatus": population_profile.status,
@@ -544,7 +581,7 @@ def reconcile_selectable_school_counts(
         "benchmarkSha256": benchmark.normalized_sha256,
         "sources": sources,
         "categories": categories,
-        "passed": True,
+        "passed": not source_drift,
     }
 
 
@@ -607,11 +644,175 @@ def build_sync_preflight_audit(
 
 
 def emit_sync_preflight_audit(audit: Mapping[str, object]) -> None:
+    if not _is_safe_sync_preflight_audit(audit):
+        raise SnapshotQualityError("sync preflight audit is invalid")
     print(json.dumps(dict(audit), ensure_ascii=False, sort_keys=True), flush=True)
     if audit.get("passed") is not True:
         raise SnapshotQualityError(
             "official school count reconciliation failed"
         )
+
+
+def _is_exact_string_int_mapping(
+    value: object,
+    *,
+    allowed_keys: frozenset[str] | None = None,
+) -> TypeGuard[dict[str, int]]:
+    return (
+        type(value) is dict
+        and (allowed_keys is None or set(value).issubset(allowed_keys))
+        and all(
+            type(key) is str
+            and type(count) is int
+            and count >= 0
+            for key, count in value.items()
+        )
+    )
+
+
+def _has_exact_fields(
+    value: object,
+    fields: frozenset[str],
+) -> TypeGuard[dict[str, object]]:
+    return (
+        type(value) is dict
+        and all(type(key) is str for key in value)
+        and set(value) == fields
+    )
+
+
+def _is_safe_reconciliation(
+    value: object,
+) -> TypeGuard[dict[str, object]]:
+    if not _has_exact_fields(value, _RECONCILIATION_FIELDS):
+        return False
+    if (
+        type(value["profileStatus"]) is not str
+        or value["profileStatus"] != "TEMPORARY_PRELIMINARY_VARIANCE"
+        or type(value["profileSha256"]) is not str
+        or _SHA256.fullmatch(value["profileSha256"]) is None
+        or type(value["benchmarkSha256"]) is not str
+        or _SHA256.fullmatch(value["benchmarkSha256"]) is None
+        or type(value["passed"]) is not bool
+    ):
+        return False
+    sources = value["sources"]
+    if not _has_exact_fields(sources, _POPULATION_SOURCES):
+        return False
+    expected_role_keys = {
+        "KINDERGARTEN_INFO": frozenset({"BENCHMARK"}),
+        "NEIS": frozenset(
+            {"BENCHMARK", "NONSELECTABLE", "QUARANTINED", "SUPPLEMENTARY"}
+        ),
+    }
+    for source, role_keys in expected_role_keys.items():
+        source_item = sources[source]
+        if not _has_exact_fields(source_item, frozenset({"roleCounts"})):
+            return False
+        role_counts = source_item["roleCounts"]
+        if not _is_exact_string_int_mapping(
+            role_counts,
+            allowed_keys=role_keys,
+        ) or set(role_counts) != role_keys:
+            return False
+    categories = value["categories"]
+    if not _has_exact_fields(categories, _SCHOOL_COUNT_CATEGORIES):
+        return False
+    validated_categories: list[dict[str, object]] = []
+    for raw_category in categories.values():
+        category = raw_category
+        if (
+            not _has_exact_fields(category, _CATEGORY_RECONCILIATION_FIELDS)
+            or type(category["expectedCount"]) is not int
+            or category["expectedCount"] <= 0
+            or type(category["actualCount"]) is not int
+            or category["actualCount"] < 0
+            or type(category["deltaCount"]) is not int
+            or category["deltaCount"]
+            != category["actualCount"] - category["expectedCount"]
+            or type(category["status"]) is not str
+            or category["status"] not in _CATEGORY_RECONCILIATION_STATUSES
+        ):
+            return False
+        validated_categories.append(category)
+    statuses = {category["status"] for category in validated_categories}
+    return (
+        (value["passed"] is False and statuses == {"SOURCE_DRIFT"})
+        or (
+            value["passed"] is True
+            and "SOURCE_DRIFT" not in statuses
+            and all(
+                (category["deltaCount"] == 0) == (category["status"] == "MATCHED")
+                for category in validated_categories
+            )
+        )
+    )
+
+
+def _is_safe_sync_preflight_audit(audit: Mapping[str, object]) -> bool:
+    if not _has_exact_fields(audit, _SYNC_PREFLIGHT_AUDIT_FIELDS):
+        return False
+    reconciliation = audit["reconciliation"]
+    if not _is_safe_reconciliation(reconciliation):
+        return False
+    allowed_types = frozenset().union(*_ALLOWED_TYPES_BY_SOURCE.values())
+    if (
+        type(audit["auditStage"]) is not str
+        or audit["auditStage"] != "PRE_PROMOTION_RECONCILIATION"
+        or type(audit["passed"]) is not bool
+        or audit["passed"] is not reconciliation["passed"]
+        or not _is_exact_string_int_mapping(
+            audit["typeCounts"],
+            allowed_keys=allowed_types,
+        )
+        or not _is_exact_string_int_mapping(
+            audit["foundationCounts"],
+            allowed_keys=frozenset(_ALLOWED_FOUNDATION_TYPES),
+        )
+    ):
+        return False
+    district_counts = audit["districtCounts"]
+    if not _is_exact_string_int_mapping(
+        district_counts,
+        allowed_keys=frozenset(_SEOUL_DISTRICTS),
+    ) or set(district_counts) != set(_SEOUL_DISTRICTS):
+        return False
+    status_counts = audit["statusCounts"]
+    expected_statuses = frozenset(
+        {
+            "PRECHECK_READY_INSTITUTION",
+            "PRECHECK_REVIEW_REQUIRED_INSTITUTION",
+        }
+    )
+    if not _is_exact_string_int_mapping(
+        status_counts,
+        allowed_keys=expected_statuses,
+    ) or set(status_counts) != expected_statuses:
+        return False
+    source_counts = audit["sourceCounts"]
+    if (
+        type(source_counts) is not dict
+        or any(type(source) is not str for source in source_counts)
+        or not set(source_counts).issubset(_EXPECTED_REGION_CODES)
+    ):
+        return False
+    for counts in source_counts.values():
+        if (
+            not _has_exact_fields(
+                counts,
+                frozenset({"fetched", "normalized", "preserved", "output"}),
+            )
+            or any(type(count) is not int or count < 0 for count in counts.values())
+        ):
+            return False
+    return all(
+        type(identifiers) is list
+        and all(type(identifier) is str for identifier in identifiers)
+        for identifiers in (
+            audit["quarantinedInstitutionIds"],
+            audit["quarantinedSiteIds"],
+        )
+    )
 
 
 async def geocode_missing_records(

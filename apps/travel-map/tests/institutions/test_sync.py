@@ -1539,7 +1539,6 @@ def test_supplementary_population_remains_in_records_but_outside_benchmark() -> 
 @pytest.mark.parametrize(
     "mutation",
     [
-        "record_label_type",
         "missing_profile_hash",
         "wrong_profile_hash",
         "approved_delta_sign",
@@ -1555,18 +1554,7 @@ def test_signed_variance_reconciliation_rejects_reviewed_contract_drift(
         provenance, profile=profile
     )
     policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
-    if mutation == "record_label_type":
-        index = next(
-            index
-            for index, record in enumerate(records)
-            if record.source_kind_label == "초등학교"
-        )
-        mutable_records = list(records)
-        mutable_records[index] = replace(
-            mutable_records[index], institution_type="MIDDLE_SCHOOL"
-        )
-        records = tuple(mutable_records)
-    elif mutation in {"missing_profile_hash", "wrong_profile_hash"}:
+    if mutation in {"missing_profile_hash", "wrong_profile_hash"}:
         bound["NEIS"] = replace(
             bound["NEIS"],
             source_population_profile_sha256=(
@@ -1612,6 +1600,39 @@ def test_signed_variance_reconciliation_rejects_reviewed_contract_drift(
     finally:
         if mutation == "policy_profile":
             object.__setattr__(policy, "sha256", PINNED_POLICY_SHA256)
+
+
+# Production break caught: normalized source drift raising before the CLI can
+# emit its required fail-first aggregate reconciliation audit.
+def test_population_reconciliation_represents_record_drift_as_safe_failure() -> None:
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    records = drift_one_elementary_record(records)
+
+    reconciliation = reconcile_selectable_school_counts(
+        records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    assert reconciliation["passed"] is False
+    assert set(reconciliation["categories"]) == {
+        "ELEMENTARY_SCHOOL",
+        "HIGH_SCHOOL",
+        "KINDERGARTEN",
+        "MIDDLE_SCHOOL",
+        "MISC_SCHOOL",
+        "SPECIAL_SCHOOL",
+    }
+    assert all(
+        category["status"] == "SOURCE_DRIFT"
+        for category in reconciliation["categories"].values()
+    )
 
 
 # Production break caught: treating reviewed lifelong-school labels as selectable
@@ -2447,22 +2468,19 @@ def test_automatic_promotion_symbol_is_not_public(
 def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _, _, records, provenance = reviewed_population_fixture()
-    reconciliation = {
-        "profileStatus": "TEMPORARY_PRELIMINARY_VARIANCE",
-        "profileSha256": PINNED_POPULATION_PROFILE_SHA256,
-        "benchmarkSha256": "36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332",
-        "sources": {},
-        "categories": {
-            "ELEMENTARY_SCHOOL": {
-                "expectedCount": 609,
-                "actualCount": 609,
-                "deltaCount": 0,
-                "status": "REJECTED",
-            },
-        },
-        "passed": False,
-    }
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    provenance = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    records = drift_one_elementary_record(records)
+    reconciliation = reconcile_selectable_school_counts(
+        records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=provenance,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
     audit = build_sync_preflight_audit(
         records,
         source_provenance=provenance,
@@ -2481,7 +2499,12 @@ def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
     assert parsed["passed"] is False
     assert parsed["reconciliation"]["passed"] is False
     assert set(parsed["reconciliation"]["categories"]) == {
-        "ELEMENTARY_SCHOOL"
+        "ELEMENTARY_SCHOOL",
+        "HIGH_SCHOOL",
+        "KINDERGARTEN",
+        "MIDDLE_SCHOOL",
+        "MISC_SCHOOL",
+        "SPECIAL_SCHOOL",
     }
     assert parsed["sourceCounts"]["NEIS"]["normalized"] == 1_414
     assert len(parsed["districtCounts"]) == 25
@@ -2489,6 +2512,61 @@ def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
     assert "quarantinedInstitutionIds" in parsed
     assert "quarantinedSiteIds" in parsed
     assert output.err == ""
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["top_level", "source", "category", "status"],
+)
+def test_preflight_audit_boundary_rejects_unreviewed_shapes_without_echo(
+    mutation: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    provenance = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=provenance,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+    audit = build_sync_preflight_audit(
+        records,
+        source_provenance=provenance,
+        reconciliation=reconciliation,
+    )
+    if mutation == "top_level":
+        audit["SECRET_RAW_LABEL"] = True
+    elif mutation == "source":
+        reconciliation["sources"]["SECRET_RAW_LABEL"] = {  # type: ignore[index]
+            "roleCounts": {"BENCHMARK": 1}
+        }
+    elif mutation == "category":
+        reconciliation["categories"]["SECRET_RAW_LABEL"] = {  # type: ignore[index]
+            "expectedCount": 1,
+            "actualCount": 1,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        }
+    else:
+        reconciliation["categories"]["ELEMENTARY_SCHOOL"][  # type: ignore[index]
+            "status"
+        ] = "SECRET_RAW_LABEL"
+    audit["reconciliation"] = reconciliation
+
+    with pytest.raises(
+        SnapshotQualityError,
+        match="^sync preflight audit is invalid$",
+    ):
+        emit_sync_preflight_audit(audit)
+
+    output = capsys.readouterr()
+    assert "SECRET_RAW_LABEL" not in output.out
+    assert "SECRET_RAW_LABEL" not in output.err
 
 
 @pytest.mark.asyncio
@@ -2503,24 +2581,15 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    neis_records = records_for_type_counts({"ELEMENTARY_SCHOOL": 602})
-    neis_provenance = source_provenance_for(neis_records)["NEIS"]
-    empty_kindergarten_provenance = SourceProvenance(
-        source="KINDERGARTEN_INFO",
-        endpoint="https://e-childschoolinfo.moe.go.kr/api/notice/basicInfo2.do",
-        license_name="PUBLIC_DATA_PORTAL_TERMS",
-        attribution="Ministry of Education Kindergarten Info",
-        fetched_at="2026-08-10T09:00:00Z",
-        source_as_of=None,
-        source_observation_date_counts=(),
-        normalized_observation_date_counts=(),
-        raw_sha256="b" * 64,
-        page_count=25,
-        row_count=0,
-        fetched_row_count=0,
-        request_region_code="11",
-        request_timing="20261",
-        normalized_sha256=normalized_records_sha256(()),
+    _, _, records, provenance = reviewed_population_fixture()
+    drifted_records = drift_one_elementary_record(records)
+    neis_records = tuple(
+        record for record in drifted_records if record.source == "NEIS"
+    )
+    kindergarten_records = tuple(
+        record
+        for record in drifted_records
+        if record.source == "KINDERGARTEN_INFO"
     )
 
     class FakeAsyncClient:
@@ -2538,14 +2607,17 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
             pass
 
         async def fetch(self) -> SourceFetchResult:
-            return SourceFetchResult(neis_records, neis_provenance)
+            return SourceFetchResult(neis_records, provenance["NEIS"])
 
     class FakeKindergartenSource:
         def __init__(self, **_kwargs: object) -> None:
             pass
 
         async def fetch(self) -> SourceFetchResult:
-            return SourceFetchResult((), empty_kindergarten_provenance)
+            return SourceFetchResult(
+                kindergarten_records,
+                provenance["KINDERGARTEN_INFO"],
+            )
 
     class FakeStandardSource:
         def __init__(self, **_kwargs: object) -> None:
@@ -2561,26 +2633,15 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
         def __init__(self, **_kwargs: object) -> None:
             raise AssertionError("Kakao must not be created before reconciliation")
 
+    def forbidden_candidate(**_kwargs: object) -> None:
+        raise AssertionError("candidate must not be built before reconciliation")
+
     monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
     monkeypatch.setattr(module, "NeisSource", FakeNeisSource)
     monkeypatch.setattr(module, "KindergartenSource", FakeKindergartenSource)
     monkeypatch.setattr(module, "StandardSchoolLocationSource", FakeStandardSource)
     monkeypatch.setattr(module, "KakaoLocalClient", ForbiddenKakaoClient)
-    monkeypatch.setattr(
-        module,
-        "load_reviewed_school_counts",
-        lambda _path: reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 609}),
-    )
-    monkeypatch.setattr(
-        module,
-        "bind_school_count_population_profile",
-        lambda provenance, *, profile: provenance,
-    )
-    monkeypatch.setattr(
-        module,
-        "reconcile_selectable_school_counts",
-        lambda *_args, **_kwargs: {"passed": False},
-    )
+    monkeypatch.setattr(module, "build_candidate_snapshot", forbidden_candidate)
     snapshot_root = tmp_path / "snapshots"
     args = argparse.Namespace(
         sen_csv=SOURCE_RESOURCES / "sen-institutions.csv",
@@ -2612,9 +2673,22 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
             [],
         )
 
-    audit = json.loads(capsys.readouterr().out)
+    output = capsys.readouterr()
+    assert len(output.out.splitlines()) == 1
+    audit = json.loads(output.out)
+    assert audit["auditStage"] == "PRE_PROMOTION_RECONCILIATION"
     assert audit["reconciliation"]["passed"] is False
     assert audit["passed"] is False
+    assert set(audit["reconciliation"]["categories"]) == {
+        "ELEMENTARY_SCHOOL",
+        "HIGH_SCHOOL",
+        "KINDERGARTEN",
+        "MIDDLE_SCHOOL",
+        "MISC_SCHOOL",
+        "SPECIAL_SCHOOL",
+    }
+    assert "SECRET_RAW_LABEL" not in output.out
+    assert "SECRET_RAW_LABEL" not in output.err
     assert not snapshot_root.exists()
 
 
@@ -6503,6 +6577,19 @@ def reviewed_population_fixture() -> tuple[
         source_category_counts=(("KINDERGARTEN_TOTAL", 706),),
     )
     return profile, benchmark, record_tuple, provenance
+
+
+def drift_one_elementary_record(
+    records: tuple[SourceInstitutionRecord, ...],
+) -> tuple[SourceInstitutionRecord, ...]:
+    mutable = list(records)
+    index = next(
+        index
+        for index, record in enumerate(mutable)
+        if record.source_kind_label == "초등학교"
+    )
+    mutable[index] = replace(mutable[index], institution_type="MIDDLE_SCHOOL")
+    return tuple(mutable)
 
 
 def records_for_type_counts(
