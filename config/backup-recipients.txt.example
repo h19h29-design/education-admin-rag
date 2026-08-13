@@ -1,0 +1,3 @@
+# Copy this file outside the source tree and replace this comment with the
+# administrator-approved public age recipient. Never place an age identity or
+# minisign secret key in this repository, the NAS, or a release bundle.

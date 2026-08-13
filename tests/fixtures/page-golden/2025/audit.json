@@ -1,0 +1,181 @@
+{
+  "schema_version": "senqa-synthetic-page-layout/v2",
+  "doc_id": "synthetic-2025-audit",
+  "edition_year": 2025,
+  "extraction_source": "ocr",
+  "pages": [
+    {
+      "pdf_page_index": 50,
+      "page_label": "50",
+      "page_role_hint": "body",
+      "lines": [
+        {
+          "text": "편: 계약 일반",
+          "bbox": [
+            250,
+            60,
+            500,
+            85
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticHeading",
+          "size": 18
+        },
+        {
+          "text": "소주제: 합성 소주제",
+          "bbox": [
+            80,
+            95,
+            400,
+            115
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticSubtopic",
+          "size": 12
+        },
+        {
+          "text": "대분류 탭: 계약",
+          "bbox": [
+            570,
+            60,
+            592,
+            700
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticVertical",
+          "size": 9
+        },
+        {
+          "text": "카드 사례: 4",
+          "bbox": [
+            72,
+            150,
+            190,
+            178
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticNumberBox",
+          "size": 16
+        },
+        {
+          "text": "제목: 합성 감사 제목",
+          "bbox": [
+            195,
+            150,
+            525,
+            180
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticTitle",
+          "size": 16,
+          "semantic_hint": "title"
+        },
+        {
+          "text": "사례 유형: 감사",
+          "bbox": [
+            80,
+            210,
+            300,
+            232
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticBody",
+          "size": 11
+        },
+        {
+          "text": "상황: 합성 감사 상황입니다.",
+          "bbox": [
+            80,
+            245,
+            525,
+            270
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticBody",
+          "size": 11
+        },
+        {
+          "text": "대상: 합성 대상",
+          "bbox": [
+            80,
+            280,
+            525,
+            305
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticBody",
+          "size": 11
+        },
+        {
+          "text": "감사 사실: 합성 감사 사실입니다.",
+          "bbox": [
+            80,
+            315,
+            525,
+            343
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticBody",
+          "size": 11
+        },
+        {
+          "text": "답변: 합성 감사 답변입니다.",
+          "bbox": [
+            80,
+            355,
+            525,
+            390
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticBody",
+          "size": 11
+        },
+        {
+          "text": "근거: 합성 감사 근거입니다.",
+          "bbox": [
+            80,
+            405,
+            525,
+            435
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticBody",
+          "size": 11,
+          "semantic_hint": "law_name"
+        },
+        {
+          "text": "참고자료: 합성 감사 참고입니다.",
+          "bbox": [
+            80,
+            445,
+            525,
+            475
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticBody",
+          "size": 11
+        }
+      ],
+      "layout_evidence": {
+        "status": "detected",
+        "detector_version": "synthetic-card-v1",
+        "regions": [
+          {
+            "region_type": "card",
+            "bbox": [
+              60,
+              135,
+              540,
+              710
+            ],
+            "evidence": "raster-border"
+          }
+        ]
+      },
+      "layout_segment_provenance": {
+        "segment_id": "synthetic-2025-segment-a",
+        "sample_status": "sampling_required"
+      }
+    }
+  ]
+}

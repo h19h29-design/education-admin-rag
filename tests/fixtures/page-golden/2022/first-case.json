@@ -1,0 +1,111 @@
+{
+  "schema_version": "senqa-synthetic-page-layout/v2",
+  "doc_id": "synthetic-2022-first-case",
+  "edition_year": 2022,
+  "extraction_source": "native",
+  "pages": [
+    {
+      "pdf_page_index": 10,
+      "page_label": "10",
+      "page_role_hint": "body",
+      "lines": [
+        {
+          "text": "대분류: 계약",
+          "bbox": [
+            80,
+            60,
+            320,
+            80
+          ],
+          "confidence": 1,
+          "font": "SyntheticDomain",
+          "size": 12
+        },
+        {
+          "text": "편: 계약 일반",
+          "bbox": [
+            250,
+            85,
+            500,
+            110
+          ],
+          "confidence": 1,
+          "font": "SyntheticHeading",
+          "size": 18
+        },
+        {
+          "text": "소주제: 합성 소주제",
+          "bbox": [
+            80,
+            120,
+            400,
+            140
+          ],
+          "confidence": 1,
+          "font": "SyntheticSubtopic",
+          "size": 12
+        },
+        {
+          "text": "1",
+          "bbox": [
+            88,
+            158,
+            103,
+            178
+          ],
+          "confidence": 1,
+          "font": "",
+          "size": 16
+        },
+        {
+          "text": "합성 첫 제목",
+          "bbox": [
+            121,
+            151,
+            516,
+            178
+          ],
+          "confidence": 1,
+          "font": "",
+          "size": 11
+        },
+        {
+          "text": "질문1 합성 첫 질문?",
+          "bbox": [
+            121,
+            210,
+            525,
+            240
+          ],
+          "confidence": 1,
+          "font": "SyntheticBody",
+          "size": 11
+        },
+        {
+          "text": "답변1 합성 첫 답변입니다.",
+          "bbox": [
+            80,
+            255,
+            525,
+            290
+          ],
+          "confidence": 1,
+          "font": "SyntheticBody",
+          "size": 11
+        },
+        {
+          "text": "참고자료 합성 첫 참고입니다.",
+          "bbox": [
+            80,
+            305,
+            525,
+            340
+          ],
+          "confidence": 1,
+          "font": "SyntheticBody",
+          "size": 11
+        }
+      ]
+    }
+  ]
+}

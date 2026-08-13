@@ -1,0 +1,139 @@
+{
+  "cases": [
+    {
+      "case_no": "4",
+      "case_type": "audit",
+      "title": "합성 감사 제목",
+      "question": null,
+      "answer": "합성 감사 답변입니다.",
+      "facts": "합성 감사 사실입니다.",
+      "basis_text": "합성 감사 근거입니다.\n합성 감사 참고입니다.",
+      "target_text": "합성 대상",
+      "situation_text": "합성 감사 상황입니다.",
+      "source_spans": [
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            72,
+            150,
+            190,
+            178
+          ],
+          "text_sha256": "bb616cff6b9a58d472c9813820c5d6e3d3684861043fb4b3870ff6a65420fde3"
+        },
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            195,
+            150,
+            525,
+            180
+          ],
+          "text_sha256": "88945c635b2ae237ec411f0a45559c1805885169ed0502aba5fd17a91af9541e"
+        },
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            80,
+            210,
+            300,
+            232
+          ],
+          "text_sha256": "a7af1d0ede023352543e42dc35e93e169a46275fed79f0b6f1b0572abc8f5585"
+        },
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            80,
+            245,
+            525,
+            270
+          ],
+          "text_sha256": "2c5302ac46e6edff9838a3b8abcf05f46a12b6620ec922972e56d4dc854b8144"
+        },
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            80,
+            280,
+            525,
+            305
+          ],
+          "text_sha256": "3ce3ec5d08b47476c53e233c7fe02263b824383618e38830adcc6b2f7f5974d4"
+        },
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            80,
+            315,
+            525,
+            343
+          ],
+          "text_sha256": "217cde1391acbfbf875020f567dd6ef7c06d08a3770861d0221330e3bf59f73a"
+        },
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            80,
+            355,
+            525,
+            390
+          ],
+          "text_sha256": "ee4b257b0e96d2c7bd6fb74b5ce44910b818063f9f0ee758e45d0bcb86c1d3ed"
+        },
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            80,
+            405,
+            525,
+            435
+          ],
+          "text_sha256": "47439bf0fdc530e0850e378ea4a65e22b5b9d7ae5fd855494ff4084821350279"
+        },
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            80,
+            445,
+            525,
+            475
+          ],
+          "text_sha256": "0f871fbf3091ff32c9d9b245b34dcbd25d3cb6934f7b65cccb352ddcc6f70ec1"
+        }
+      ],
+      "review_status": "machine_extracted",
+      "critical_field_review": "sampling_required",
+      "layout_segment_id": "synthetic-2025-segment-a",
+      "search_eligible": false,
+      "answer_eligible": false
+    }
+  ],
+  "quarantines": [],
+  "transitions": [
+    {
+      "pdf_page_index": 50,
+      "role": "domain",
+      "value": "계약"
+    },
+    {
+      "pdf_page_index": 50,
+      "role": "part",
+      "value": "계약 일반"
+    },
+    {
+      "pdf_page_index": 50,
+      "role": "subtopic",
+      "value": "합성 소주제"
+    }
+  ]
+}

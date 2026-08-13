@@ -1,0 +1,61 @@
+{
+  "$comment": "Runtime canonical validation is required because JSON Schema cannot compare source_case_id and target_case_id to reject self-relations.",
+  "$id": "data/schemas/case-relation.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A reviewed relationship between two distinct canonical cases.",
+  "properties": {
+    "confidence": {
+      "maximum": 1,
+      "minimum": 0,
+      "title": "Confidence",
+      "type": "number"
+    },
+    "relation_id": {
+      "minLength": 1,
+      "title": "Relation Id",
+      "type": "string"
+    },
+    "relation_type": {
+      "enum": [
+        "related",
+        "duplicate",
+        "supersedes",
+        "conflicts"
+      ],
+      "title": "Relation Type",
+      "type": "string"
+    },
+    "review_status": {
+      "enum": [
+        "machine_extracted",
+        "needs_review",
+        "search_approved",
+        "approved",
+        "rejected"
+      ],
+      "title": "Review Status",
+      "type": "string"
+    },
+    "source_case_id": {
+      "minLength": 1,
+      "title": "Source Case Id",
+      "type": "string"
+    },
+    "target_case_id": {
+      "minLength": 1,
+      "title": "Target Case Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "relation_id",
+    "source_case_id",
+    "target_case_id",
+    "relation_type",
+    "confidence",
+    "review_status"
+  ],
+  "title": "CaseRelation",
+  "type": "object"
+}

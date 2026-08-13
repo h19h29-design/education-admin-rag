@@ -1,0 +1,439 @@
+{
+  "$defs": {
+    "SourceSpan": {
+      "$comment": "Runtime canonical validation is required because JSON Schema cannot compare bbox coordinates to enforce x0 < x1 and y0 < y1.",
+      "additionalProperties": false,
+      "description": "A locatable fragment in an original PDF page.",
+      "properties": {
+        "bbox": {
+          "maxItems": 4,
+          "minItems": 4,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Bbox",
+          "type": "array"
+        },
+        "page_label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Page Label"
+        },
+        "pdf_page_index": {
+          "minimum": 1,
+          "title": "Pdf Page Index",
+          "type": "integer"
+        },
+        "text_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Text Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pdf_page_index",
+        "bbox",
+        "text_sha256"
+      ],
+      "title": "SourceSpan",
+      "type": "object"
+    }
+  },
+  "$id": "data/schemas/case.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "case_type": {
+            "const": "credits"
+          }
+        },
+        "required": [
+          "case_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "answer_eligible": {
+            "const": false
+          },
+          "search_eligible": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "pii_class": {
+            "enum": [
+              "public_credit",
+              "restricted"
+            ]
+          }
+        },
+        "required": [
+          "pii_class"
+        ]
+      },
+      "then": {
+        "properties": {
+          "answer_eligible": {
+            "const": false
+          },
+          "search_eligible": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "case_type": {
+            "not": {
+              "const": "credits"
+            }
+          },
+          "pii_class": {
+            "enum": [
+              "none",
+              "anonymized_case",
+              "quasi_identifier"
+            ]
+          },
+          "review_status": {
+            "enum": [
+              "machine_extracted",
+              "needs_review",
+              "rejected"
+            ]
+          }
+        },
+        "required": [
+          "case_type",
+          "pii_class",
+          "review_status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "answer_eligible": {
+            "const": false
+          },
+          "search_eligible": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "case_type": {
+            "not": {
+              "const": "credits"
+            }
+          },
+          "pii_class": {
+            "enum": [
+              "none",
+              "anonymized_case",
+              "quasi_identifier"
+            ]
+          },
+          "review_status": {
+            "const": "search_approved"
+          }
+        },
+        "required": [
+          "case_type",
+          "pii_class",
+          "review_status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "answer_eligible": {
+            "const": false
+          },
+          "search_eligible": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "case_type": {
+            "not": {
+              "const": "credits"
+            }
+          },
+          "pii_class": {
+            "enum": [
+              "none",
+              "anonymized_case",
+              "quasi_identifier"
+            ]
+          },
+          "review_status": {
+            "const": "approved"
+          }
+        },
+        "required": [
+          "case_type",
+          "pii_class",
+          "review_status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "search_eligible": {
+            "const": true
+          }
+        }
+      }
+    }
+  ],
+  "description": "One independently citable question-answer, audit, law-index, or credits record.",
+  "properties": {
+    "anonymization_status": {
+      "minLength": 1,
+      "title": "Anonymization Status",
+      "type": "string"
+    },
+    "answer": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Answer"
+    },
+    "answer_eligible": {
+      "title": "Answer Eligible",
+      "type": "boolean"
+    },
+    "basis_text": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Basis Text"
+    },
+    "case_id": {
+      "minLength": 1,
+      "title": "Case Id",
+      "type": "string"
+    },
+    "case_no": {
+      "minLength": 1,
+      "title": "Case No",
+      "type": "string"
+    },
+    "case_type": {
+      "enum": [
+        "qa",
+        "audit",
+        "law_index",
+        "credits"
+      ],
+      "title": "Case Type",
+      "type": "string"
+    },
+    "critical_field_review": {
+      "minLength": 1,
+      "title": "Critical Field Review",
+      "type": "string"
+    },
+    "currency_status": {
+      "enum": [
+        "unverified",
+        "current",
+        "historical_reference",
+        "superseded"
+      ],
+      "title": "Currency Status",
+      "type": "string"
+    },
+    "doc_id": {
+      "minLength": 1,
+      "title": "Doc Id",
+      "type": "string"
+    },
+    "domain": {
+      "minLength": 1,
+      "title": "Domain",
+      "type": "string"
+    },
+    "extraction_confidence": {
+      "maximum": 1,
+      "minimum": 0,
+      "title": "Extraction Confidence",
+      "type": "number"
+    },
+    "extraction_source": {
+      "enum": [
+        "native",
+        "ocr"
+      ],
+      "title": "Extraction Source",
+      "type": "string"
+    },
+    "facts": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Facts"
+    },
+    "law_ref_ids": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Law Ref Ids",
+      "type": "array"
+    },
+    "legacy_ids": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Legacy Ids",
+      "type": "array"
+    },
+    "part": {
+      "minLength": 1,
+      "title": "Part",
+      "type": "string"
+    },
+    "pii_class": {
+      "enum": [
+        "none",
+        "anonymized_case",
+        "quasi_identifier",
+        "public_credit",
+        "restricted"
+      ],
+      "title": "Pii Class",
+      "type": "string"
+    },
+    "question": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Question"
+    },
+    "review_status": {
+      "enum": [
+        "machine_extracted",
+        "needs_review",
+        "search_approved",
+        "approved",
+        "rejected"
+      ],
+      "title": "Review Status",
+      "type": "string"
+    },
+    "search_eligible": {
+      "title": "Search Eligible",
+      "type": "boolean"
+    },
+    "source_spans": {
+      "items": {
+        "$ref": "#/$defs/SourceSpan"
+      },
+      "minItems": 1,
+      "title": "Source Spans",
+      "type": "array"
+    },
+    "subtopic": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Subtopic"
+    },
+    "title_normalized": {
+      "minLength": 1,
+      "title": "Title Normalized",
+      "type": "string"
+    },
+    "title_raw": {
+      "minLength": 1,
+      "title": "Title Raw",
+      "type": "string"
+    }
+  },
+  "required": [
+    "case_id",
+    "doc_id",
+    "case_type",
+    "domain",
+    "part",
+    "case_no",
+    "title_raw",
+    "title_normalized",
+    "source_spans",
+    "extraction_source",
+    "extraction_confidence",
+    "critical_field_review",
+    "pii_class",
+    "anonymization_status",
+    "currency_status",
+    "search_eligible",
+    "answer_eligible",
+    "review_status"
+  ],
+  "title": "Case",
+  "type": "object"
+}

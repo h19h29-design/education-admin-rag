@@ -1,0 +1,95 @@
+{
+  "cases": [
+    {
+      "case_no": "1",
+      "case_type": "qa",
+      "title": "합성 첫 제목",
+      "question": "합성 첫 질문?",
+      "answer": "합성 첫 답변입니다.",
+      "facts": null,
+      "basis_text": "합성 첫 참고입니다.",
+      "target_text": null,
+      "situation_text": null,
+      "source_spans": [
+        {
+          "pdf_page_index": 10,
+          "page_label": "10",
+          "bbox": [
+            121,
+            151,
+            516,
+            178
+          ],
+          "text_sha256": "ce04fd47ec2ef18e8798443c8928ad9a76dc1cd81f31bae375192b0f89562192"
+        },
+        {
+          "pdf_page_index": 10,
+          "page_label": "10",
+          "bbox": [
+            88,
+            158,
+            103,
+            178
+          ],
+          "text_sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
+        },
+        {
+          "pdf_page_index": 10,
+          "page_label": "10",
+          "bbox": [
+            121,
+            210,
+            525,
+            240
+          ],
+          "text_sha256": "e3a50bea67a8333ba56dfc5c1bae05f73a95ce260af01e9ab4943410a6dcb881"
+        },
+        {
+          "pdf_page_index": 10,
+          "page_label": "10",
+          "bbox": [
+            80,
+            255,
+            525,
+            290
+          ],
+          "text_sha256": "922c6b453782889a161d27da02d052e27a8c09c728634d1f394caab8ce4a87f9"
+        },
+        {
+          "pdf_page_index": 10,
+          "page_label": "10",
+          "bbox": [
+            80,
+            305,
+            525,
+            340
+          ],
+          "text_sha256": "74ffed8ead437239753cf757176bf419873bcb9ef170ce3668d4f1a30a0f93a2"
+        }
+      ],
+      "review_status": "machine_extracted",
+      "critical_field_review": "not_applicable",
+      "layout_segment_id": null,
+      "search_eligible": false,
+      "answer_eligible": false
+    }
+  ],
+  "quarantines": [],
+  "transitions": [
+    {
+      "pdf_page_index": 10,
+      "role": "domain",
+      "value": "계약"
+    },
+    {
+      "pdf_page_index": 10,
+      "role": "part",
+      "value": "계약 일반"
+    },
+    {
+      "pdf_page_index": 10,
+      "role": "subtopic",
+      "value": "합성 소주제"
+    }
+  ]
+}

@@ -90,7 +90,7 @@ Expected: 출력이 없고, 기존 작업 폴더의 미커밋 파일은 새 work
 
 - [ ] **Step 2: 테스트를 실행할 최소 의존성 환경만 먼저 고정한다.**
 
-`.python-version`, `pyproject.toml`, `docker/ingestion.Dockerfile`, `.gitignore`를 만든다. `pyproject.toml`에 `typer`, `pydantic`, `pymupdf`, `sentence-transformers`, `qdrant-client`를 기본 runtime dependency로 선언한다. `paddleocr`와 CPU용 `paddlepaddle`은 Linux/amd64 ingestion image에서만 설치하는 `ocr` optional dependency로 분리한다. `pytest`, `pytest-cov`, `ruff`, `mypy`, `jsonschema`는 dev dependency로 선언한다. `docker/ingestion.Dockerfile`은 digest로 고정한 Python 3.11 slim base와 `uv sync --frozen --extra ocr`를 사용한다.
+`.python-version`, `pyproject.toml`, `docker/ingestion.Dockerfile`, `.gitignore`를 만든다. `pyproject.toml`의 기본 runtime dependency에는 `typer`, `pydantic`, `pymupdf`만 선언한다. `paddleocr`와 CPU용 `paddlepaddle`은 Linux/amd64 ingestion image에서만 설치하는 `ocr` optional dependency로, `sentence-transformers`와 `qdrant-client`는 향후 indexer image에서만 설치하는 `index` optional dependency로 분리한다. `pytest`, `pytest-cov`, `ruff`, `mypy`, `jsonschema`는 dev dependency로 선언한다. `docker/ingestion.Dockerfile`은 digest로 고정한 Python 3.11 slim base와 `uv sync --frozen --extra ocr --no-dev`를 사용하며, indexer는 `uv sync --frozen --extra index --no-dev`를 사용한다.
 
 ```bash
 uv lock
@@ -184,7 +184,7 @@ git add .python-version pyproject.toml uv.lock .gitignore docker/ingestion.Docke
 git commit -m "build: scaffold corpus pipeline"
 ```
 
-## Task 1A: 기존 노출 키 차단과 history-aware secret gate
+## Task 2: 기존 노출 키 차단과 history-aware secret gate
 
 **Files:**
 
@@ -242,7 +242,7 @@ git add 교육행정_AI_Launcher.html tests/security/test_no_client_ai_secret.py
 git commit -m "security: disable exposed client AI integration"
 ```
 
-## Task 2: 원본 6권 manifest와 변경 탐지
+## Task 3: 원본 6권 manifest와 변경 탐지
 
 **Files:**
 
@@ -358,7 +358,7 @@ git add data/manifests/sen_qa_sources.json src/ingestion/manifest.py tests/inges
 git commit -m "feat: verify source document manifest"
 ```
 
-## Task 3: 정규 데이터 모델, 상태 불변식, 안정적 ID
+## Task 4: 정규 데이터 모델, 상태 불변식, 안정적 ID
 
 **Files:**
 
@@ -464,7 +464,7 @@ git add src/corpus/models.py src/corpus/ids.py data/schemas/document.schema.json
 git commit -m "feat: define canonical corpus contracts"
 ```
 
-## Task 4: 공통 page JSONL과 2020~2022 native 추출
+## Task 5: 공통 page JSONL과 2020~2022 native 추출
 
 **Files:**
 
@@ -534,7 +534,7 @@ git add src/ingestion/extract_common.py src/ingestion/extract_native.py tests/fi
 git commit -m "feat: extract native PDF pages with provenance"
 ```
 
-## Task 5: 2023~2025 전체 페이지 PaddleOCR 추출
+## Task 6: 2023~2025 전체 페이지 PaddleOCR 추출
 
 **Files:**
 
@@ -591,13 +591,29 @@ Expected: PaddlePaddle을 import하지 않는 fake adapter 테스트가 통과�
 ```bash
 docker version
 docker buildx version
-mkdir -p artifacts/build artifacts/ocr-smoke
+test "$(id -u)" -ne 0
+SEN_QA_BUILDER_SOURCE_ROOT=/volume1/education-admin/source
+test -d "$SEN_QA_BUILDER_SOURCE_ROOT"
+mkdir -p artifacts/build artifacts
+SEN_QA_OCR_SMOKE_DIR="$(mktemp -d "$PWD/artifacts/ocr-smoke.XXXXXX")"
+SEN_QA_RUNTIME_USER="$(id -u):$(id -g)"
 docker buildx build --platform linux/amd64 --load --network default -f docker/ingestion.Dockerfile -t education-admin-ingestion:corpus-v1 .
+test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' education-admin-ingestion:corpus-v1)" = "linux/amd64"
+SEN_QA_INGESTION_IMAGE_SIZE_BYTES="$(docker image inspect --format '{{.Size}}' education-admin-ingestion:corpus-v1)"
+test "$SEN_QA_INGESTION_IMAGE_SIZE_BYTES" -le 2500000000
 docker image inspect --format 'SEN_QA_INGESTION_IMAGE_DIGEST={{.Id}}' education-admin-ingestion:corpus-v1 > artifacts/build/ingestion.env
-docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g --env-file artifacts/build/ingestion.env -e SEN_QA_SOURCE_ROOT=/sources -v /volume1/education-admin/source:/sources:ro -v "$PWD/artifacts/ocr-smoke:/work/artifacts/ocr-smoke:rw" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli extract-ocr --year 2025 --pages 13 --output artifacts/ocr-smoke
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -c 'import cv2, paddle, paddleocr, paddlex, pymupdf, pydantic, typer; assert paddle.__version__ == "3.1.1", paddle.__version__; print("runtime-imports=ok")'
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -c 'import importlib.metadata as metadata, importlib.util as util; modules=("torch", "sentence_transformers", "transformers", "qdrant_client", "triton"); present=[name for name in modules if util.find_spec(name) is not None]; distributions={dist.metadata["Name"].lower() for dist in metadata.distributions() if dist.metadata["Name"]}; accelerator=sorted(name for name in distributions if name.startswith(("nvidia-", "cuda-"))); assert not present, present; assert not accelerator, accelerator; print("index-stack=absent")'
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli validate-ocr-models
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" --env-file artifacts/build/ingestion.env -e SEN_QA_SOURCE_ROOT=/sources --mount "type=bind,src=$SEN_QA_BUILDER_SOURCE_ROOT,dst=/sources,readonly" --mount "type=bind,src=$SEN_QA_OCR_SMOKE_DIR,dst=/work/artifacts/ocr-smoke" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli extract-ocr --year 2025 --pages 13 --output /work/artifacts/ocr-smoke
+sha256sum "$SEN_QA_OCR_SMOKE_DIR/sen-qa-2025.jsonl" > artifacts/build/ocr-smoke-run-1.sha256
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" --env-file artifacts/build/ingestion.env -e SEN_QA_SOURCE_ROOT=/sources --mount "type=bind,src=$SEN_QA_BUILDER_SOURCE_ROOT,dst=/sources,readonly" --mount "type=bind,src=$SEN_QA_OCR_SMOKE_DIR,dst=/work/artifacts/ocr-smoke" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli extract-ocr --year 2025 --pages 13 --output /work/artifacts/ocr-smoke
+sha256sum "$SEN_QA_OCR_SMOKE_DIR/sen-qa-2025.jsonl" > artifacts/build/ocr-smoke-run-2.sha256
+cmp artifacts/build/ocr-smoke-run-1.sha256 artifacts/build/ocr-smoke-run-2.sha256
+docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g,mode=1777 --user "$SEN_QA_RUNTIME_USER" education-admin-ingestion:corpus-v1 /opt/venv/bin/python -m src.cli validate-ocr-models
 ```
 
-`SEN_QA_INGESTION_IMAGE_DIGEST`에는 바로 앞에서 기록한 local content digest가 env file로 전달된다. Expected: Docker server architecture가 amd64이고, network가 차단된 container에서 page JSON에 bbox/confidence, `render_dpi=300`, source/render hash, image digest가 기록된다. Docker/buildx가 없으면 host 명령으로 우회하지 않고 Linux builder 준비 작업으로 차단한다.
+`SEN_QA_INGESTION_IMAGE_DIGEST`에는 바로 앞에서 기록한 local content digest가 env file로 전달된다. Build만 네트워크를 사용하며 runtime은 host 소유 출력 디렉터리와 같은 non-root UID/GID로 실행한다. Expected: Docker server와 final image가 linux/amd64이고 image size가 2,500,000,000 bytes 이하이며, OCR runtime module은 모두 import되고 `paddle.__version__`은 정확히 `3.1.1`이며, index/CUDA stack module과 `nvidia-*`/`cuda-*` distribution은 하나도 없다. network가 차단된 read-only container에서 locked-model 검증과 실제 page-13 CPU 예측이 성공한다. 두 실행의 JSONL hash가 같고 page JSON에는 PDF-point bbox/confidence, `render_dpi=300`, source/render hash, review flags, image digest가 기록된다. 두 실행 전후 locked-model 검증이 모두 통과해야 한다. Docker/buildx가 없으면 host 명령으로 우회하지 않고 Linux builder 준비 작업으로 차단한다.
 
 - [ ] **Step 8: 커밋한다.**
 
@@ -606,7 +622,7 @@ git add config/models.lock.json docker/ingestion.Dockerfile src/ingestion/extrac
 git commit -m "feat: extract OCR pages with locked models"
 ```
 
-## Task 6: 정규화, 개인정보 분류, 품질 게이트
+## Task 7: 정규화, 개인정보 분류, 품질 게이트
 
 **Files:**
 
@@ -707,7 +723,7 @@ git add src/ingestion/normalize.py src/ingestion/privacy.py src/ingestion/qualit
 git commit -m "feat: gate corpus quality and privacy"
 ```
 
-## Task 7: 연도별 사례 경계 파서와 페이지 연속성
+## Task 8: 연도별 사례 경계 파서와 페이지 연속성
 
 **Files:**
 
@@ -793,7 +809,7 @@ git add src/ingestion/parse_common.py src/ingestion/parse_2020.py src/ingestion/
 git commit -m "feat: parse yearly question answer layouts"
 ```
 
-## Task 8: canonical corpus, 법령·관계·역할 기반 청킹
+## Task 9: canonical corpus, 법령·관계·역할 기반 청킹
 
 **Files:**
 
@@ -838,7 +854,7 @@ uv run pytest tests/corpus/test_relations.py tests/corpus/test_chunking.py tests
 
 - [ ] **Step 3: chunk token counter가 사용할 `bge-m3` tokenizer를 lock한다.**
 
-network-enabled model-lock 단계에서 `BAAI/bge-m3`의 40자리 commit SHA와 tokenizer/model 파일 SHA-256을 `config/models.lock.json`에 기록한다. 이 단계에서는 image를 만들지 않고 lock과 검증된 staging cache만 생성하며, Task 10에서 같은 파일을 indexer image에 bake한다. `main`, `latest`, 빈 revision을 거부하며 unit test는 lock에 맞춘 작은 fake tokenizer를 사용한다. 실제 tokenizer cache가 lock과 다르면 corpus build 전 실패한다.
+network-enabled model-lock 단계에서 `BAAI/bge-m3`의 40자리 commit SHA와 tokenizer/model 파일 SHA-256을 `config/models.lock.json`에 기록한다. 이 단계에서는 image를 만들지 않고 lock과 검증된 staging cache만 생성하며, Task 11에서 같은 파일을 indexer image에 bake한다. `main`, `latest`, 빈 revision을 거부하며 unit test는 lock에 맞춘 작은 fake tokenizer를 사용한다. 실제 tokenizer cache가 lock과 다르면 corpus build 전 실패한다.
 
 - [ ] **Step 4: 역할 기반 chunker를 구현한다.**
 
@@ -864,7 +880,7 @@ git add config/models.lock.json src/corpus/relations.py src/corpus/chunking.py s
 git commit -m "feat: build reproducible canonical corpus"
 ```
 
-## Task 9: SQLite FTS5 한글 lexical 색인
+## Task 10: SQLite FTS5 한글 lexical 색인
 
 **Files:**
 
@@ -915,7 +931,7 @@ git add config/retrieval.toml src/retrieval/query.py src/retrieval/lexical.py te
 git commit -m "feat: add Korean lexical retrieval"
 ```
 
-## Task 10: 고정 `bge-m3` 임베딩과 Qdrant release collection
+## Task 11: 고정 `bge-m3` 임베딩과 Qdrant release collection
 
 **Files:**
 
@@ -948,12 +964,14 @@ def test_restricted_chunk_is_never_upserted(fake_qdrant, restricted_chunk) -> No
 - [ ] **Step 2: 실패를 확인한다.**
 
 ```bash
-uv run pytest tests/retrieval/test_dense.py -q
+uv run --extra index pytest tests/retrieval/test_dense.py -q
 ```
 
-- [ ] **Step 3: Task 8에서 고정한 `BAAI/bge-m3` cache를 offline 검증한다.**
+Expected: clean host environment에서도 `index` extra가 선택되어 `sentence-transformers`와 `qdrant-client`를 사용할 수 있다.
 
-`docker/indexer.Dockerfile`은 digest로 고정한 Python base에서 `config/models.lock.json`의 40자리 commit SHA만 내려받아 encoder/tokenizer를 image에 bake하고 파일별 SHA-256을 재검사한다. runtime은 `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `--network none`으로 시작하며 `main`, `latest`, 비어 있는 revision, cache miss를 모두 실패시킨다. tokenizer revision과 encoder revision이 다르면 dense build를 시작하지 않는다.
+- [ ] **Step 3: Task 9에서 고정한 `BAAI/bge-m3` cache를 offline 검증한다.**
+
+`docker/indexer.Dockerfile`은 digest로 고정한 Python base에서 `uv sync --frozen --extra index --no-dev`로 embedding/vector dependency를 설치하고, `config/models.lock.json`의 40자리 commit SHA만 내려받아 encoder/tokenizer를 image에 bake하고 파일별 SHA-256을 재검사한다. runtime은 `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `--network none`으로 시작하며 `main`, `latest`, 비어 있는 revision, cache miss를 모두 실패시킨다. tokenizer revision과 encoder revision이 다르면 dense build를 시작하지 않는다.
 
 - [ ] **Step 4: batch encoder와 Qdrant payload를 구현한다.**
 
@@ -975,13 +993,13 @@ Expected: Docker server가 사용 가능하다. `docker-compose.index.yml`의 Qd
 - [ ] **Step 7: indexer image offline smoke와 Qdrant integration을 실행한다.**
 
 ```bash
-uv run pytest tests/retrieval/test_dense.py -q
+uv run --extra index pytest tests/retrieval/test_dense.py -q
 mkdir -p artifacts/build
 docker buildx build --platform linux/amd64 --load --network default -f docker/indexer.Dockerfile -t education-admin-indexer:corpus-v1 .
 docker image inspect --format 'SEN_QA_INDEXER_IMAGE_DIGEST={{.Id}}' education-admin-indexer:corpus-v1 > artifacts/build/indexer.env
 docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=512m --env-file artifacts/build/indexer.env education-admin-indexer:corpus-v1 /opt/venv/bin/python -m src.cli dense-smoke --text "학교회계 제12조"
 docker compose -f docker-compose.index.yml up -d qdrant
-uv run pytest -m qdrant tests/retrieval/test_dense.py -q
+uv run --extra index pytest -m qdrant tests/retrieval/test_dense.py -q
 docker compose -f docker-compose.index.yml stop qdrant
 ```
 
@@ -994,7 +1012,7 @@ git add config/models.lock.json src/cli.py src/retrieval/dense.py tests/retrieva
 git commit -m "feat: build versioned dense index"
 ```
 
-## Task 11: Hybrid RRF 검색 계약과 근거 span 반환
+## Task 12: Hybrid RRF 검색 계약과 근거 span 반환
 
 **Files:**
 
@@ -1075,7 +1093,7 @@ git add src/retrieval/fusion.py src/retrieval/service.py data/schemas/search-res
 git commit -m "feat: expose grounded hybrid search contract"
 ```
 
-## Task 12: 200문항 골드셋과 수집·검색 평가
+## Task 13: 200문항 골드셋과 수집·검색 평가
 
 **Files:**
 
@@ -1138,7 +1156,7 @@ git add data/eval/retrieval-dev.jsonl data/eval/retrieval-blind.jsonl src/evalua
 git commit -m "test: add corpus and retrieval release gates"
 ```
 
-## Task 13: 레거시 매핑, release 전환, 백업·복구 자동화
+## Task 14: 레거시 매핑, release 전환, 백업·복구 자동화
 
 **Files:**
 
@@ -1248,7 +1266,7 @@ git add src/release.py src/corpus/legacy.py config/backup-recipients.txt config/
 git commit -m "feat: automate corpus release and recovery"
 ```
 
-## Task 14: PDF 6권 전체 수집, 사람 검수, NAS 성능 출시 게이트
+## Task 15: PDF 6권 전체 수집, 사람 검수, NAS 성능 출시 게이트
 
 **Files:**
 
@@ -1323,7 +1341,7 @@ set +a
 bash scripts/evaluate-release.sh
 ```
 
-Expected: 기존 substring 검색, lexical, dense, hybrid 네 방식을 같은 200문항으로 비교하고 hybrid가 Task 12의 전체·연도별·근거 span·무응답 기준을 모두 통과한다. 보고서는 2023, 2024, 2025 OCR 품질군을 따로 보여준다. 하나라도 미달하면 alias를 바꾸지 않는다.
+Expected: 기존 substring 검색, lexical, dense, hybrid 네 방식을 같은 200문항으로 비교하고 hybrid가 Task 13의 전체·연도별·근거 span·무응답 기준을 모두 통과한다. 보고서는 2023, 2024, 2025 OCR 품질군을 따로 보여준다. 하나라도 미달하면 alias를 바꾸지 않는다.
 
 - [ ] **Step 6: DS925+ warm 성능을 24GB RAM 환경에서 측정한다.**
 

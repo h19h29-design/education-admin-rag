@@ -1,0 +1,44 @@
+[project]
+name = "education-admin-rag"
+version = "0.1.0"
+description = "Offline PDF corpus and RAG foundation for education administration."
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "pydantic",
+    "pymupdf",
+    "typer",
+]
+
+[project.optional-dependencies]
+ocr = [
+    "paddleocr; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "paddlepaddle==3.1.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+index = [
+    "qdrant-client",
+    "sentence-transformers",
+]
+
+[dependency-groups]
+dev = [
+    "jsonschema",
+    "mypy",
+    "pyyaml",
+    "qdrant-client",
+    "pytest",
+    "pytest-cov",
+    "ruff",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.uv]
+package = false

@@ -1,0 +1,398 @@
+{
+  "$defs": {
+    "AppliedSearchFilters": {
+      "additionalProperties": false,
+      "properties": {
+        "access_level": {
+          "enum": [
+            "public",
+            "staff"
+          ],
+          "title": "Access Level",
+          "type": "string"
+        },
+        "case_types": {
+          "default": [],
+          "items": {
+            "enum": [
+              "qa",
+              "audit",
+              "law_index",
+              "credits"
+            ],
+            "type": "string"
+          },
+          "title": "Case Types",
+          "type": "array"
+        },
+        "domains": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Domains",
+          "type": "array"
+        },
+        "years": {
+          "default": [],
+          "items": {
+            "type": "integer"
+          },
+          "title": "Years",
+          "type": "array"
+        }
+      },
+      "required": [
+        "access_level"
+      ],
+      "title": "AppliedSearchFilters",
+      "type": "object"
+    },
+    "MatchedSpan": {
+      "additionalProperties": false,
+      "properties": {
+        "bbox": {
+          "maxItems": 4,
+          "minItems": 4,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Bbox",
+          "type": "array"
+        },
+        "chunk_id": {
+          "minLength": 1,
+          "title": "Chunk Id",
+          "type": "string"
+        },
+        "page_label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Page Label"
+        },
+        "pdf_page_index": {
+          "minimum": 1,
+          "title": "Pdf Page Index",
+          "type": "integer"
+        },
+        "source_span_index": {
+          "minimum": 0,
+          "title": "Source Span Index",
+          "type": "integer"
+        },
+        "text_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Text Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "chunk_id",
+        "source_span_index",
+        "pdf_page_index",
+        "bbox",
+        "text_sha256"
+      ],
+      "title": "MatchedSpan",
+      "type": "object"
+    },
+    "SearchLatency": {
+      "additionalProperties": false,
+      "properties": {
+        "dense_ms": {
+          "minimum": 0,
+          "title": "Dense Ms",
+          "type": "number"
+        },
+        "fusion_ms": {
+          "minimum": 0,
+          "title": "Fusion Ms",
+          "type": "number"
+        },
+        "lexical_ms": {
+          "minimum": 0,
+          "title": "Lexical Ms",
+          "type": "number"
+        },
+        "total_ms": {
+          "minimum": 0,
+          "title": "Total Ms",
+          "type": "number"
+        }
+      },
+      "required": [
+        "lexical_ms",
+        "dense_ms",
+        "fusion_ms",
+        "total_ms"
+      ],
+      "title": "SearchLatency",
+      "type": "object"
+    },
+    "SearchResult": {
+      "additionalProperties": false,
+      "properties": {
+        "answer_context_eligible": {
+          "title": "Answer Context Eligible",
+          "type": "boolean"
+        },
+        "answer_eligible": {
+          "title": "Answer Eligible",
+          "type": "boolean"
+        },
+        "case_id": {
+          "minLength": 1,
+          "title": "Case Id",
+          "type": "string"
+        },
+        "case_type": {
+          "enum": [
+            "qa",
+            "audit",
+            "law_index",
+            "credits"
+          ],
+          "title": "Case Type",
+          "type": "string"
+        },
+        "conflicts_case_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "title": "Conflicts Case Ids",
+          "type": "array"
+        },
+        "currency_status": {
+          "enum": [
+            "unverified",
+            "current",
+            "historical_reference",
+            "superseded"
+          ],
+          "title": "Currency Status",
+          "type": "string"
+        },
+        "doc_id": {
+          "minLength": 1,
+          "title": "Doc Id",
+          "type": "string"
+        },
+        "domain": {
+          "minLength": 1,
+          "title": "Domain",
+          "type": "string"
+        },
+        "edition_year": {
+          "maximum": 2100,
+          "minimum": 1900,
+          "title": "Edition Year",
+          "type": "integer"
+        },
+        "exact_boost": {
+          "title": "Exact Boost",
+          "type": "number"
+        },
+        "matched_spans": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MatchedSpan"
+          },
+          "maxItems": 256,
+          "title": "Matched Spans",
+          "type": "array"
+        },
+        "matched_terms": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "title": "Matched Terms",
+          "type": "array"
+        },
+        "part": {
+          "minLength": 1,
+          "title": "Part",
+          "type": "string"
+        },
+        "quality_warnings": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Quality Warnings",
+          "type": "array"
+        },
+        "question_summary": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Question Summary"
+        },
+        "reciprocal_rank_score": {
+          "title": "Reciprocal Rank Score",
+          "type": "number"
+        },
+        "related_case_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "title": "Related Case Ids",
+          "type": "array"
+        },
+        "review_status": {
+          "enum": [
+            "search_approved",
+            "approved"
+          ],
+          "title": "Review Status",
+          "type": "string"
+        },
+        "score": {
+          "title": "Score",
+          "type": "number"
+        },
+        "superseded_by_case_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "title": "Superseded By Case Ids",
+          "type": "array"
+        },
+        "supersedes_case_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "title": "Supersedes Case Ids",
+          "type": "array"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "case_id",
+        "doc_id",
+        "title",
+        "edition_year",
+        "domain",
+        "part",
+        "case_type",
+        "review_status",
+        "currency_status",
+        "answer_eligible",
+        "answer_context_eligible",
+        "score",
+        "reciprocal_rank_score",
+        "exact_boost"
+      ],
+      "title": "SearchResult",
+      "type": "object"
+    }
+  },
+  "$id": "data/schemas/search-result.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "corpus_version": {
+      "pattern": "^corpus-[0-9]{14}-[0-9a-f]{8}$",
+      "title": "Corpus Version",
+      "type": "string"
+    },
+    "embedding_version": {
+      "minLength": 1,
+      "title": "Embedding Version",
+      "type": "string"
+    },
+    "filters": {
+      "$ref": "#/$defs/AppliedSearchFilters"
+    },
+    "latency": {
+      "$ref": "#/$defs/SearchLatency"
+    },
+    "lexical_version": {
+      "minLength": 1,
+      "title": "Lexical Version",
+      "type": "string"
+    },
+    "no_answer_candidate": {
+      "title": "No Answer Candidate",
+      "type": "boolean"
+    },
+    "no_answer_reason_codes": {
+      "default": [],
+      "items": {
+        "enum": [
+          "no-results",
+          "low-fusion-score",
+          "missing-evidence",
+          "no-approved-answer"
+        ],
+        "type": "string"
+      },
+      "maxItems": 4,
+      "title": "No Answer Reason Codes",
+      "type": "array"
+    },
+    "normalized_query": {
+      "minLength": 1,
+      "title": "Normalized Query",
+      "type": "string"
+    },
+    "results": {
+      "items": {
+        "$ref": "#/$defs/SearchResult"
+      },
+      "maxItems": 8,
+      "title": "Results",
+      "type": "array"
+    }
+  },
+  "required": [
+    "normalized_query",
+    "filters",
+    "corpus_version",
+    "lexical_version",
+    "embedding_version",
+    "latency",
+    "no_answer_candidate",
+    "results"
+  ],
+  "title": "SearchResponse",
+  "type": "object"
+}

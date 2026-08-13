@@ -1,0 +1,32 @@
+{
+  "schema_version": "senqa-synthetic-page-layout/v2",
+  "doc_id": "synthetic-2024-credits",
+  "edition_year": 2024,
+  "extraction_source": "ocr",
+  "pages": [
+    {
+      "pdf_page_index": 324,
+      "page_label": null,
+      "page_role_hint": "credits",
+      "lines": [
+        {
+          "text": "합성 크레딧 페이지",
+          "bbox": [
+            80,
+            60,
+            520,
+            130
+          ],
+          "confidence": 0.96,
+          "font": "SyntheticBody",
+          "size": 11
+        }
+      ],
+      "layout_evidence": {
+        "status": "not_detected",
+        "detector_version": "synthetic-card-v1",
+        "regions": []
+      }
+    }
+  ]
+}

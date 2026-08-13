@@ -1,0 +1,106 @@
+{
+  "cases": [
+    {
+      "case_no": "4",
+      "case_type": "audit",
+      "title": "합성 감사 제목",
+      "question": null,
+      "answer": "합성 감사 답변입니다.",
+      "facts": "합성 감사 사실입니다.",
+      "basis_text": "합성 감사 근거입니다.",
+      "target_text": null,
+      "situation_text": null,
+      "source_spans": [
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            73,
+            150,
+            93,
+            180
+          ],
+          "text_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+        },
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            117,
+            150,
+            522,
+            185
+          ],
+          "text_sha256": "8b35a5a259e66e85bc766440862d4b36e59ed29b8c828f1576e598555c46f3e7"
+        },
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            80,
+            210,
+            300,
+            232
+          ],
+          "text_sha256": "a7af1d0ede023352543e42dc35e93e169a46275fed79f0b6f1b0572abc8f5585"
+        },
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            80,
+            245,
+            525,
+            273
+          ],
+          "text_sha256": "217cde1391acbfbf875020f567dd6ef7c06d08a3770861d0221330e3bf59f73a"
+        },
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            80,
+            285,
+            525,
+            320
+          ],
+          "text_sha256": "7d58379cdc5fef3898caa7c128c0431427c7b254f2cf06010c6f203a1d135fe3"
+        },
+        {
+          "pdf_page_index": 50,
+          "page_label": "50",
+          "bbox": [
+            80,
+            335,
+            525,
+            370
+          ],
+          "text_sha256": "35c8bef4afcad5f64edb445b5667c634b3c091b7531d913e48db6c4b1becb90d"
+        }
+      ],
+      "review_status": "machine_extracted",
+      "critical_field_review": "not_applicable",
+      "layout_segment_id": null,
+      "search_eligible": false,
+      "answer_eligible": false
+    }
+  ],
+  "quarantines": [],
+  "transitions": [
+    {
+      "pdf_page_index": 50,
+      "role": "domain",
+      "value": "계약"
+    },
+    {
+      "pdf_page_index": 50,
+      "role": "part",
+      "value": "계약 일반"
+    },
+    {
+      "pdf_page_index": 50,
+      "role": "subtopic",
+      "value": "합성 소주제"
+    }
+  ]
+}

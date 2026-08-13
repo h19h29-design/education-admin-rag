@@ -1,0 +1,95 @@
+{
+  "cases": [
+    {
+      "case_no": "9",
+      "case_type": "qa",
+      "title": "합성 마지막 제목",
+      "question": "합성 마지막 질문?",
+      "answer": "합성 마지막 답변입니다.",
+      "facts": null,
+      "basis_text": "합성 마지막 근거입니다.",
+      "target_text": null,
+      "situation_text": null,
+      "source_spans": [
+        {
+          "pdf_page_index": 60,
+          "page_label": "60",
+          "bbox": [
+            73,
+            150,
+            93,
+            180
+          ],
+          "text_sha256": "19581e27de7ced00ff1ce50b2047e7a567c76b1cbaebabe5ef03f7c3017bb5b7"
+        },
+        {
+          "pdf_page_index": 60,
+          "page_label": "60",
+          "bbox": [
+            117,
+            150,
+            522,
+            185
+          ],
+          "text_sha256": "7c6313edeed49bbaf40dce9fdf7e2cd94fc93d1ae1d98cfe639ca69b04f001e1"
+        },
+        {
+          "pdf_page_index": 60,
+          "page_label": "60",
+          "bbox": [
+            80,
+            210,
+            525,
+            240
+          ],
+          "text_sha256": "1990ddcf7a59d703773ad28f3e11d530545496ff063d04ccba85718770ccce3c"
+        },
+        {
+          "pdf_page_index": 60,
+          "page_label": "60",
+          "bbox": [
+            80,
+            255,
+            525,
+            290
+          ],
+          "text_sha256": "39833369376df185de49682bc7f602ec59d3c125ed704362c0ea234e5bafb3be"
+        },
+        {
+          "pdf_page_index": 60,
+          "page_label": "60",
+          "bbox": [
+            80,
+            305,
+            525,
+            340
+          ],
+          "text_sha256": "8e171411cf4fd2b5d6b304527e98434215f99dafd12fc2a62d68a0114a12f938"
+        }
+      ],
+      "review_status": "machine_extracted",
+      "critical_field_review": "not_applicable",
+      "layout_segment_id": null,
+      "search_eligible": false,
+      "answer_eligible": false
+    }
+  ],
+  "quarantines": [],
+  "transitions": [
+    {
+      "pdf_page_index": 60,
+      "role": "domain",
+      "value": "계약"
+    },
+    {
+      "pdf_page_index": 60,
+      "role": "part",
+      "value": "계약 일반"
+    },
+    {
+      "pdf_page_index": 60,
+      "role": "subtopic",
+      "value": "합성 소주제"
+    }
+  ]
+}

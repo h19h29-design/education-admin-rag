@@ -1,0 +1,10 @@
+# This deliberately invalid template must be replaced with values read from the
+# target NAS. The three service UIDs must be distinct non-root IDs.
+schema_version = "sen-qa-storage-policy/v1"
+ingestion_uid = "REPLACE_WITH_NAS_UID"
+search_uid = "REPLACE_WITH_NAS_UID"
+evaluator_uid = "REPLACE_WITH_NAS_UID"
+reviewer_gid = "REPLACE_WITH_NAS_GID"
+source_root = "REPLACE_WITH_ABSOLUTE_SOURCE_ROOT"
+artifact_root = "REPLACE_WITH_ABSOLUTE_ARTIFACT_ROOT"
+private_eval_root = "REPLACE_WITH_ABSOLUTE_PRIVATE_EVAL_ROOT"

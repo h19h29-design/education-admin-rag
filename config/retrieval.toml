@@ -1,0 +1,12 @@
+schema_version = 1
+index_version = "korean-lexical-v1"
+max_results = 100
+max_records = 100000
+
+[bm25]
+title = 8.0
+question = 7.0
+law_names = 8.0
+exact_tokens = 10.0
+char_ngrams = 2.5
+body = 1.0

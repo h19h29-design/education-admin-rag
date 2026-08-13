@@ -1,0 +1,146 @@
+{
+  "$id": "data/schemas/chunk.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "pii_class": {
+            "enum": [
+              "public_credit",
+              "restricted"
+            ]
+          }
+        },
+        "required": [
+          "pii_class"
+        ]
+      },
+      "then": {
+        "properties": {
+          "answer_eligible": {
+            "const": false
+          },
+          "search_eligible": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "answer_eligible": {
+            "const": true
+          }
+        },
+        "required": [
+          "answer_eligible"
+        ]
+      },
+      "then": {
+        "properties": {
+          "search_eligible": {
+            "const": true
+          }
+        }
+      }
+    }
+  ],
+  "description": "A retrievable child of a single canonical case.",
+  "properties": {
+    "answer_eligible": {
+      "title": "Answer Eligible",
+      "type": "boolean"
+    },
+    "case_id": {
+      "minLength": 1,
+      "title": "Case Id",
+      "type": "string"
+    },
+    "chunk_id": {
+      "minLength": 1,
+      "title": "Chunk Id",
+      "type": "string"
+    },
+    "embedding_text": {
+      "minLength": 1,
+      "title": "Embedding Text",
+      "type": "string"
+    },
+    "pii_class": {
+      "enum": [
+        "none",
+        "anonymized_case",
+        "quasi_identifier",
+        "public_credit",
+        "restricted"
+      ],
+      "title": "Pii Class",
+      "type": "string"
+    },
+    "quality_flags": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Quality Flags",
+      "type": "array"
+    },
+    "role": {
+      "enum": [
+        "question",
+        "answer",
+        "basis",
+        "facts",
+        "table"
+      ],
+      "title": "Role",
+      "type": "string"
+    },
+    "search_eligible": {
+      "title": "Search Eligible",
+      "type": "boolean"
+    },
+    "sequence": {
+      "minimum": 1,
+      "title": "Sequence",
+      "type": "integer"
+    },
+    "source_span_indexes": {
+      "items": {
+        "type": "integer"
+      },
+      "minItems": 1,
+      "title": "Source Span Indexes",
+      "type": "array",
+      "uniqueItems": true
+    },
+    "text": {
+      "minLength": 1,
+      "title": "Text",
+      "type": "string"
+    },
+    "token_count": {
+      "minimum": 0,
+      "title": "Token Count",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "chunk_id",
+    "case_id",
+    "role",
+    "sequence",
+    "text",
+    "embedding_text",
+    "source_span_indexes",
+    "token_count",
+    "pii_class",
+    "search_eligible",
+    "answer_eligible"
+  ],
+  "title": "Chunk",
+  "type": "object"
+}
