@@ -1498,8 +1498,9 @@ def _load_reviewable_candidate(
         raise SnapshotQualityError("recoverable final manifest approval is invalid")
     institutions, sites = _recheck_candidate(selected_path, manifest, snapshot_id)
     _recheck_promotion_quality(root, manifest, institutions, sites, coverage)
+    _recheck_source_provenance(manifest, institutions, sites)
     if not _is_test_fixture_manifest(manifest):
-        _recheck_source_provenance(manifest, institutions, sites)
+        _recheck_production_source_provenance(manifest, institutions)
         _recheck_school_count_reconciliation(manifest, institutions)
     _recheck_enrichment_provenance(manifest, institutions, sites)
     _transaction_attests_manifest(transaction, manifest)
@@ -3108,12 +3109,18 @@ def _recheck_source_provenance(
     sites_by_parent: dict[str, list[InstitutionSite]] = defaultdict(list)
     for site in sites:
         sites_by_parent[site.institution_id].append(site)
+    checked_sources: set[str] = set()
     for entry in source_entries:
         if type(entry) is not dict:
             raise SnapshotQualityError("candidate source provenance is invalid")
         source = entry.get("source")
-        if type(source) is not str or source not in by_source:
+        if (
+            type(source) is not str
+            or source not in by_source
+            or source in checked_sources
+        ):
             raise SnapshotQualityError("candidate source provenance is invalid")
+        checked_sources.add(source)
         rows = by_source[source]
         current_count = sum(
             row.status is not InstitutionStatus.MISSING_FROM_SOURCE for row in rows
@@ -3124,7 +3131,6 @@ def _recheck_source_provenance(
             if row.status is not InstitutionStatus.MISSING_FROM_SOURCE
         ]
         preserved_count = len(rows) - current_count
-        timing = entry.get("requestTiming")
         raw_counts_value = entry.get("sourceObservationDateCounts")
         normalized_counts_value = entry.get("normalizedObservationDateCounts")
         preserved_counts_value = entry.get("preservedObservationDateCounts")
@@ -3181,14 +3187,57 @@ def _recheck_source_provenance(
             raise SnapshotQualityError(
                 "candidate source observation dates do not match persisted rows"
             )
-        source_normalized_matches = current_count == 0 or (
+        source_normalized_rows = current_rows if current_rows else rows
+        source_normalized_matches = (
             entry.get("sourceNormalizedSha256")
             == _normalized_persisted_source_sha256(
-                current_rows,
+                source_normalized_rows,
                 sites_by_parent,
                 before_enrichment=True,
             )
         )
+        if (
+            entry.get("normalizedRowCount") != current_count
+            or entry.get("preservedRowCount") != preserved_count
+            or entry.get("rowCount") != len(rows)
+            or not source_normalized_matches
+            or entry.get("normalizedSha256")
+            != _normalized_persisted_source_sha256(rows, sites_by_parent)
+            or type(entry.get("rawSha256")) is not str
+            or _SHA256.fullmatch(entry["rawSha256"]) is None
+        ):
+            raise SnapshotQualityError(
+                "candidate source provenance does not match persisted rows"
+            )
+    if checked_sources != set(by_source):
+        raise SnapshotQualityError("candidate source provenance is invalid")
+
+
+def _recheck_production_source_provenance(
+    manifest: dict[str, object],
+    institutions: list[Institution],
+) -> None:
+    source_entries = manifest.get("sources")
+    if type(source_entries) is not list:
+        raise SnapshotQualityError("candidate source provenance is invalid")
+    by_source: dict[str, list[Institution]] = defaultdict(list)
+    for institution in institutions:
+        by_source[institution.source].append(institution)
+    for entry in source_entries:
+        if type(entry) is not dict:
+            raise SnapshotQualityError("candidate source provenance is invalid")
+        source = entry.get("source")
+        if (
+            type(source) is not str
+            or source not in by_source
+            or source not in _SOURCE_ENDPOINTS
+        ):
+            raise SnapshotQualityError("candidate source provenance is invalid")
+        rows = by_source[source]
+        current_count = sum(
+            row.status is not InstitutionStatus.MISSING_FROM_SOURCE for row in rows
+        )
+        timing = entry.get("requestTiming")
         if (
             entry.get("endpoint") != _SOURCE_ENDPOINTS[source]
             or entry.get("licenseName") != _SOURCE_LICENSES[source]
@@ -3199,13 +3248,6 @@ def _recheck_source_provenance(
                 entry.get("pageCount"),
                 entry.get("fetchedRowCount"),
             )
-            or entry.get("normalizedRowCount") != current_count
-            or entry.get("preservedRowCount") != preserved_count
-            or not source_normalized_matches
-            or entry.get("normalizedSha256")
-            != _normalized_persisted_source_sha256(rows, sites_by_parent)
-            or type(entry.get("rawSha256")) is not str
-            or _SHA256.fullmatch(entry["rawSha256"]) is None
             or source in _PINNED_SOURCE_RAW_SHA256
             and entry["rawSha256"] != _PINNED_SOURCE_RAW_SHA256[source]
             or source in _PINNED_SOURCE_NORMALIZED_SHA256
@@ -3483,6 +3525,7 @@ def _normalized_persisted_source_sha256(
             for site in sites_by_parent.get(row.institution_id, [])
             if not (
                 before_enrichment
+                and row.status is not InstitutionStatus.MISSING_FROM_SOURCE
                 and site.status is InstitutionStatus.MISSING_FROM_SOURCE
             )
         ]

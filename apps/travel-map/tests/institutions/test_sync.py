@@ -376,6 +376,72 @@ def test_final_approval_replays_population_and_reconciliation_before_pointer_wri
     assert replayed_digest == idempotent_digest == reviewed_digest
 
 
+# Production break caught: the narrow test-fixture identity exception must not
+# disable replay of the source hashes that authenticate its persisted records.
+@pytest.mark.parametrize("operation", ["review", "approve"])
+def test_test_fixture_source_hash_tampering_fails_before_pointer_mutation(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    baseline = build_explicit_test_fixture_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id=f"fixture-hash-baseline-{operation}",
+        coverage=FAST_TEST_COVERAGE,
+    )
+    promote_snapshot(baseline, tmp_path, coverage=FAST_TEST_COVERAGE)
+    pointer = tmp_path / "current.json"
+    original_pointer = pointer.read_bytes()
+    candidate = build_explicit_test_fixture_candidate(
+        records=(source_record(),),
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id=f"fixture-hash-candidate-{operation}",
+        coverage=FAST_TEST_COVERAGE,
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=FAST_TEST_COVERAGE,
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    fixture_source = next(
+        entry for entry in manifest["sources"] if entry["source"] == "TEST_NEIS"
+    )
+    fixture_source["sourceNormalizedSha256"] = "f" * 64
+    sync_module._write_json(manifest_path, manifest)
+    resign_candidate(candidate, tmp_path)
+
+    forged_packet = dict(packet)
+    forged_packet["candidateManifestSha256"] = hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+    forged_packet["sourceProvenanceSha256"] = (
+        sync_module._manifest_section_sha256(manifest["sources"])
+    )
+    forged_packet.pop("reviewDigest")
+    forged_review_digest = sync_module._manifest_section_sha256(forged_packet)
+
+    with pytest.raises(SnapshotQualityError, match="source provenance"):
+        if operation == "review":
+            sync_module.build_candidate_review_packet(
+                snapshot_id=candidate.snapshot_id,
+                snapshot_root=tmp_path,
+                coverage=FAST_TEST_COVERAGE,
+            )
+        else:
+            sync_module.approve_candidate_snapshot(
+                snapshot_id=candidate.snapshot_id,
+                review_digest=forged_review_digest,
+                reviewer_role="TEST_FIXTURE_REVIEWER",
+                snapshot_root=tmp_path,
+                coverage=FAST_TEST_COVERAGE,
+            )
+    assert pointer.read_bytes() == original_pointer
+
+
 @pytest.mark.parametrize(
     ("old", "new"),
     [
