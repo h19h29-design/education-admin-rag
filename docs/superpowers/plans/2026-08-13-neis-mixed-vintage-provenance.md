@@ -4,7 +4,7 @@
 
 **Goal:** Preserve every NEIS `LOAD_DTM` observation date through source ingestion, candidate review, digest-gated human approval, and strict snapshot verification without dropping or inventing school records.
 
-**Architecture:** Treat observation dates as immutable provenance, not a source-wide shortcut.  Each source manifest entry records a deterministic raw-observation histogram, a normalized-record histogram, and a preserved-record histogram; `sourceAsOf` is present only when their applicable observation-date union has one date.  Candidate creation remains non-public, while review and approval independently reconstruct and authenticate the same summary before the existing atomic pointer publication path can run.
+**Architecture:** Treat observation dates as immutable provenance, not a source-wide shortcut.  Each source manifest entry records a deterministic raw-observation histogram, a normalized-record histogram, and a preserved-record histogram; `sourceAsOf` is present only when the raw-observation histogram has exactly one date.  Candidate creation remains non-public, while review and approval independently reconstruct and authenticate the same summary before the existing atomic pointer publication path can run.
 
 **Tech Stack:** Python 3.12, Pydantic v2, `httpx`, `pytest`, `ruff`, `mypy`, JSON SHA-256/HMAC transaction receipts, existing `CoverageService` and snapshot verifier.
 
@@ -18,6 +18,10 @@
 - Keep user-facing map behavior unchanged.  Update only the administrator-only snapshot section of `apps/travel-map/README.md`.
 - Do not add credentials, test fixtures, raw source payloads, or generated snapshots under `apps/travel-map/resources/institution-snapshots/`.
 - Execute all Python tests with `PYTHONWARNINGS=error` and run commands from the repository root unless a command explicitly changes directory.
+
+## Approved Execution Sequencing
+
+Tasks 1–3 form one compatibility implementation and review unit.  Execute the RED/GREEN test cycles in their listed order, but do not commit an intermediate state that introduces `sourceAsOf: null` while downstream manifest or candidate validation still requires one date.  Make the first implementation commit only after all Task 1–3 contracts pass together; then perform one combined Task 1 review.  Tasks 4–6 retain their listed sequence and review gates.
 
 ---
 
@@ -84,7 +88,7 @@ The manifest source entry has these three related fields:
 
 `sourceObservationDateCounts` counts every raw source row and therefore sums to `fetchedRowCount`.  `normalizedObservationDateCounts` counts current (not `MISSING_FROM_SOURCE`) persisted institutions and sums to `normalizedRowCount`.  `preservedObservationDateCounts` counts retained `MISSING_FROM_SOURCE` institutions and sums to `preservedRowCount`.  Their normalized-plus-preserved union must equal the persisted output rows and `rowCount`.  This separation keeps the existing explicit exclusion of raw `공동실습소` rows auditable without redefining `fetchedRowCount`.
 
-`sourceAsOf` is the one date only if the applicable union contains exactly one date; otherwise it is JSON `null`.  Snapshot-wide `snapshotAsOf` remains the maximum date across every source observation key and enrichment `sourceAsOf` value.
+`sourceAsOf` is the one raw-observation date only if `sourceObservationDateCounts` has exactly one key; otherwise it is JSON `null`, even when filtering or preservation leaves only one normalized/preserved date.  Snapshot-wide `snapshotAsOf` remains the maximum date across every raw source-observation key and enrichment `sourceAsOf` value.
 
 ### Task 1: Preserve raw and normalized NEIS observation dates
 
@@ -287,7 +291,7 @@ Add corresponding `dict[str, int]` fields to `SourceSnapshotInfo`.  The field va
 4. require every value to be an exact `int` greater than zero, except an empty preserved map when `preservedRowCount == 0`;
 5. return the original insertion order, not a sorted replacement.
 
-Permit `source_as_of: str | None`.  In the model-level validator, require a non-null value exactly when the union of normalized and preserved histogram keys has one date, require that value to equal that date, and require `None` otherwise.  Also require raw, normalized, and preserved sums to equal `fetched_row_count`, `normalized_row_count`, and `preserved_row_count` respectively.
+Permit `source_as_of: str | None`.  In the model-level validator, require a non-null value exactly when `sourceObservationDateCounts` has one date, require that value to equal that raw-observation date, and require `None` otherwise.  Also require raw, normalized, and preserved sums to equal `fetched_row_count`, `normalized_row_count`, and `preserved_row_count` respectively.
 
 - [ ] **Step 4: Verify persisted JSONL distributions rather than one source date**
 
@@ -409,7 +413,7 @@ Retain endpoint, license, attribution, region, pagination, raw-hash, pinned-sour
 
 - [ ] **Step 4: Write all three histograms into the candidate manifest**
 
-In `_candidate_manifest()`, derive preserved counts from output institutions with `MISSING_FROM_SOURCE`, derive normalized counts from non-preserved output institutions, and require them to agree with the source provenance for current source rows.  Set `sourceAsOf` through `source_as_of_for()` over the union of normalized and preserved keys; do not use `max(row.source_as_of ...)`.
+In `_candidate_manifest()`, derive preserved counts from output institutions with `MISSING_FROM_SOURCE`, derive normalized counts from non-preserved output institutions, and require them to agree with the source provenance for current source rows.  Set `sourceAsOf` through `source_as_of_for(provenance.source_observation_date_counts)`; do not use `max(row.source_as_of ...)` or a filtered-record union.
 
 The source entry construction must include:
 
