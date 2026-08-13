@@ -15,6 +15,10 @@ from app.institutions.sources.common import (
     source_as_of_for,
     utc_now,
 )
+from app.institutions.sources.neis_classification import (
+    NeisUnclassifiedPolicy,
+    validate_unclassified_school_counts,
+)
 
 _ENDPOINT = "https://open.neis.go.kr/hub/schoolInfo"
 _MAX_DECLARED_ROWS = 5_000
@@ -50,6 +54,7 @@ class NeisSource:
         *,
         api_key: str,
         client: httpx.AsyncClient,
+        unclassified_policy: NeisUnclassifiedPolicy,
         page_size: int = 1_000,
     ) -> None:
         if not api_key.strip():
@@ -58,6 +63,7 @@ class NeisSource:
             raise SourceDataError("NEIS page size must be between 1 and 1000")
         self._api_key = api_key
         self._client = client
+        self._unclassified_policy = unclassified_policy
         self._page_size = page_size
 
     async def fetch(self) -> SourceFetchResult:
@@ -139,7 +145,10 @@ class NeisSource:
             if page_ids in seen_page_ids:
                 raise SourceDataError("NEIS returned a repeated page")
             seen_page_ids.add(page_ids)
-            parsed = parse_neis_rows(payload)
+            parsed = parse_neis_rows(
+                payload,
+                unclassified_policy=self._unclassified_policy,
+            )
             pages.append(raw)
             raw_row_count += len(raw_rows)
             records.extend(parsed)
@@ -153,6 +162,9 @@ class NeisSource:
         raw_counts = observation_date_counts(raw_source_dates)
         normalized_counts = observation_date_counts(
             record.source_as_of for record in records
+        )
+        unclassified_counts = validate_unclassified_school_counts(
+            tuple(records), self._unclassified_policy
         )
         return SourceFetchResult(
             records=tuple(records),
@@ -172,11 +184,17 @@ class NeisSource:
                 request_region_code="B10",
                 request_timing=None,
                 normalized_sha256=normalized_records_sha256(records),
+                unclassified_school_kind_counts=tuple(unclassified_counts.items()),
+                unclassified_school_policy_sha256=self._unclassified_policy.sha256,
             ),
         )
 
 
-def parse_neis_rows(payload: Mapping[str, object]) -> tuple[SourceInstitutionRecord, ...]:
+def parse_neis_rows(
+    payload: Mapping[str, object],
+    *,
+    unclassified_policy: NeisUnclassifiedPolicy | None = None,
+) -> tuple[SourceInstitutionRecord, ...]:
     rows = _neis_rows(payload)
     _raw_neis_load_dates(rows)
 
@@ -186,7 +204,10 @@ def parse_neis_rows(payload: Mapping[str, object]) -> tuple[SourceInstitutionRec
         if _required_string_from_object(row, "SCHUL_KND_SC_NM")
         not in _NONSELECTABLE_TYPES
     ]
-    return tuple(_parse_row(row)[0] for row in selectable_rows)
+    return tuple(
+        _parse_row(row, unclassified_policy=unclassified_policy)[0]
+        for row in selectable_rows
+    )
 
 
 def _raw_neis_load_dates(rows: list[object]) -> tuple[str, ...]:
@@ -241,7 +262,11 @@ def _neis_total(payload: Mapping[str, object]) -> int:
         raise SourceDataError("NEIS list_total_count is missing") from exc
 
 
-def _parse_row(row: object) -> tuple[SourceInstitutionRecord, str]:
+def _parse_row(
+    row: object,
+    *,
+    unclassified_policy: NeisUnclassifiedPolicy | None,
+) -> tuple[SourceInstitutionRecord, str]:
     if type(row) is not dict:
         raise SourceDataError("NEIS row must be an object")
     try:
@@ -250,9 +275,15 @@ def _parse_row(row: object) -> tuple[SourceInstitutionRecord, str]:
             raise SourceDataError("NEIS row is not in the B10 source region")
         school_code = _required_string(row, "SD_SCHUL_CODE")
         foundation = _FOUNDATION_TYPES[_required_string(row, "FOND_SC_NM")]
-        institution_type = _INSTITUTION_TYPES[
-            _required_string(row, "SCHUL_KND_SC_NM")
-        ]
+        raw_kind = _required_string(row, "SCHUL_KND_SC_NM")
+        if raw_kind in _INSTITUTION_TYPES:
+            institution_type = _INSTITUTION_TYPES[raw_kind]
+            source_kind_label = None
+        elif unclassified_policy is not None and raw_kind in unclassified_policy.labels:
+            institution_type = "UNCLASSIFIED_SCHOOL"
+            source_kind_label = raw_kind
+        else:
+            raise SourceDataError("NEIS row contains an unsupported value")
         road_address = _required_string(row, "ORG_RDNMA")
         loaded = _yyyymmdd_as_iso(_required_string(row, "LOAD_DTM"))
     except (KeyError, ValueError) as exc:
@@ -271,6 +302,7 @@ def _parse_row(row: object) -> tuple[SourceInstitutionRecord, str]:
         source_region_code="B10",
         source_as_of=loaded,
         coordinate_quality="MISSING",
+        source_kind_label=source_kind_label,
     )
     return record, loaded
 

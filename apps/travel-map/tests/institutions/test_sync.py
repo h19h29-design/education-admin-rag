@@ -19,6 +19,7 @@ from types import SimpleNamespace, TracebackType
 
 import app.institutions.sources.kindergarten as kindergarten_module
 import app.institutions.sources.neis as neis_module
+import app.institutions.sources.neis_classification as neis_classification_module
 import app.institutions.sources.standard_school as standard_school_module
 import app.institutions.sync as sync_module
 import app.providers.kakao_local as kakao_module
@@ -44,6 +45,12 @@ from app.institutions.sources.kindergarten import (
     parse_kindergarten_rows,
 )
 from app.institutions.sources.neis import NeisSource, parse_neis_rows
+from app.institutions.sources.neis_classification import (
+    PINNED_POLICY_SHA256,
+    NeisUnclassifiedPolicy,
+    load_neis_unclassified_policy,
+    validate_unclassified_school_counts,
+)
 from app.institutions.sources.sen import SenCsvSource, parse_sen_csv
 from app.institutions.sources.sen_counts import (
     ReportedSchoolTotal,
@@ -75,6 +82,12 @@ SOURCE_RESOURCES = Path("apps/travel-map/resources/institution-sources")
 TEST_COVERAGE = CoverageService.from_geojson(
     seoul_path="apps/travel-map/resources/geodata/seoul.geojson",
     buffer_distance_m=12_000,
+)
+EMPTY_NEIS_UNCLASSIFIED_POLICY = NeisUnclassifiedPolicy(
+    counts=(),
+    sha256="0" * 64,
+    reviewed_as_of="2026-08-13",
+    reviewer_role="test",
 )
 
 
@@ -201,6 +214,219 @@ def test_neis_explicitly_excludes_nonselectable_joint_training_center() -> None:
     payload = neis_payload(source_type="\uacf5\ub3d9\uc2e4\uc2b5\uc18c")
 
     assert parse_neis_rows(payload) == ()
+
+
+def test_load_neis_unclassified_policy_accepts_exact_reviewed_resource() -> None:
+    policy = load_neis_unclassified_policy(
+        SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    )
+
+    assert policy.counts == (
+        ("평생학교(고)-2년6학기", 7),
+        ("평생학교(고)-3년6학기", 4),
+        ("평생학교(중)-2년6학기", 5),
+        ("평생학교(초)-3년6학기", 2),
+    )
+    assert policy.sha256 == (
+        "2a9222d34083261c42ba51fd4430dd6b84b2210908a13e377a64cc69298c51a1"
+    )
+    assert policy.sha256 == PINNED_POLICY_SHA256
+    assert policy.reviewed_as_of == "2026-08-13"
+    assert policy.reviewer_role == "data-steward"
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("schemaVersion=1", "schemaVersion=2"),
+        (
+            "school_kind,expected_count,reason_code",
+            "school_kind,expected_count,reason_code,extra_column",
+        ),
+        (
+            "평생학교(고)-3년6학기,4,OFFICIAL_CLASSIFICATION_PENDING",
+            "평생학교(고)-2년6학기,7,OFFICIAL_CLASSIFICATION_PENDING",
+        ),
+        (
+            "평생학교(중)-2년6학기,5,OFFICIAL_CLASSIFICATION_PENDING",
+            "평생학교(초)-3년6학기,2,OFFICIAL_CLASSIFICATION_PENDING",
+        ),
+        (
+            "평생학교(고)-2년6학기,7,OFFICIAL_CLASSIFICATION_PENDING",
+            "평생학교(고)-2년6학기,True,OFFICIAL_CLASSIFICATION_PENDING",
+        ),
+        ("OFFICIAL_CLASSIFICATION_PENDING", "DIFFERENT_REASON"),
+    ],
+)
+def test_neis_unclassified_policy_rejects_tampered_reviewed_resource(
+    tmp_path: Path,
+    old: str,
+    new: str,
+) -> None:
+    source = SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    path = tmp_path / "policy.csv"
+    body = source.read_text(encoding="utf-8").replace(old, new, 1)
+    path.write_text(body, encoding="utf-8")
+
+    with pytest.raises(SourceDataError, match="reviewed|SHA-256|policy"):
+        load_neis_unclassified_policy(path)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "school_kind,expected_count,reason_code",
+            "school_kind,expected_count,reason_code,extra_column",
+        ),
+        (
+            "school_kind,expected_count,reason_code",
+            "school_kind,expected_count",
+        ),
+        (
+            "평생학교(고)-3년6학기,4,OFFICIAL_CLASSIFICATION_PENDING",
+            "평생학교(고)-2년6학기,4,OFFICIAL_CLASSIFICATION_PENDING",
+        ),
+        (
+            (
+                "평생학교(고)-2년6학기,7,OFFICIAL_CLASSIFICATION_PENDING\n"
+                "평생학교(고)-3년6학기,4,OFFICIAL_CLASSIFICATION_PENDING"
+            ),
+            (
+                "평생학교(고)-3년6학기,4,OFFICIAL_CLASSIFICATION_PENDING\n"
+                "평생학교(고)-2년6학기,7,OFFICIAL_CLASSIFICATION_PENDING"
+            ),
+        ),
+        (
+            "평생학교(초)-3년6학기,2,OFFICIAL_CLASSIFICATION_PENDING",
+            "평생학교(초)-3년6학기,0,OFFICIAL_CLASSIFICATION_PENDING",
+        ),
+        (
+            "평생학교(초)-3년6학기,2,OFFICIAL_CLASSIFICATION_PENDING",
+            "평생학교(초)-3년6학기,True,OFFICIAL_CLASSIFICATION_PENDING",
+        ),
+        ("OFFICIAL_CLASSIFICATION_PENDING", "DIFFERENT_REASON"),
+    ],
+)
+def test_neis_unclassified_policy_rejects_malformed_rehashed_resource(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    old: str,
+    new: str,
+) -> None:
+    path = tmp_path / "policy.csv"
+    body = (SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv").read_text(
+        encoding="utf-8"
+    ).replace(old, new, 1)
+    path.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(
+        neis_classification_module,
+        "PINNED_POLICY_SHA256",
+        hashlib.sha256(body.encode("utf-8")).hexdigest(),
+    )
+
+    with pytest.raises(SourceDataError, match="columns|labels|counts|rows"):
+        load_neis_unclassified_policy(path)
+
+
+def test_neis_unclassified_policy_rejects_symlinked_resource(tmp_path: Path) -> None:
+    link = tmp_path / "policy-link.csv"
+    link.symlink_to(SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv")
+
+    with pytest.raises(SourceDataError, match="symlink|regular"):
+        load_neis_unclassified_policy(link)
+
+
+def test_neis_quarantines_only_the_exact_reviewed_lifelong_school_labels() -> None:
+    policy = load_neis_unclassified_policy(
+        SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    )
+    payload = neis_payload_rows(
+        *(label for label, count in policy.counts for _ in range(count))
+    )
+
+    records = parse_neis_rows(payload, unclassified_policy=policy)
+
+    assert Counter(row.institution_type for row in records) == {
+        "UNCLASSIFIED_SCHOOL": 18
+    }
+    assert {row.source_kind_label for row in records} == policy.labels
+    assert validate_unclassified_school_counts(records, policy) == dict(policy.counts)
+
+
+@pytest.mark.asyncio
+async def test_neis_binds_quarantine_histogram_and_policy_hash_to_provenance() -> None:
+    policy = load_neis_unclassified_policy(
+        SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    )
+    payload = neis_payload_rows(
+        *(label for label, count in policy.counts for _ in range(count))
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await NeisSource(
+            api_key="test-key",
+            client=client,
+            unclassified_policy=policy,
+        ).fetch()
+
+    assert result.provenance.unclassified_school_kind_counts == policy.counts
+    assert result.provenance.unclassified_school_policy_sha256 == policy.sha256
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_types",
+    [
+        ("평생학교(초)-3년6학기",) * 3
+        + ("평생학교(중)-2년6학기",) * 5
+        + ("평생학교(고)-2년6학기",) * 7
+        + ("평생학교(고)-3년6학기",) * 4,
+        ("평생학교(초)-3년6학기",) * 2
+        + ("평생학교(중)-2년6학기",) * 5
+        + ("평생학교(고)-2년6학기",) * 8
+        + ("평생학교(고)-3년6학기",) * 4,
+    ],
+)
+async def test_neis_rejects_quarantine_count_drift(
+    source_types: tuple[str, ...],
+) -> None:
+    policy = load_neis_unclassified_policy(
+        SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    )
+    payload = neis_payload_rows(*source_types)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(SourceDataError, match="counts"):
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=policy,
+                page_size=len(source_types),
+            ).fetch()
+
+
+def test_neis_rejects_unknown_lifelong_school_label_before_candidate_creation() -> None:
+    policy = load_neis_unclassified_policy(
+        SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    )
+    payload = neis_payload_rows("평생학교(고)-4년8학기")
+
+    with pytest.raises(SourceDataError, match="unsupported"):
+        parse_neis_rows(payload, unclassified_policy=policy)
+
+
+def test_neis_policy_label_is_rejected_without_a_supplied_policy() -> None:
+    payload = neis_payload_rows("평생학교(초)-3년6학기")
+
+    with pytest.raises(SourceDataError, match="unsupported"):
+        parse_neis_rows(payload)
 
 
 # Production break caught: collapsing two raw vintages on one API page to one date.
@@ -1713,7 +1939,12 @@ async def test_neis_source_requires_real_key_and_paginates_to_declared_total() -
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler)
     ) as client:
-        source = NeisSource(api_key="test-key", client=client, page_size=1)
+        source = NeisSource(
+            api_key="test-key",
+            client=client,
+            unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+            page_size=1,
+        )
         result = await source.fetch()
 
     assert len(result.records) == 2
@@ -1722,7 +1953,11 @@ async def test_neis_source_requires_real_key_and_paginates_to_declared_total() -
     assert all(request.url.params["ATPT_OFCDC_SC_CODE"] == "B10" for request in requests)
 
     with pytest.raises(SourceDataError, match="NEIS_API_KEY"):
-        NeisSource(api_key="", client=httpx.AsyncClient())
+        NeisSource(
+            api_key="",
+            client=httpx.AsyncClient(),
+            unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+        )
 
 
 @pytest.mark.asyncio
@@ -1740,7 +1975,11 @@ async def test_neis_source_rejects_keyless_sample_and_redacts_invalid_key() -> N
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError) as raised:
-            await NeisSource(api_key=secret, client=client).fetch()
+            await NeisSource(
+                api_key=secret,
+                client=client,
+                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
 
     assert secret not in str(raised.value)
 
@@ -1756,7 +1995,11 @@ async def test_source_http_failure_traceback_does_not_retain_api_key() -> None:
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError) as raised:
-            await NeisSource(api_key=secret, client=client).fetch()
+            await NeisSource(
+                api_key=secret,
+                client=client,
+                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
 
     formatted = "".join(
         traceback.format_exception(raised.type, raised.value, raised.tb)
@@ -1778,7 +2021,11 @@ async def test_unexpected_transport_failure_does_not_retain_api_key() -> None:
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError, match="NEIS request failed") as raised:
-            await NeisSource(api_key=secret, client=client).fetch()
+            await NeisSource(
+                api_key=secret,
+                client=client,
+                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
 
     assert_secret_absent_from_app_traceback(raised.value, raised.tb, secret)
 
@@ -1864,7 +2111,11 @@ async def test_successful_source_fetches_clear_api_keys(tmp_path: Path) -> None:
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(neis_handler)
     ) as client:
-        neis = NeisSource(api_key=neis_secret, client=client)
+        neis = NeisSource(
+            api_key=neis_secret,
+            client=client,
+            unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+        )
         await neis.fetch()
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(kindergarten_handler)
@@ -1903,6 +2154,7 @@ async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
         result = await NeisSource(
             api_key="test-key",
             client=client,
+            unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
             page_size=2,
         ).fetch()
 
@@ -1939,7 +2191,10 @@ async def test_neis_fetch_records_raw_and_normalized_mixed_vintage_histograms() 
         transport=httpx.MockTransport(handler)
     ) as client:
         result = await NeisSource(
-            api_key="test-key", client=client, page_size=2
+            api_key="test-key",
+            client=client,
+            unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+            page_size=2,
         ).fetch()
 
     assert result.provenance.source_as_of is None
@@ -1973,7 +2228,10 @@ async def test_neis_source_preserves_different_date_on_excluded_only_page() -> N
         transport=httpx.MockTransport(handler)
     ) as client:
         result = await NeisSource(
-            api_key="test-key", client=client, page_size=1
+            api_key="test-key",
+            client=client,
+            unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+            page_size=1,
         ).fetch()
 
     assert result.provenance.source_as_of is None
@@ -2007,7 +2265,11 @@ async def test_neis_source_rejects_five_row_sample_success_shape() -> None:
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError, match="sample"):
-            await NeisSource(api_key="test-key", client=client).fetch()
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
 
     assert len(requests) == 1
 
@@ -2038,7 +2300,12 @@ async def test_neis_source_bounds_declared_total_before_second_request(
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError, match=message):
-            await NeisSource(api_key="test-key", client=client, page_size=1).fetch()
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+                page_size=1,
+            ).fetch()
 
     assert len(requests) == 1
 
@@ -2058,7 +2325,11 @@ async def test_neis_source_rejects_oversized_response_before_retention(
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError, match="response size"):
-            await NeisSource(api_key="test-key", client=client).fetch()
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
 
 
 @pytest.mark.asyncio
@@ -2082,7 +2353,11 @@ async def test_neis_response_stream_stops_after_byte_limit(
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError, match="response size"):
-            await NeisSource(api_key="test-key", client=client).fetch()
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
 
     assert yielded_chunks < 10
 
@@ -2105,7 +2380,12 @@ async def test_neis_source_rejects_more_rows_than_requested_page_size() -> None:
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError, match="page size"):
-            await NeisSource(api_key="test-key", client=client, page_size=1).fetch()
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+                page_size=1,
+            ).fetch()
 
 
 @pytest.mark.asyncio
@@ -2132,6 +2412,7 @@ async def test_neis_source_bounds_actual_page_counter(
             await NeisSource(
                 api_key="test-key",
                 client=client,
+                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
                 page_size=1_000,
             ).fetch()
 
@@ -4496,6 +4777,24 @@ def neis_payload(*, source_type: str) -> dict[str, object]:
             "LOAD_DTM": "20260810",
         }
     )
+    return payload
+
+
+def neis_payload_rows(*source_types: str) -> dict[str, object]:
+    payload = neis_payload(source_type="초등학교")
+    section = payload["schoolInfo"]
+    assert type(section) is list
+    template = section[1]["row"][0]
+    assert type(template) is dict
+    section[0]["head"][0]["list_total_count"] = len(source_types)
+    section[1]["row"] = [
+        {
+            **template,
+            "SD_SCHUL_CODE": f"{7010000 + index}",
+            "SCHUL_KND_SC_NM": source_type,
+        }
+        for index, source_type in enumerate(source_types, start=1)
+    ]
     return payload
 
 

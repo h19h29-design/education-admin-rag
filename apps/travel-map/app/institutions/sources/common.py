@@ -105,6 +105,7 @@ class SourceInstitutionRecord:
     coordinate_quality: str
     site_name: str = "main"
     additional_sites: tuple[SourceInstitutionSiteRecord, ...] = ()
+    source_kind_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,8 @@ class SourceProvenance:
     request_region_code: str | None = None
     request_timing: str | None = None
     normalized_sha256: str | None = None
+    unclassified_school_kind_counts: tuple[tuple[str, int], ...] = ()
+    unclassified_school_policy_sha256: str | None = None
 
 
 @dataclass(frozen=True)

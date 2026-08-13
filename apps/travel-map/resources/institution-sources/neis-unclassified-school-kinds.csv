@@ -1,0 +1,10 @@
+# schemaVersion=1
+# sourceUrl=https://open.neis.go.kr/hub/schoolInfo
+# sourceRegionCode=B10
+# reviewedAsOf=2026-08-13
+# reviewerRole=data-steward
+school_kind,expected_count,reason_code
+평생학교(고)-2년6학기,7,OFFICIAL_CLASSIFICATION_PENDING
+평생학교(고)-3년6학기,4,OFFICIAL_CLASSIFICATION_PENDING
+평생학교(중)-2년6학기,5,OFFICIAL_CLASSIFICATION_PENDING
+평생학교(초)-3년6학기,2,OFFICIAL_CLASSIFICATION_PENDING
