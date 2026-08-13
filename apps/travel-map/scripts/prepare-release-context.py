@@ -5,6 +5,7 @@ import json
 import shutil
 from pathlib import Path
 
+from app.institutions.models import PRODUCTION_INSTITUTION_SOURCES
 from app.institutions.snapshot import verify_snapshot
 from app.policy.coverage import verify_geodata_resources
 from app.policy.rules import RuleRepository
@@ -65,10 +66,13 @@ def stage_release_context(
 
     resources = source / "resources"
     verified_snapshot = verify_snapshot(resources / "institution-snapshots")
+    source_names = {
+        source.source for source in verified_snapshot.manifest.sources
+    }
     is_test_fixture = (
         verified_snapshot.manifest.approved_by_role == "TEST_FIXTURE_REVIEWER"
-        and {source.source for source in verified_snapshot.manifest.sources}
-        == {"TEST_NEIS"}
+        and len(verified_snapshot.manifest.sources) == 1
+        and source_names == {"TEST_NEIS"}
         and verified_snapshot.manifest.school_count_reconciliation is None
     )
     if is_test_fixture and not allow_test_fixture:
@@ -76,12 +80,13 @@ def stage_release_context(
     if not is_test_fixture and (
         verified_snapshot.manifest.approved_by_role != "data-steward"
         or verified_snapshot.manifest.school_count_reconciliation is None
-        or any(
-            source.source == "TEST_NEIS"
-            for source in verified_snapshot.manifest.sources
-        )
+        or len(verified_snapshot.manifest.sources)
+        != len(PRODUCTION_INSTITUTION_SOURCES)
+        or source_names != PRODUCTION_INSTITUTION_SOURCES
     ):
-        raise ValueError("institution snapshot is not approved for production")
+        raise ValueError(
+            "institution snapshot does not use the exact production source set"
+        )
     verify_geodata_resources(resources / "geodata", verify_source=True)
     RuleRepository.from_directory(resources / "rules", require_hashes=True)
 

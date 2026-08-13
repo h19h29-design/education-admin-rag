@@ -93,6 +93,7 @@ from app.providers.kakao_local import KakaoLocalClient
 from tests.institutions.population_fixtures import (
     reviewed_population_fixture as shared_reviewed_population_fixture,
 )
+from tests.institutions.population_fixtures import reviewed_production_fixture
 
 SOURCE_FIXTURES = Path("apps/travel-map/tests/fixtures/institutions/sources")
 SOURCE_RESOURCES = Path("apps/travel-map/resources/institution-sources")
@@ -154,7 +155,7 @@ def test_school_count_population_profile_loads_exact_reviewed_contract() -> None
 def test_candidate_binds_population_provenance_and_school_count_reconciliation(
     tmp_path: Path,
 ) -> None:
-    profile, benchmark, records, provenance = reviewed_population_fixture()
+    profile, benchmark, records, provenance = reviewed_production_fixture()
     bound = sync_module.bind_school_count_population_profile(
         provenance,
         profile=profile,
@@ -212,13 +213,111 @@ def test_candidate_binds_population_provenance_and_school_count_reconciliation(
     assert records[0].road_address not in packet_text
 
 
+# Production break caught: a candidate whose provenance matches only the rows it
+# happens to contain can silently omit a whole reviewed production source.
+@pytest.mark.parametrize(
+    "removed_source",
+    ("NEIS", "KINDERGARTEN_INFO", "SEN_REVIEWED_CSV"),
+)
+def test_candidate_requires_every_exact_production_source(
+    tmp_path: Path,
+    removed_source: str,
+) -> None:
+    profile, benchmark, records, provenance = reviewed_production_fixture()
+    remaining_records = tuple(
+        record for record in records if record.source != removed_source
+    )
+    fully_bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    bound = {
+        source: item
+        for source, item in fully_bound.items()
+        if source != removed_source
+    }
+    reconciliation = reconcile_selectable_school_counts(
+        tuple(
+            record
+            for record in records
+            if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+        ),
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=fully_bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    with pytest.raises(SnapshotQualityError, match="production source set"):
+        build_candidate_snapshot(
+            records=remaining_records,
+            previous=None,
+            output_root=tmp_path,
+            snapshot_id=f"missing-production-{removed_source.lower()}",
+            coverage=FAST_TEST_COVERAGE,
+            source_provenance=bound,
+            school_count_reconciliation=reconciliation,
+        )
+
+    assert not any(tmp_path.glob(".*.candidate"))
+
+
+# Production break caught: an allowlisted-looking fourth source escaping review
+# because candidate completeness only compares provenance with supplied records.
+def test_candidate_rejects_an_extra_production_source(tmp_path: Path) -> None:
+    profile, benchmark, records, provenance = reviewed_production_fixture()
+    extra = replace(
+        next(record for record in records if record.source == "SEN_REVIEWED_CSV"),
+        institution_id="extra:unreviewed",
+        source="EXTRA_REVIEWED_CSV",
+        source_region_code="SEOUL",
+    )
+    extra_provenance = replace(
+        provenance["SEN_REVIEWED_CSV"],
+        source="EXTRA_REVIEWED_CSV",
+        normalized_sha256=normalized_records_sha256((extra,)),
+        row_count=1,
+        fetched_row_count=1,
+        source_observation_date_counts=((extra.source_as_of, 1),),
+        normalized_observation_date_counts=((extra.source_as_of, 1),),
+    )
+    bound = sync_module.bind_school_count_population_profile(
+        {**provenance, extra_provenance.source: extra_provenance},
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        tuple(
+            record
+            for record in records
+            if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+        ),
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    with pytest.raises(SnapshotQualityError, match="production source set"):
+        build_candidate_snapshot(
+            records=(*records, extra),
+            previous=None,
+            output_root=tmp_path,
+            snapshot_id="extra-production-source",
+            coverage=FAST_TEST_COVERAGE,
+            source_provenance=bound,
+            school_count_reconciliation=reconciliation,
+        )
+
+    assert not (tmp_path / ".extra-production-source.candidate").exists()
+
+
 # Production break caught: an attacker who can rewrite public snapshot metadata
 # and re-sign the transaction can alter the reviewed population after digest review.
 def test_final_approval_replays_population_and_reconciliation_before_pointer_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    profile, benchmark, records, provenance = reviewed_population_fixture()
+    profile, benchmark, records, provenance = reviewed_production_fixture()
     bound = sync_module.bind_school_count_population_profile(
         provenance,
         profile=profile,
@@ -270,6 +369,7 @@ def test_final_approval_replays_population_and_reconciliation_before_pointer_wri
     with pytest.raises(SnapshotQualityError, match="schema"):
         sync_module._validate_unapproved_manifest_schema(tampered)
     assert (pointer.read_bytes() if pointer.exists() else None) == original_pointer
+
 
     sync_module._write_json(manifest_path, original_manifest)
     resign_candidate(candidate, tmp_path)
@@ -375,6 +475,64 @@ def test_final_approval_replays_population_and_reconciliation_before_pointer_wri
         coverage=FAST_TEST_COVERAGE,
     )
     assert replayed_digest == idempotent_digest == reviewed_digest
+
+
+# Production break caught: removing the complete reviewed SEN source, updating all
+# public hashes, and re-attesting the transaction can otherwise preserve the old
+# pointer relationship while publishing a two-source production snapshot.
+def test_re_attested_source_removal_is_rejected_without_pointer_change(
+    tmp_path: Path,
+) -> None:
+    baseline = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="complete-source-baseline",
+        include_reviewed_sen=True,
+    )
+    promote_snapshot(baseline, tmp_path, coverage=FAST_TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    candidate = build_reviewed_population_candidate(
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="source-removal-candidate",
+        include_reviewed_sen=True,
+    )
+    remove_candidate_source(
+        candidate,
+        tmp_path,
+        source="SEN_REVIEWED_CSV",
+    )
+
+    with pytest.raises(SnapshotQualityError, match="production source set"):
+        sync_module.build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=FAST_TEST_COVERAGE,
+        )
+
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+    assert verify_snapshot(tmp_path).manifest.snapshot_id == baseline.snapshot_id
+
+
+# Production break caught: persisted verification trusting a valid data-steward
+# manifest after one complete production source and its records are removed.
+def test_snapshot_verification_rejects_missing_production_source(
+    tmp_path: Path,
+) -> None:
+    candidate = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="verify-complete-source-set",
+        include_reviewed_sen=True,
+    )
+    promote_snapshot(candidate, tmp_path, coverage=FAST_TEST_COVERAGE)
+    remove_snapshot_source(
+        tmp_path / candidate.snapshot_id,
+        source="SEN_REVIEWED_CSV",
+    )
+
+    with pytest.raises(SnapshotIntegrityError, match="production source set"):
+        verify_snapshot(tmp_path)
 
 
 # Production break caught: the narrow test-fixture identity exception must not
@@ -1363,30 +1521,14 @@ def test_sen_multisite_parser_rejects_duplicate_or_second_default(
 def test_unresolved_sen_main_and_branch_are_both_persisted_for_review(
     tmp_path: Path,
 ) -> None:
-    result = SenCsvSource(
-        SOURCE_RESOURCES / "sen-institutions.csv",
-        expected_type_counts={
-            "HEADQUARTERS": 1,
-            "DISTRICT_OFFICE": 11,
-            "DIRECT_AGENCY": 8,
-            "LIFELONG_LEARNING_CENTER": 4,
-            "LIBRARY": 17,
-        },
-    ).load()
-
-    candidate = build_candidate_snapshot(
-        records=result.records,
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="unresolved-sen-multisite",
         coverage=TEST_COVERAGE,
-        source_provenance={result.provenance.source: result.provenance},
-        school_count_reconciliation=reviewed_reconciliation_contract(),
     )
 
-    assert candidate.issues == (
-        "coordinate validation success rate is below 98 percent",
-    )
+    assert candidate.issues == ()
     institutions = [
         json.loads(line)
         for line in (candidate.candidate_path / "institutions.jsonl")
@@ -1521,56 +1663,49 @@ def test_reviewed_sen_multisite_survives_snapshot_and_store(
 def test_reviewed_sen_provenance_is_accepted_by_candidate_builder(
     tmp_path: Path,
 ) -> None:
-    result = SenCsvSource(
-        SOURCE_RESOURCES / "sen-institutions.csv",
-        expected_type_counts={
-            "HEADQUARTERS": 1,
-            "DISTRICT_OFFICE": 11,
-            "DIRECT_AGENCY": 8,
-            "LIFELONG_LEARNING_CENTER": 4,
-            "LIBRARY": 17,
-        },
-    ).load()
-
-    candidate = build_candidate_snapshot(
-        records=result.records,
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="sen-provenance-contract",
         coverage=TEST_COVERAGE,
-        source_provenance={result.provenance.source: result.provenance},
-        school_count_reconciliation=reviewed_reconciliation_contract(),
     )
 
-    assert candidate.issues == (
-        "coordinate validation success rate is below 98 percent",
-    )
+    assert candidate.issues == ()
 
 
 def test_reviewed_sen_provenance_rejects_valid_looking_wrong_raw_digest(
     tmp_path: Path,
 ) -> None:
-    result = SenCsvSource(
-        SOURCE_RESOURCES / "sen-institutions.csv",
-        expected_type_counts={
-            "HEADQUARTERS": 1,
-            "DISTRICT_OFFICE": 11,
-            "DIRECT_AGENCY": 8,
-            "LIFELONG_LEARNING_CENTER": 4,
-            "LIBRARY": 17,
-        },
-    ).load()
-    forged = replace(result.provenance, raw_sha256="f" * 64)
+    profile, benchmark, records, provenance = reviewed_production_fixture()
+    provenance["SEN_REVIEWED_CSV"] = replace(
+        provenance["SEN_REVIEWED_CSV"],
+        raw_sha256="f" * 64,
+    )
+    bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        tuple(
+            record
+            for record in records
+            if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+        ),
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
 
     with pytest.raises(SnapshotQualityError, match="source provenance"):
         build_candidate_snapshot(
-            records=result.records,
+            records=records,
             previous=None,
             output_root=tmp_path,
             snapshot_id="sen-wrong-raw-digest",
             coverage=TEST_COVERAGE,
-            source_provenance={forged.source: forged},
-            school_count_reconciliation=reviewed_reconciliation_contract(),
+            source_provenance=bound,
+            school_count_reconciliation=reconciliation,
         )
 
 
@@ -2471,7 +2606,8 @@ def test_review_packet_is_deterministic_and_only_contains_safe_aggregates(
             "2026-04-23": 1_412,
             "2026-05-17": 1,
             "2026-06-07": 1,
-        }
+        },
+        "SEN_REVIEWED_CSV": {"2026-08-10": 41},
     }
     assert isinstance(first["reviewDigest"], str)
     assert re.fullmatch(r"[0-9a-f]{64}", first["reviewDigest"])
@@ -6412,7 +6548,7 @@ def build_reviewed_population_candidate(
     coverage: CoverageService = FAST_TEST_COVERAGE,
     neis_observation_dates: tuple[str, ...] | None = None,
     neis_raw_observation_date_counts: tuple[tuple[str, int], ...] | None = None,
-    include_reviewed_sen: bool = False,
+    include_reviewed_sen: bool = True,
     cross_source_match: bool = False,
 ) -> SnapshotBuildResult:
     profile, benchmark, records, provenance = reviewed_population_fixture()
@@ -6773,6 +6909,65 @@ def resign_candidate(candidate: SnapshotBuildResult, snapshot_root: Path) -> Non
         transaction,
         replace_existing=True,
     )
+
+
+def remove_candidate_source(
+    candidate: SnapshotBuildResult,
+    snapshot_root: Path,
+    *,
+    source: str,
+) -> None:
+    remove_snapshot_source(candidate.candidate_path, source=source)
+    resign_candidate(candidate, snapshot_root)
+
+
+def remove_snapshot_source(snapshot_path: Path, *, source: str) -> None:
+    institution_path = snapshot_path / "institutions.jsonl"
+    site_path = snapshot_path / "sites.jsonl"
+    manifest_path = snapshot_path / "manifest.json"
+    institutions = [
+        Institution.model_validate_json(line)
+        for line in institution_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["source"] != source
+    ]
+    kept_ids = {institution.institution_id for institution in institutions}
+    sites = [
+        InstitutionSite.model_validate_json(line)
+        for line in site_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["institutionId"] in kept_ids
+    ]
+    institution_bytes = sync_module._jsonl_bytes(institutions)
+    site_bytes = sync_module._jsonl_bytes(sites)
+    institution_path.write_bytes(institution_bytes)
+    site_path.write_bytes(site_bytes)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sources"] = [
+        entry for entry in manifest["sources"] if entry["source"] != source
+    ]
+    manifest["institutionsSha256"] = hashlib.sha256(institution_bytes).hexdigest()
+    manifest["sitesSha256"] = hashlib.sha256(site_bytes).hexdigest()
+    manifest["institutionCount"] = len(institutions)
+    manifest["siteCount"] = len(sites)
+    manifest["quarantinedCount"] = sum(
+        institution.status is InstitutionStatus.REVIEW_REQUIRED
+        for institution in institutions
+    )
+    manifest["countsByType"] = dict(
+        Counter(institution.institution_type for institution in institutions)
+    )
+    manifest["countsByFoundation"] = dict(
+        Counter(institution.foundation_type for institution in institutions)
+    )
+    manifest["countsByStatus"] = dict(
+        Counter(institution.status.value for institution in institutions)
+    )
+    manifest["coordinateQualityCounts"] = dict(
+        Counter(site.coordinate_quality for site in sites)
+    )
+    possible_matches = sync_module._persisted_possible_matches(institutions, sites)
+    manifest["possibleMatchCount"] = len(possible_matches)
+    manifest["possibleMatches"] = possible_matches
+    sync_module._write_json(manifest_path, manifest)
 
 
 def quarantined_neis_records(prefix: str) -> tuple[SourceInstitutionRecord, ...]:

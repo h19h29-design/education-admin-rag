@@ -11,6 +11,8 @@ from typing import TypeVar
 from pydantic import BaseModel, ValidationError
 
 from app.institutions.models import (
+    PRODUCTION_INSTITUTION_SOURCES,
+    TEST_FIXTURE_INSTITUTION_SOURCES,
     Institution,
     InstitutionSite,
     InstitutionStatus,
@@ -422,6 +424,7 @@ def _verify_records(
     institutions: tuple[Institution, ...],
     sites: tuple[InstitutionSite, ...],
 ) -> None:
+    _verify_exact_source_contract(manifest)
     if len(institutions) != manifest.institution_count:
         raise SnapshotIntegrityError(
             "institutionCount does not match institutions.jsonl row count"
@@ -524,6 +527,27 @@ def _verify_records(
     _verify_source_counts(manifest, institutions)
     _verify_school_count_reconciliation(manifest, institutions)
     _verify_possible_matches(manifest, institution_ids)
+
+
+def _verify_exact_source_contract(manifest: SnapshotManifest) -> None:
+    source_names = {source.source for source in manifest.sources}
+    production_contract = (
+        len(manifest.sources) == len(PRODUCTION_INSTITUTION_SOURCES)
+        and source_names == PRODUCTION_INSTITUTION_SOURCES
+        and manifest.approved_by_role == "data-steward"
+        and manifest.school_count_reconciliation is not None
+    )
+    test_fixture_contract = (
+        len(manifest.sources) == 1
+        and source_names == TEST_FIXTURE_INSTITUTION_SOURCES
+        and manifest.approved_by_role == "TEST_FIXTURE_REVIEWER"
+        and manifest.school_count_reconciliation is None
+    )
+    if not (production_contract or test_fixture_contract):
+        raise SnapshotIntegrityError(
+            "manifest must use the exact production source set or exact "
+            "synthetic test fixture"
+        )
 
 
 def _verify_possible_matches(

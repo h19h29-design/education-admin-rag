@@ -13,6 +13,7 @@ from app.institutions.sources.school_count_profile import (
     SchoolCountPopulationProfile,
     load_school_count_population_profile,
 )
+from app.institutions.sources.sen import SenCsvSource
 from app.institutions.sources.sen_counts import (
     ReviewedSchoolCounts,
     load_reviewed_school_counts,
@@ -141,3 +142,32 @@ def reviewed_population_fixture() -> tuple[
         ),
     }
     return profile, benchmark, record_tuple, provenance
+
+
+def reviewed_production_fixture() -> tuple[
+    SchoolCountPopulationProfile,
+    ReviewedSchoolCounts,
+    tuple[SourceInstitutionRecord, ...],
+    dict[str, SourceProvenance],
+]:
+    """Return the exact three-source production candidate input contract."""
+
+    profile, benchmark, population_records, provenance = (
+        reviewed_population_fixture()
+    )
+    sen = SenCsvSource(
+        SOURCE_RESOURCES / "sen-institutions.csv",
+        expected_type_counts={
+            "HEADQUARTERS": 1,
+            "DISTRICT_OFFICE": 11,
+            "DIRECT_AGENCY": 8,
+            "LIFELONG_LEARNING_CENTER": 4,
+            "LIBRARY": 17,
+        },
+    ).load()
+    return (
+        profile,
+        benchmark,
+        (*population_records, *sen.records),
+        {**provenance, sen.provenance.source: sen.provenance},
+    )

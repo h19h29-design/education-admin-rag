@@ -61,6 +61,10 @@ _SCHOOL_COUNT_CATEGORY_RESULTS = {
     "MISC_SCHOOL": (18, 22, 4),
     "SPECIAL_SCHOOL": (32, 32, 0),
 }
+PRODUCTION_INSTITUTION_SOURCES = frozenset(
+    {"NEIS", "KINDERGARTEN_INFO", "SEN_REVIEWED_CSV"}
+)
+TEST_FIXTURE_INSTITUTION_SOURCES = frozenset({"TEST_NEIS"})
 
 
 class InstitutionStatus(StrEnum):
@@ -764,7 +768,8 @@ class SnapshotManifest(_StrictManifestContractModel):
             raise ValueError("sources must be nonempty")
         source_names = {source.source for source in self.sources}
         test_fixture_exception = (
-            source_names == {"TEST_NEIS"}
+            len(self.sources) == 1
+            and source_names == TEST_FIXTURE_INSTITUTION_SOURCES
             and self.approved_by_role == "TEST_FIXTURE_REVIEWER"
             and self.school_count_reconciliation is None
             and all(
@@ -774,11 +779,19 @@ class SnapshotManifest(_StrictManifestContractModel):
                 for source in self.sources
             )
         )
-        if self.school_count_reconciliation is None and not test_fixture_exception:
-            raise ValueError("schoolCountReconciliation is required")
-        if source_names & set(_SOURCE_POPULATION_ROLE_COUNTS):
-            if self.school_count_reconciliation is None:
-                raise ValueError("production school sources require reconciliation")
+        production_contract = (
+            len(self.sources) == len(PRODUCTION_INSTITUTION_SOURCES)
+            and source_names == PRODUCTION_INSTITUTION_SOURCES
+            and self.approved_by_role == "data-steward"
+            and self.school_count_reconciliation is not None
+        )
+        if not (test_fixture_exception or production_contract):
+            raise ValueError(
+                "manifest must use the exact production source set or exact "
+                "synthetic test fixture"
+            )
+        if production_contract:
+            assert self.school_count_reconciliation is not None
             manifest_sources = {source.source: source for source in self.sources}
             for source_name, summary in self.school_count_reconciliation.sources.items():
                 source = manifest_sources.get(source_name)

@@ -16,6 +16,7 @@ from typing import TypeGuard, TypeVar, cast
 from pydantic import BaseModel, ValidationError
 
 from app.institutions.models import (
+    PRODUCTION_INSTITUTION_SOURCES,
     Institution,
     InstitutionSite,
     InstitutionStatus,
@@ -246,6 +247,9 @@ class SnapshotBuildResult:
 
 _POPULATION_SOURCES = frozenset({"NEIS", "KINDERGARTEN_INFO"})
 _POPULATION_MISMATCH = "source population profile does not match fetched data"
+_PRODUCTION_SOURCE_SET_MISMATCH = (
+    "candidate must contain the exact production source set"
+)
 _REVIEWED_POPULATION_PROFILE_SHA256 = (
     "e904a254ab4f0fa264a0ec3894827e6bebbb2b94ab263bf635594c812dd7df06"
 )
@@ -630,6 +634,8 @@ def _validate_bound_school_count_reconciliation(
     value: Mapping[str, object],
     source_provenance: Mapping[str, SourceProvenance],
 ) -> dict[str, object]:
+    if set(source_provenance) != PRODUCTION_INSTITUTION_SOURCES:
+        raise SnapshotQualityError(_PRODUCTION_SOURCE_SET_MISMATCH)
     if type(value) is not dict:
         raise SnapshotQualityError("school count reconciliation is invalid")
     try:
@@ -998,11 +1004,14 @@ def build_candidate_snapshot(
     if duplicate_ids:
         raise SnapshotQualityError("duplicate source ID")
     issues: list[str] = []
+    record_sources = {record.source for record in records}
+    if not record_sources.issubset(PRODUCTION_INSTITUTION_SOURCES):
+        raise SnapshotQualityError(_PRODUCTION_SOURCE_SET_MISMATCH)
     for record in records:
         _validate_source_record(record)
     if source_provenance is None:
         raise SnapshotQualityError("source provenance is required")
-    expected_sources = {record.source for record in records}
+    expected_sources = record_sources
     if set(source_provenance) != expected_sources:
         raise SnapshotQualityError("source provenance does not match record sources")
     if any(
@@ -1019,6 +1028,8 @@ def build_candidate_snapshot(
             provenance,
             current_by_source[source_name],
         )
+    if expected_sources != PRODUCTION_INSTITUTION_SOURCES:
+        raise SnapshotQualityError(_PRODUCTION_SOURCE_SET_MISMATCH)
     canonical_reconciliation = _validate_bound_school_count_reconciliation(
         school_count_reconciliation,
         source_provenance,
@@ -3220,6 +3231,16 @@ def _recheck_production_source_provenance(
     source_entries = manifest.get("sources")
     if type(source_entries) is not list:
         raise SnapshotQualityError("candidate source provenance is invalid")
+    source_names = {
+        entry.get("source")
+        for entry in source_entries
+        if type(entry) is dict and type(entry.get("source")) is str
+    }
+    if (
+        len(source_entries) != len(PRODUCTION_INSTITUTION_SOURCES)
+        or source_names != PRODUCTION_INSTITUTION_SOURCES
+    ):
+        raise SnapshotQualityError(_PRODUCTION_SOURCE_SET_MISMATCH)
     by_source: dict[str, list[Institution]] = defaultdict(list)
     for institution in institutions:
         by_source[institution.source].append(institution)
@@ -3319,8 +3340,8 @@ def _recheck_school_count_reconciliation(
     source_names = {
         entry.get("source") for entry in source_entries if type(entry) is dict
     }
-    if not source_names & _POPULATION_SOURCES:
-        return
+    if source_names != PRODUCTION_INSTITUTION_SOURCES:
+        raise SnapshotQualityError(_PRODUCTION_SOURCE_SET_MISMATCH)
     entries = {
         entry.get("source"): entry
         for entry in source_entries
@@ -3649,6 +3670,7 @@ def _persisted_possible_matches(
 
 
 def _validate_unapproved_manifest_schema(manifest: dict[str, object]) -> None:
+    _require_manifest_source_contract(manifest)
     if (
         manifest.get("approved") is not False
         or manifest.get("approvedAt") is not None
@@ -3672,6 +3694,7 @@ def _validate_unapproved_manifest_schema(manifest: dict[str, object]) -> None:
 
 
 def _validate_approved_manifest_schema(manifest: dict[str, object]) -> None:
+    _require_manifest_source_contract(manifest)
     try:
         parsed = SnapshotManifest.model_validate_json(
             json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
@@ -3687,11 +3710,29 @@ def _validate_approved_manifest_schema(manifest: dict[str, object]) -> None:
         raise SnapshotQualityError("approved manifest role is invalid")
 
 
+def _require_manifest_source_contract(manifest: Mapping[str, object]) -> None:
+    if _is_test_fixture_manifest(manifest):
+        return
+    sources = manifest.get("sources")
+    if type(sources) is not list:
+        raise SnapshotQualityError(_PRODUCTION_SOURCE_SET_MISMATCH)
+    source_names = {
+        source.get("source")
+        for source in sources
+        if type(source) is dict and type(source.get("source")) is str
+    }
+    if (
+        len(sources) != len(PRODUCTION_INSTITUTION_SOURCES)
+        or source_names != PRODUCTION_INSTITUTION_SOURCES
+    ):
+        raise SnapshotQualityError(_PRODUCTION_SOURCE_SET_MISMATCH)
+
+
 def _is_test_fixture_manifest(manifest: Mapping[str, object]) -> bool:
     sources = manifest.get("sources")
     return (
         type(sources) is list
-        and bool(sources)
+        and len(sources) == 1
         and manifest.get("schoolCountReconciliation") is None
         and all(
             type(source) is dict
