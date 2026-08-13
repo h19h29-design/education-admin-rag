@@ -54,7 +54,7 @@ _SEN_COUNTS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build and atomically promote a Seoul education institution snapshot."
+        description="Build a Seoul education institution snapshot candidate for review."
     )
     parser.add_argument(
         "--sen-csv",
@@ -134,6 +134,7 @@ async def _run_with_keys(
         args.school_count_population_profile,
         unclassified_policy=policy,
     )
+    benchmark = load_reviewed_school_counts(args.school_counts)
     timeout = httpx.Timeout(5.0, connect=2.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
         neis_source = NeisSource(
@@ -163,7 +164,6 @@ async def _run_with_keys(
             neis_result.records,
             standard_result.locations,
         )
-        benchmark = load_reviewed_school_counts(args.school_counts)
         all_records = (
             neis_records + kindergarten_result.records + sen_result.records
         )

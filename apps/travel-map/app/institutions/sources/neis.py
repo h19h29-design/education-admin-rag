@@ -283,7 +283,7 @@ def _parse_row(
         raw_kind = _required_school_kind_label(row)
         if raw_kind in _INSTITUTION_TYPES:
             institution_type = _INSTITUTION_TYPES[raw_kind]
-            source_kind_label = None
+            source_kind_label = raw_kind
         elif unclassified_policy is not None and raw_kind in unclassified_policy.labels:
             institution_type = "UNCLASSIFIED_SCHOOL"
             source_kind_label = raw_kind

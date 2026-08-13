@@ -2,6 +2,7 @@ import argparse
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -1731,6 +1732,69 @@ def test_population_reconciliation_uses_exact_reviewed_signed_variances() -> Non
     assert reconciliation["passed"] is True
 
 
+# Production break caught: the synthetic profile fixture carried raw NEIS kind
+# labels that the real parser discarded, making an exact live population look
+# like source drift before candidate creation.
+def test_parsed_neis_population_reconciles_the_exact_reviewed_aggregates() -> None:
+    profile, benchmark, fixture_records, provenance = reviewed_population_fixture()
+    raw_neis_labels = tuple(
+        row.source_category
+        for row in profile.rows
+        if row.source == "NEIS"
+        for _ in range(row.observed_count)
+    )
+    parsed_neis = parse_neis_rows(
+        neis_payload_rows(*raw_neis_labels),
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+    kindergarten = tuple(
+        record
+        for record in fixture_records
+        if record.source == "KINDERGARTEN_INFO"
+    )
+    records = (*parsed_neis, *kindergarten)
+    bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+
+    reconciliation = reconcile_selectable_school_counts(
+        records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    assert len(raw_neis_labels) == 1_415
+    assert len(parsed_neis) == 1_414
+    assert len(kindergarten) == 706
+    assert Counter(record.institution_type for record in parsed_neis) == {
+        "ELEMENTARY_SCHOOL": 610,
+        "HIGH_SCHOOL": 324,
+        "MIDDLE_SCHOOL": 391,
+        "MISC_SCHOOL": 39,
+        "SPECIAL_SCHOOL": 32,
+        "UNCLASSIFIED_SCHOOL": 18,
+    }
+    assert validate_unclassified_school_counts(
+        parsed_neis,
+        REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    ) == dict(REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts)
+    assert reconciliation["passed"] is True
+    assert {
+        name: category["status"]
+        for name, category in reconciliation["categories"].items()
+    } == {
+        "ELEMENTARY_SCHOOL": "REVIEWED_VARIANCE",
+        "HIGH_SCHOOL": "MATCHED",
+        "KINDERGARTEN": "REVIEWED_VARIANCE",
+        "MIDDLE_SCHOOL": "MATCHED",
+        "MISC_SCHOOL": "REVIEWED_VARIANCE",
+        "SPECIAL_SCHOOL": "MATCHED",
+    }
+
+
 def test_population_profile_binding_preserves_unrelated_sen_provenance() -> None:
     profile, _, _, provenance = reviewed_population_fixture()
     sen = source_provenance_for(
@@ -2839,10 +2903,9 @@ def test_preflight_audit_boundary_rejects_unreviewed_shapes_without_echo(
 
 
 @pytest.mark.asyncio
-async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
+async def test_population_profile_cli_reconciliation_failure_flushes_before_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     script_path = Path("apps/travel-map/scripts/sync-institutions.py")
     spec = importlib.util.spec_from_file_location("sync_institutions_cli", script_path)
@@ -2860,6 +2923,14 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
         for record in drifted_records
         if record.source == "KINDERGARTEN_INFO"
     )
+    cleared_holders: list[str] = []
+
+    class FlushTrackingBuffer(io.StringIO):
+        flush_count = 0
+
+        def flush(self) -> None:
+            self.flush_count += 1
+            super().flush()
 
     class FakeAsyncClient:
         def __init__(self, **_kwargs: object) -> None:
@@ -2872,21 +2943,29 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
             return None
 
     class FakeNeisSource:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
+        def __init__(self, *, api_key: str, **_kwargs: object) -> None:
+            self.api_key = api_key
 
         async def fetch(self) -> SourceFetchResult:
             return SourceFetchResult(neis_records, provenance["NEIS"])
 
+        def clear_credentials(self) -> None:
+            self.api_key = ""
+            cleared_holders.append("NEIS")
+
     class FakeKindergartenSource:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
+        def __init__(self, *, api_key: str, **_kwargs: object) -> None:
+            self.api_key = api_key
 
         async def fetch(self) -> SourceFetchResult:
             return SourceFetchResult(
                 kindergarten_records,
                 provenance["KINDERGARTEN_INFO"],
             )
+
+        def clear_credentials(self) -> None:
+            self.api_key = ""
+            cleared_holders.append("KINDERGARTEN_INFO")
 
     class FakeStandardSource:
         def __init__(self, **_kwargs: object) -> None:
@@ -2912,6 +2991,11 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
     monkeypatch.setattr(module, "KakaoLocalClient", ForbiddenKakaoClient)
     monkeypatch.setattr(module, "build_candidate_snapshot", forbidden_candidate)
     snapshot_root = tmp_path / "snapshots"
+    keys = {
+        "NEIS_API_KEY": "NEIS_CREDENTIAL_SENTINEL",
+        "KINDERGARTEN_API_KEY": "KINDERGARTEN_CREDENTIAL_SENTINEL",
+        "KAKAO_REST_API_KEY": "KAKAO_CREDENTIAL_SENTINEL",
+    }
     args = argparse.Namespace(
         sen_csv=SOURCE_RESOURCES / "sen-institutions.csv",
         region_codes=SOURCE_RESOURCES / "kindergarten-region-codes.csv",
@@ -2928,23 +3012,19 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
         snapshot_id="must-not-build",
     )
 
-    with pytest.raises(
-        SnapshotQualityError,
-        match="official school count reconciliation failed",
-    ):
-        await module._run_with_keys(
-            args,
-            {
-                "NEIS_API_KEY": "neis-test",
-                "KINDERGARTEN_API_KEY": "kindergarten-test",
-                "KAKAO_REST_API_KEY": "kakao-test",
-            },
-            [],
-        )
+    audit_output = FlushTrackingBuffer()
+    with monkeypatch.context() as stdout_patch:
+        stdout_patch.setattr(sys, "stdout", audit_output)
+        with pytest.raises(
+            SnapshotQualityError,
+            match="official school count reconciliation failed",
+        ):
+            await module.run(args, keys)
 
-    output = capsys.readouterr()
-    assert len(output.out.splitlines()) == 1
-    audit = json.loads(output.out)
+    output = audit_output.getvalue()
+    assert audit_output.flush_count >= 1
+    assert len(output.splitlines()) == 1
+    audit = json.loads(output)
     assert audit["auditStage"] == "PRE_PROMOTION_RECONCILIATION"
     assert audit["reconciliation"]["passed"] is False
     assert audit["passed"] is False
@@ -2956,12 +3036,18 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
         "MISC_SCHOOL",
         "SPECIAL_SCHOOL",
     }
-    assert "SECRET_RAW_LABEL" not in output.out
-    assert "SECRET_RAW_LABEL" not in output.err
+    assert "SECRET_RAW_LABEL" not in output
+    assert "CREDENTIAL_SENTINEL" not in output
+    assert cleared_holders == ["NEIS", "KINDERGARTEN_INFO"]
+    assert keys == {
+        "NEIS_API_KEY": "",
+        "KINDERGARTEN_API_KEY": "",
+        "KAKAO_REST_API_KEY": "",
+    }
     assert not snapshot_root.exists()
 
 
-def test_sync_cli_defaults_to_the_reviewed_neis_unclassified_policy(
+def test_sync_cli_defaults_to_reviewed_population_profile_and_neis_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     script_path = Path("apps/travel-map/scripts/sync-institutions.py")
@@ -2982,7 +3068,7 @@ def test_sync_cli_defaults_to_the_reviewed_neis_unclassified_policy(
 
 
 @pytest.mark.asyncio
-async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
+async def test_population_profile_cli_stops_at_candidate_review_without_promotion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -2996,17 +3082,25 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert not hasattr(module, "promote_snapshot")
+    assert not hasattr(module, "approve_candidate_snapshot")
 
     neis_records = (source_record(),)
     neis_provenance = source_provenance_for(neis_records)["NEIS"]
-    loaded_policy = False
-    loaded_profile = False
+    observed_order: list[str] = []
     population_calls: list[str] = []
+    bound_sources: set[str] = set()
+    bound_provenance: Mapping[str, SourceProvenance] | None = None
+    candidate_kwargs: dict[str, object] = {}
+    reconciliation = {
+        "passed": True,
+        "unclassifiedSchoolKindCounts": dict(
+            REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
+        ),
+    }
 
     class FakeAsyncClient:
         def __init__(self, **_kwargs: object) -> None:
-            assert loaded_policy, "policy must load before network clients"
-            assert loaded_profile, "population profile must load before network clients"
+            observed_order.append("open-http-client")
 
         async def __aenter__(self) -> object:
             return self
@@ -3058,7 +3152,7 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
 
     class FakeKakaoClient:
         def __init__(self, **_kwargs: object) -> None:
-            pass
+            assert population_calls == ["bind", "reconcile"]
 
         def clear_credentials(self) -> None:
             pass
@@ -3085,6 +3179,7 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
     snapshot_id = "candidate-only-cli"
 
     def fake_build_candidate_snapshot(**_kwargs: object) -> SnapshotBuildResult:
+        candidate_kwargs.update(_kwargs)
         snapshot_root.mkdir()
         candidate_path = snapshot_root / f".{snapshot_id}.candidate"
         candidate_path.mkdir()
@@ -3112,11 +3207,10 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
     monkeypatch.setattr(module, "KakaoLocalClient", FakeKakaoClient)
     monkeypatch.setattr(module, "geocode_missing_records", identity_records)
     def load_policy(path: Path) -> NeisUnclassifiedPolicy:
-        nonlocal loaded_policy
         assert path == (
             SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
         )
-        loaded_policy = True
+        observed_order.append("load-unclassified-policy")
         return REVIEWED_NEIS_UNCLASSIFIED_POLICY
 
     monkeypatch.setattr(
@@ -3125,11 +3219,14 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
         load_policy,
         raising=False,
     )
-    monkeypatch.setattr(
-        module,
-        "load_reviewed_school_counts",
-        lambda _path: object(),
-    )
+    benchmark = object()
+
+    def load_benchmark(path: Path) -> object:
+        assert path == tmp_path / "counts.csv"
+        observed_order.append("load-school-count-benchmark")
+        return benchmark
+
+    monkeypatch.setattr(module, "load_reviewed_school_counts", load_benchmark)
     real_profile_loader = module.load_school_count_population_profile
 
     def load_profile(
@@ -3137,10 +3234,9 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
         *,
         unclassified_policy: NeisUnclassifiedPolicy,
     ) -> SchoolCountPopulationProfile:
-        nonlocal loaded_profile
         assert path == SOURCE_RESOURCES / "school-count-population-profile.csv"
         assert unclassified_policy is REVIEWED_NEIS_UNCLASSIFIED_POLICY
-        loaded_profile = True
+        observed_order.append("load-population-profile")
         return real_profile_loader(path, unclassified_policy=unclassified_policy)
 
     def bind_population(
@@ -3148,10 +3244,12 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
         *,
         profile: SchoolCountPopulationProfile,
     ) -> Mapping[str, SourceProvenance]:
-        assert loaded_profile
+        nonlocal bound_provenance
         assert profile.sha256 == PINNED_POPULATION_PROFILE_SHA256
+        bound_sources.update(provenance)
         population_calls.append("bind")
-        return provenance
+        bound_provenance = dict(provenance)
+        return bound_provenance
 
     monkeypatch.setattr(module, "load_school_count_population_profile", load_profile)
     monkeypatch.setattr(
@@ -3174,17 +3272,16 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
     ) -> dict[str, object]:
         assert unclassified_policy is REVIEWED_NEIS_UNCLASSIFIED_POLICY
         assert population_profile.sha256 == PINNED_POPULATION_PROFILE_SHA256
+        assert source_provenance is bound_provenance
         assert set(source_provenance) == {
             "NEIS",
             "KINDERGARTEN_INFO",
             "SEN_REVIEWED_CSV",
         }
         assert population_calls == ["bind"]
+        assert _kwargs["benchmark"] is benchmark
         population_calls.append("reconcile")
-        return {
-            "passed": True,
-            "unclassifiedSchoolKindCounts": dict(unclassified_policy.counts),
-        }
+        return reconciliation
 
     monkeypatch.setattr(module, "reconcile_selectable_school_counts", reconcile)
     monkeypatch.setattr(
@@ -3238,6 +3335,15 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
     assert (snapshot_root / ".candidate-only-cli.candidate").is_dir()
     assert not (snapshot_root / "current.json").exists()
     assert population_calls == ["bind", "reconcile"]
+    assert observed_order[:3] == [
+        "load-unclassified-policy",
+        "load-population-profile",
+        "load-school-count-benchmark",
+    ]
+    assert observed_order[3] == "open-http-client"
+    assert {"NEIS", "KINDERGARTEN_INFO"}.issubset(bound_sources)
+    assert candidate_kwargs["source_provenance"] is bound_provenance
+    assert candidate_kwargs["school_count_reconciliation"] is reconciliation
 
 
 @pytest.mark.parametrize(

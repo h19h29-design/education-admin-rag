@@ -85,6 +85,42 @@ Release remains blocked until step 3 publishes the independently reviewed
 digest. A missing or invalid approved snapshot is a release blocker, never
 permission to substitute a sample catalog.
 
+### Temporary school-count variance review (administrators only)
+
+The temporary population profile exists because the official preliminary
+school-count table and the live source disclosures have different observation
+dates and populations. It makes those differences explicit and reviewable; it
+must not be used to silently redefine the official benchmark. The pinned source
+contract is 1,415 NEIS rows fetched, 1,414 NEIS rows normalized, and 706
+kindergarten rows for disclosure timing `20261` as of `2026-04-01`.
+
+The six reviewed comparisons below use signed `actual - expected` differences:
+
+| Category | Official expected | Profile actual | Signed difference |
+| --- | ---: | ---: | ---: |
+| Elementary school | 609 | 610 | +1 |
+| Middle school | 390 | 390 | 0 |
+| High school | 319 | 319 | 0 |
+| Special school | 32 | 32 | 0 |
+| Miscellaneous school | 18 | 22 | +4 |
+| Kindergarten | 724 | 706 | -18 |
+
+Broadcast middle/high schools and foreign schools remain in the normalized
+catalog as supplementary populations, but they are not added to the benchmark
+actuals above. The 18 lifelong-school rows remain quarantined pending official
+classification. The single joint workshop row is nonselectable and excluded
+from the normalized NEIS population.
+
+For every candidate, run the sync, inspect the emitted
+`PRE_PROMOTION_RECONCILIATION`, generate and inspect the credential-free review
+packet, and only then pass that exact packet digest to the separate approval
+command as a `data-steward`. Synchronization itself never approves or updates
+`current.json`. Do not change the population profile unless there is new
+official evidence, a design review, passing tests, and explicit `data-steward`
+approval. General-user instructions and public UI copy must not expose internal
+population labels, quarantined identifiers, provenance hashes, or credentials;
+these details belong only in the administrator review workflow.
+
 ### NEIS lifelong-school quarantine review
 
 The sync command loads the reviewed NEIS quarantine policy from

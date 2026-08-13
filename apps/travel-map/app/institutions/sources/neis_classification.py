@@ -175,14 +175,15 @@ def validate_unclassified_school_counts(
     labels = [
         record.source_kind_label
         for record in records
-        if record.source_kind_label is not None
+        if record.institution_type == "UNCLASSIFIED_SCHOOL"
+        and record.source_kind_label is not None
     ]
     if any(
-        record.institution_type != "UNCLASSIFIED_SCHOOL"
+        record.source_kind_label is None
         for record in records
-        if record.source_kind_label is not None
+        if record.institution_type == "UNCLASSIFIED_SCHOOL"
     ):
-        raise SourceDataError("NEIS unclassified rows must use the quarantine type")
+        raise SourceDataError("NEIS unclassified rows must retain their source label")
     actual = Counter(labels)
     if set(actual) != policy.labels or dict(actual) != dict(policy.counts):
         raise SourceDataError("NEIS unclassified school counts do not match policy")
