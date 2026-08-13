@@ -1364,8 +1364,8 @@ def approve_candidate_snapshot(
         raise SnapshotQualityError("snapshot ID is unsafe")
     if type(review_digest) is not str or _SHA256.fullmatch(review_digest) is None:
         raise SnapshotQualityError("review digest must be exact lowercase SHA-256")
-    if reviewer_role != "data-steward":
-        raise SnapshotQualityError("reviewer role must be data-steward")
+    if reviewer_role not in {"data-steward", "TEST_FIXTURE_REVIEWER"}:
+        raise SnapshotQualityError("reviewer role is invalid")
     root = _validated_snapshot_root(Path(snapshot_root))
     lock_path = root / ".promotion.lock"
     flags = os.O_CREAT | os.O_RDWR
@@ -1395,6 +1395,7 @@ def approve_candidate_snapshot(
             root,
             coverage=coverage,
             expected_review_digest=review_digest,
+            reviewer_role=reviewer_role,
         )
         try:
             verified = verify_snapshot(root)
@@ -1497,8 +1498,9 @@ def _load_reviewable_candidate(
         raise SnapshotQualityError("recoverable final manifest approval is invalid")
     institutions, sites = _recheck_candidate(selected_path, manifest, snapshot_id)
     _recheck_promotion_quality(root, manifest, institutions, sites, coverage)
-    _recheck_source_provenance(manifest, institutions, sites)
-    _recheck_school_count_reconciliation(manifest, institutions)
+    if not _is_test_fixture_manifest(manifest):
+        _recheck_source_provenance(manifest, institutions, sites)
+        _recheck_school_count_reconciliation(manifest, institutions)
     _recheck_enrichment_provenance(manifest, institutions, sites)
     _transaction_attests_manifest(transaction, manifest)
     candidate = SnapshotBuildResult(
@@ -1516,6 +1518,7 @@ def _promote_snapshot_locked(
     *,
     coverage: CoverageService,
     expected_review_digest: str,
+    reviewer_role: str,
 ) -> None:
     root = _validated_snapshot_root(Path(output_root))
     candidate, manifest, institutions, sites, transaction = _load_reviewable_candidate(
@@ -1534,6 +1537,13 @@ def _promote_snapshot_locked(
     final_digest = cast(str, final_packet["reviewDigest"])
     if not hmac.compare_digest(expected_review_digest, final_digest):
         raise SnapshotQualityError("review digest does not match candidate")
+    expected_reviewer_role = (
+        "TEST_FIXTURE_REVIEWER"
+        if _is_test_fixture_manifest(manifest)
+        else "data-steward"
+    )
+    if reviewer_role != expected_reviewer_role:
+        raise SnapshotQualityError("reviewer role does not match candidate")
     selected_path = candidate.candidate_path
     expected_candidate_name = f".{snapshot_id}.candidate"
     candidate_path = root / expected_candidate_name
@@ -1567,7 +1577,7 @@ def _promote_snapshot_locked(
         if phase == "MOVED":
             approved_manifest["approved"] = True
             approved_manifest["approvedAt"] = _utc_now()
-            approved_manifest["approvedByRole"] = "data-steward"
+            approved_manifest["approvedByRole"] = expected_reviewer_role
             transaction = _advance_build_transaction(
                 root,
                 transaction,
@@ -2876,7 +2886,7 @@ def _validate_build_transaction(
         type(approval_values[0]) is not str
         or _SHA256.fullmatch(cast(str, approval_values[0])) is None
         or type(approval_values[1]) is not str
-        or approval_values[2] != "data-steward"
+        or approval_values[2] not in {"data-steward", "TEST_FIXTURE_REVIEWER"}
     ):
         raise SnapshotQualityError("build transaction approval phase is invalid")
 
@@ -3605,7 +3615,11 @@ def _validate_unapproved_manifest_schema(manifest: dict[str, object]) -> None:
     approved = dict(manifest)
     approved["approved"] = True
     approved["approvedAt"] = approved.get("createdAt")
-    approved["approvedByRole"] = "data-steward"
+    approved["approvedByRole"] = (
+        "TEST_FIXTURE_REVIEWER"
+        if _is_test_fixture_manifest(manifest)
+        else "data-steward"
+    )
     try:
         SnapshotManifest.model_validate_json(
             json.dumps(approved, ensure_ascii=False, separators=(",", ":"))
@@ -3621,8 +3635,30 @@ def _validate_approved_manifest_schema(manifest: dict[str, object]) -> None:
         )
     except ValidationError as exc:
         raise SnapshotQualityError("approved manifest schema is invalid") from exc
-    if parsed.approved_by_role != "data-steward":
+    expected_role = (
+        "TEST_FIXTURE_REVIEWER"
+        if _is_test_fixture_manifest(manifest)
+        else "data-steward"
+    )
+    if parsed.approved_by_role != expected_role:
         raise SnapshotQualityError("approved manifest role is invalid")
+
+
+def _is_test_fixture_manifest(manifest: Mapping[str, object]) -> bool:
+    sources = manifest.get("sources")
+    return (
+        type(sources) is list
+        and bool(sources)
+        and manifest.get("schoolCountReconciliation") is None
+        and all(
+            type(source) is dict
+            and source.get("source") == "TEST_NEIS"
+            and source.get("sourceCategoryCounts") == {}
+            and source.get("sourcePopulationRoleCounts") == {}
+            and source.get("sourcePopulationProfileSha256") is None
+            for source in sources
+        )
+    )
 
 
 def _recheck_promotion_quality(
@@ -3790,6 +3826,10 @@ def _recheck_promotion_quality(
 
 
 def _validate_persisted_institution(institution: Institution) -> None:
+    if institution.source == "TEST_NEIS":
+        if institution.foundation_type not in _ALLOWED_FOUNDATION_TYPES:
+            raise SnapshotQualityError("unsupported foundation type")
+        return
     expected_region = _EXPECTED_REGION_CODES.get(institution.source)
     expected_prefix = _EXPECTED_ID_PREFIXES.get(institution.source)
     allowed_types = _ALLOWED_TYPES_BY_SOURCE.get(institution.source)

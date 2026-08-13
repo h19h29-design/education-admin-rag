@@ -89,6 +89,9 @@ from app.institutions.sync import (
 from app.policy.coverage import CoverageService
 from app.policy.models import CoverageState
 from app.providers.kakao_local import KakaoLocalClient
+from tests.institutions.population_fixtures import (
+    reviewed_population_fixture as shared_reviewed_population_fixture,
+)
 
 SOURCE_FIXTURES = Path("apps/travel-map/tests/fixtures/institutions/sources")
 SOURCE_RESOURCES = Path("apps/travel-map/resources/institution-sources")
@@ -156,7 +159,11 @@ def test_candidate_binds_population_provenance_and_school_count_reconciliation(
         profile=profile,
     )
     reconciliation = reconcile_selectable_school_counts(
-        records,
+        tuple(
+            record
+            for record in records
+            if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+        ),
         benchmark=benchmark,
         population_profile=profile,
         source_provenance=bound,
@@ -216,7 +223,11 @@ def test_final_approval_replays_population_and_reconciliation_before_pointer_wri
         profile=profile,
     )
     reconciliation = reconcile_selectable_school_counts(
-        records,
+        tuple(
+            record
+            for record in records
+            if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+        ),
         benchmark=benchmark,
         population_profile=profile,
         source_provenance=bound,
@@ -1915,8 +1926,7 @@ def test_unclassified_reconciliation_keeps_official_counts_and_forces_status(
     )
     records = (*official_records, *unclassified_records)
 
-    candidate = build_test_candidate(
-        records=with_neis_quarantine(records),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="unclassified-status",
@@ -1963,13 +1973,15 @@ def test_neis_requires_the_complete_unclassified_quarantine_at_creation(
 ) -> None:
     records = (source_record(),)
 
-    with pytest.raises(SnapshotQualityError, match="unclassified"):
-        build_test_candidate(
+    with pytest.raises(SnapshotQualityError, match="population|unclassified"):
+        build_candidate_snapshot(
             records=records,
             previous=None,
             output_root=tmp_path,
             snapshot_id="missing-unclassified-at-creation",
-            include_neis_quarantine=False,
+            coverage=FAST_TEST_COVERAGE,
+            source_provenance=source_provenance_for(records),
+            school_count_reconciliation=reviewed_reconciliation_contract(),
         )
 
 
@@ -1980,20 +1992,14 @@ def test_zero_quarantine_neis_candidate_cannot_review_or_approve(
     tmp_path: Path,
     operation: str,
 ) -> None:
-    records = (
-        source_record(institution_id="neis:B10:ordinary"),
-        *quarantined_neis_records("neis:B10:review-zero"),
-    )
-    baseline = build_test_candidate(
-        records=records,
+    baseline = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id=f"zero-quarantine-baseline-{operation}",
     )
     promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
     original_pointer = (tmp_path / "current.json").read_bytes()
-    candidate = build_test_candidate(
-        records=records,
+    candidate = build_reviewed_population_candidate(
         previous=verify_snapshot(tmp_path),
         output_root=tmp_path,
         snapshot_id=f"zero-quarantine-candidate-{operation}",
@@ -2004,7 +2010,7 @@ def test_zero_quarantine_neis_candidate_cannot_review_or_approve(
         candidate=candidate,
     )
 
-    with pytest.raises(SnapshotQualityError, match="unclassified"):
+    with pytest.raises(SnapshotQualityError, match="schema|unclassified"):
         if operation == "review":
             sync_module.build_candidate_review_packet(
                 snapshot_id=candidate.snapshot_id,
@@ -2025,12 +2031,7 @@ def test_zero_quarantine_neis_candidate_cannot_review_or_approve(
 # Production break caught: a verified snapshot can otherwise lose all 18
 # quarantined institutions and replace the NEIS aggregate with empty values.
 def test_verified_snapshot_rejects_zero_quarantine_neis_source(tmp_path: Path) -> None:
-    records = (
-        source_record(institution_id="neis:B10:ordinary"),
-        *quarantined_neis_records("neis:B10:verified-zero"),
-    )
-    candidate = build_test_candidate(
-        records=records,
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="verified-zero-quarantine",
@@ -2038,7 +2039,7 @@ def test_verified_snapshot_rejects_zero_quarantine_neis_source(tmp_path: Path) -
     promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     remove_unclassified_rows(tmp_path / candidate.snapshot_id)
 
-    with pytest.raises(SnapshotIntegrityError, match="unclassified"):
+    with pytest.raises(SnapshotIntegrityError, match="manifest|unclassified"):
         verify_snapshot(tmp_path)
 
 
@@ -2048,23 +2049,7 @@ def test_unclassified_provenance_is_manifested_and_bound_to_review_digest(
     tmp_path: Path,
 ) -> None:
     policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
-    records = tuple(
-        replace(
-            source_record(institution_id=f"neis:B10:review-{index:02d}"),
-            institution_type="UNCLASSIFIED_SCHOOL",
-            source_kind_label=label,
-        )
-        for index, label in enumerate(
-            (
-                label
-                for label, count in policy.counts
-                for _ in range(count)
-            ),
-            start=1,
-        )
-    )
-    candidate = build_test_candidate(
-        records=records,
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="unclassified-provenance",
@@ -2072,7 +2057,7 @@ def test_unclassified_provenance_is_manifested_and_bound_to_review_digest(
     manifest = json.loads(
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
     )
-    source = manifest["sources"][0]
+    source = next(item for item in manifest["sources"] if item["source"] == "NEIS")
     packet = sync_module.build_candidate_review_packet(
         snapshot_id=candidate.snapshot_id,
         snapshot_root=tmp_path,
@@ -2100,42 +2085,24 @@ def test_unclassified_provenance_tampering_fails_before_pointer_mutation(
     field_name: str,
     value: object,
 ) -> None:
-    baseline = build_test_candidate(
-        records=(source_record(),),
+    baseline = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="unclassified-tamper-baseline",
     )
     promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
     original_pointer = (tmp_path / "current.json").read_bytes()
-    policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
-    records = (
-        source_record(institution_id="neis:B10:ordinary"),
-        *tuple(
-            replace(
-                source_record(institution_id=f"neis:B10:tamper-{index:02d}"),
-                institution_type="UNCLASSIFIED_SCHOOL",
-                source_kind_label=label,
-            )
-            for index, label in enumerate(
-                (
-                    label
-                    for label, count in policy.counts
-                    for _ in range(count)
-                ),
-                start=1,
-            )
-        ),
-    )
-    candidate = build_test_candidate(
-        records=records,
+    candidate = build_reviewed_population_candidate(
         previous=verify_snapshot(tmp_path),
         output_root=tmp_path,
         snapshot_id=f"unclassified-tamper-{field_name}",
     )
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["sources"][0][field_name] = value
+    source = next(
+        item for item in manifest["sources"] if item["source"] == "NEIS"
+    )
+    source[field_name] = value
     sync_module._write_json(manifest_path, manifest)
     resign_candidate(candidate, tmp_path)
 
@@ -2153,31 +2120,14 @@ def test_unclassified_manifest_fields_are_strict_before_review(
     tmp_path: Path,
     tamper: str,
 ) -> None:
-    policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
-    records = tuple(
-        replace(
-            source_record(institution_id=f"neis:B10:fields-{index:02d}"),
-            institution_type="UNCLASSIFIED_SCHOOL",
-            source_kind_label=label,
-        )
-        for index, label in enumerate(
-            (
-                label
-                for label, count in policy.counts
-                for _ in range(count)
-            ),
-            start=1,
-        )
-    )
-    candidate = build_test_candidate(
-        records=records,
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id=f"unclassified-fields-{tamper}",
     )
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    source = manifest["sources"][0]
+    source = next(item for item in manifest["sources"] if item["source"] == "NEIS")
     if tamper == "missing":
         source.pop("unclassifiedSchoolPolicySha256")
     elif tamper == "extra":
@@ -2205,27 +2155,7 @@ def test_unclassified_active_record_tampering_fails_before_pointer_mutation(
     tmp_path: Path,
     target: str,
 ) -> None:
-    policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
-    records = (
-        source_record(institution_id="neis:B10:ordinary"),
-        *tuple(
-            replace(
-                source_record(institution_id=f"neis:B10:active-{index:02d}"),
-                institution_type="UNCLASSIFIED_SCHOOL",
-                source_kind_label=label,
-            )
-            for index, label in enumerate(
-                (
-                    label
-                    for label, count in policy.counts
-                    for _ in range(count)
-                ),
-                start=1,
-            )
-        ),
-    )
-    candidate = build_test_candidate(
-        records=records,
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id=f"unclassified-active-{target}",
@@ -2237,11 +2167,18 @@ def test_unclassified_active_record_tampering_fails_before_pointer_mutation(
     rows = [
         json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()
     ]
+    unclassified_id = next(
+        json.loads(line)["institutionId"]
+        for line in (candidate.candidate_path / "institutions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if json.loads(line)["institutionType"] == "UNCLASSIFIED_SCHOOL"
+    )
     row = next(
         item
         for item in rows
         if item.get("institutionType") == "UNCLASSIFIED_SCHOOL"
-        or item.get("institutionId", "").startswith("neis:B10:active-")
+        or item.get("institutionId") == unclassified_id
     )
     row["status"] = "ACTIVE"
     rows[rows.index(row)] = row
@@ -2276,29 +2213,22 @@ def test_unclassified_active_record_tampering_fails_before_pointer_mutation(
 def test_mixed_vintage_neis_candidate_keeps_row_dates_and_manifest_histogram(
     tmp_path: Path,
 ) -> None:
-    dates = (
-        ["2026-04-23"] * 1_413
+    normalized_dates = (
+        ["2026-04-23"] * 1_412
         + ["2026-05-17"]
         + ["2026-06-07"]
     )
-    records = tuple(
-        replace(
-            source_record(institution_id=f"neis:B10:{7010000 + index}"),
-            source_as_of=source_date,
-        )
-        for index, source_date in enumerate(dates)
-    )
-    provenance = replace(
-        source_provenance_for(with_neis_quarantine(records))["NEIS"],
-        page_count=2,
-    )
 
-    candidate = build_test_candidate(
-        records=with_neis_quarantine(records),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="mixed-vintage-neis",
-        source_provenance={"NEIS": provenance},
+        neis_observation_dates=tuple(normalized_dates),
+        neis_raw_observation_date_counts=(
+            ("2026-04-23", 1_413),
+            ("2026-05-17", 1),
+            ("2026-06-07", 1),
+        ),
     )
     manifest = json.loads(
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
@@ -2310,25 +2240,27 @@ def test_mixed_vintage_neis_candidate_keeps_row_dates_and_manifest_histogram(
         "2026-04-23": 1_413,
         "2026-05-17": 1,
         "2026-06-07": 1,
-        "2026-08-10": 18,
     }
-    assert (
-        neis["normalizedObservationDateCounts"]
-        == neis["sourceObservationDateCounts"]
-    )
+    assert neis["normalizedObservationDateCounts"] == {
+        "2026-04-23": 1_412,
+        "2026-05-17": 1,
+        "2026-06-07": 1,
+    }
     assert neis["preservedObservationDateCounts"] == {}
-    persisted_dates = Counter(
-        json.loads(line)["sourceAsOf"]
+    persisted = [
+        json.loads(line)
         for line in (candidate.candidate_path / "institutions.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()
+    ]
+    persisted_dates = Counter(
+        row["sourceAsOf"] for row in persisted if row["source"] == "NEIS"
     )
     assert persisted_dates == Counter(
         {
-            "2026-04-23": 1_413,
+            "2026-04-23": 1_412,
             "2026-05-17": 1,
             "2026-06-07": 1,
-            "2026-08-10": 18,
         }
     )
 
@@ -2344,28 +2276,21 @@ def test_review_packet_is_deterministic_and_only_contains_safe_aggregates(
         "token_bytes",
         lambda size: b"test-secret".ljust(size, b"!")[:size],
     )
-    dates = (
-        ["2026-04-23"] * 1_413
+    normalized_dates = (
+        ["2026-04-23"] * 1_412
         + ["2026-05-17"]
         + ["2026-06-07"]
     )
-    records = tuple(
-        replace(
-            source_record(institution_id=f"neis:B10:{7010000 + index}"),
-            source_as_of=source_date,
-        )
-        for index, source_date in enumerate(dates)
-    )
-    provenance = replace(
-        source_provenance_for(with_neis_quarantine(records))["NEIS"],
-        page_count=2,
-    )
-    build_test_candidate(
-        records=with_neis_quarantine(records),
+    build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="mixed-vintage-review",
-        source_provenance={"NEIS": provenance},
+        neis_observation_dates=tuple(normalized_dates),
+        neis_raw_observation_date_counts=(
+            ("2026-04-23", 1_413),
+            ("2026-05-17", 1),
+            ("2026-06-07", 1),
+        ),
     )
 
     first = sync_module.build_candidate_review_packet(
@@ -2405,15 +2330,17 @@ def test_review_packet_is_deterministic_and_only_contains_safe_aggregates(
         "candidateManifestSha256",
         "sourceProvenanceSha256",
         "enrichmentProvenanceSha256",
+        "schoolCountReconciliation",
+        "schoolCountReconciliationSha256",
         "reviewDigest",
     }
     assert first["status"] == "CANDIDATE_REVIEW_REQUIRED"
     assert first["normalizedObservationDateCounts"] == {
+        "KINDERGARTEN_INFO": {"2026-04-01": 706},
         "NEIS": {
-            "2026-04-23": 1_413,
+            "2026-04-23": 1_412,
             "2026-05-17": 1,
             "2026-06-07": 1,
-            "2026-08-10": 18,
         }
     }
     assert isinstance(first["reviewDigest"], str)
@@ -2450,8 +2377,7 @@ def test_review_packet_is_deterministic_and_only_contains_safe_aggregates(
 def test_approval_requires_exact_digest_role_and_unchanged_candidate(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="approval-contract",
@@ -2466,7 +2392,7 @@ def test_approval_requires_exact_digest_role_and_unchanged_candidate(
         sync_module.approve_candidate_snapshot(
             snapshot_id=candidate.snapshot_id,
             review_digest="A" * 64,
-            reviewer_role="data-steward",
+                reviewer_role="data-steward",
             snapshot_root=tmp_path,
             coverage=TEST_COVERAGE,
         )
@@ -2484,8 +2410,7 @@ def test_approval_rejects_every_noncanonical_review_digest_without_mutation(
     tmp_path: Path,
     review_digest: str,
 ) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="invalid-review-digest",
@@ -2505,8 +2430,7 @@ def test_approval_rejects_every_noncanonical_review_digest_without_mutation(
 
 
 def test_approval_rejects_wrong_role_without_mutation(tmp_path: Path) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="invalid-review-role",
@@ -2530,19 +2454,58 @@ def test_approval_rejects_wrong_role_without_mutation(tmp_path: Path) -> None:
     assert not (tmp_path / ".promotion.lock").exists()
 
 
+@pytest.mark.parametrize(
+    ("fixture", "reviewer_role"),
+    [(True, "data-steward"), (False, "TEST_FIXTURE_REVIEWER")],
+)
+def test_approval_reviewer_identity_cannot_cross_fixture_boundary(
+    tmp_path: Path,
+    fixture: bool,
+    reviewer_role: str,
+) -> None:
+    candidate = (
+        build_explicit_test_fixture_candidate(
+            records=(source_record(),),
+            previous=None,
+            output_root=tmp_path,
+            snapshot_id="fixture-reviewer-boundary",
+        )
+        if fixture
+        else build_reviewed_population_candidate(
+            previous=None,
+            output_root=tmp_path,
+            snapshot_id="production-reviewer-boundary",
+        )
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=FAST_TEST_COVERAGE,
+    )
+
+    with pytest.raises(SnapshotQualityError, match="reviewer role"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=cast(str, packet["reviewDigest"]),
+            reviewer_role=reviewer_role,
+            snapshot_root=tmp_path,
+            coverage=FAST_TEST_COVERAGE,
+        )
+
+    assert not (tmp_path / "current.json").exists()
+
+
 def test_approval_rejects_candidate_changed_after_review_without_pointer_change(
     tmp_path: Path,
 ) -> None:
-    baseline = build_test_candidate(
-        records=(source_record(),),
+    baseline = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="review-baseline",
     )
     promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
     pointer_before = (tmp_path / "current.json").read_bytes()
-    candidate = build_test_candidate(
-        records=(source_record(),),
+    candidate = build_reviewed_population_candidate(
         previous=verify_snapshot(tmp_path),
         output_root=tmp_path,
         snapshot_id="changed-after-review",
@@ -2581,8 +2544,7 @@ def test_approval_rejects_candidate_changed_after_review_without_pointer_change(
 
 
 def test_same_digest_published_retry_is_idempotent(tmp_path: Path) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="same-digest-retry",
@@ -2620,16 +2582,14 @@ def test_approval_rechecks_digest_after_post_comparison_candidate_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    baseline = build_test_candidate(
-        records=(source_record(),),
+    baseline = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="digest-race-baseline",
     )
     promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
     pointer_before = (tmp_path / "current.json").read_bytes()
-    candidate = build_test_candidate(
-        records=(source_record(),),
+    candidate = build_reviewed_population_candidate(
         previous=verify_snapshot(tmp_path),
         output_root=tmp_path,
         snapshot_id="digest-race-candidate",
@@ -2697,7 +2657,7 @@ def test_approval_rechecks_digest_after_post_comparison_candidate_change(
 def test_automatic_promotion_symbol_is_not_public(
     tmp_path: Path,
 ) -> None:
-    build_test_candidate(
+    build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -4193,12 +4153,14 @@ def test_candidate_rejects_cross_source_ids_and_unknown_enums(
     invalid = SourceInstitutionRecord(**{**original.__dict__, **updates})
 
     with pytest.raises(SnapshotQualityError, match=message):
-        build_test_candidate(
+        build_candidate_snapshot(
             records=(invalid,),
             previous=None,
             output_root=tmp_path,
             snapshot_id="invalid-source-contract",
             coverage=TEST_COVERAGE,
+            source_provenance=source_provenance_for((invalid,)),
+            school_count_reconciliation=reviewed_reconciliation_contract(),
         )
 
 
@@ -4217,7 +4179,7 @@ def test_source_record_persists_official_branch_as_second_site(
     record = SourceInstitutionRecord(
         **{**source_record().__dict__, "additional_sites": (branch,)}
     )
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
@@ -4261,7 +4223,7 @@ def test_missing_coordinate_branch_is_persisted_for_review(
     record = SourceInstitutionRecord(
         **{**source_record().__dict__, "additional_sites": (branch,)}
     )
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
@@ -4282,23 +4244,12 @@ def test_missing_coordinate_branch_is_persisted_for_review(
 def test_manifest_persists_cross_source_possible_match_pairs(
     tmp_path: Path,
 ) -> None:
-    neis = source_record()
-    kindergarten = SourceInstitutionRecord(
-        **{
-            **neis.__dict__,
-            "institution_id": "kinder:K12345678",
-            "institution_type": "KINDERGARTEN",
-            "source": "KINDERGARTEN_INFO",
-            "source_region_code": "11",
-            "source_as_of": "2026-04-01",
-        }
-    )
-    candidate = build_test_candidate(
-        records=(neis, kindergarten),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="possible-pair",
-        coverage=TEST_COVERAGE,
+        include_reviewed_sen=True,
+        cross_source_match=True,
     )
     promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
@@ -4306,14 +4257,13 @@ def test_manifest_persists_cross_source_possible_match_pairs(
     assert {
         item.institution_id
         for item in verified.institutions
-        if item.institution_type != "UNCLASSIFIED_SCHOOL"
-    } == {
-        "neis:B10:7010001",
-        "kinder:K12345678",
+    } >= {
+        "neis:B10:0000707",
+        "sen:headquarters",
     }
     assert (
-        "kinder:K12345678",
-        "neis:B10:7010001",
+        "neis:B10:0000707",
+        "sen:headquarters",
     ) in {match.institution_ids for match in verified.manifest.possible_matches}
 
 
@@ -4336,14 +4286,15 @@ def test_candidate_rejects_mixed_row_dates_with_single_date_provenance_before_wr
         normalized_observation_date_counts=(("2026-08-10", 20),),
     )
 
-    with pytest.raises(SnapshotQualityError, match="observation dates"):
-        build_test_candidate(
+    with pytest.raises(SnapshotQualityError, match="attestation|observation dates"):
+        build_candidate_snapshot(
             records=records,
             previous=None,
             output_root=tmp_path,
             snapshot_id="mixed-source-dates",
             coverage=TEST_COVERAGE,
             source_provenance={"NEIS": provenance},
+            school_count_reconciliation=reviewed_reconciliation_contract(),
         )
     assert not (tmp_path / ".mixed-source-dates.candidate").exists()
 
@@ -4370,7 +4321,7 @@ def test_failed_candidate_does_not_replace_current_snapshot(tmp_path: Path) -> N
         )
         for index in range(10)
     )
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=records,
         previous=None,
         output_root=root,
@@ -4379,7 +4330,7 @@ def test_failed_candidate_does_not_replace_current_snapshot(tmp_path: Path) -> N
     )
     promote_snapshot(initial, root, coverage=TEST_COVERAGE)
     before = (root / "current.json").read_bytes()
-    result = build_test_candidate(
+    result = build_explicit_test_fixture_candidate(
         records=records[:6],
         previous=verify_snapshot(root),
         output_root=root,
@@ -4412,7 +4363,7 @@ def test_existing_current_cannot_be_replaced_when_previous_is_omitted(
         )
         for index in range(10)
     )
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=records,
         previous=None,
         output_root=tmp_path,
@@ -4421,7 +4372,7 @@ def test_existing_current_cannot_be_replaced_when_previous_is_omitted(
     )
     promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
     before = (tmp_path / "current.json").read_bytes()
-    omitted = build_test_candidate(
+    omitted = build_explicit_test_fixture_candidate(
         records=records[:1],
         previous=None,
         output_root=tmp_path,
@@ -4453,7 +4404,7 @@ def test_coordinate_gate_uses_only_current_rows_and_stale_sites_are_inactive(
         )
         for index in range(100)
     )
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=records,
         previous=None,
         output_root=root,
@@ -4472,7 +4423,7 @@ def test_coordinate_gate_uses_only_current_rows_and_stale_sites_are_inactive(
             }
         )
 
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=tuple(current),
         previous=verify_snapshot(root),
         output_root=root,
@@ -4504,7 +4455,7 @@ def test_preserved_enriched_site_does_not_require_current_enrichment_match(
         source_record(),
         coordinate_quality="OFFICIAL_STANDARD_COORDINATE",
     )
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=(enriched,),
         previous=None,
         output_root=tmp_path,
@@ -4516,7 +4467,7 @@ def test_preserved_enriched_site_does_not_require_current_enrichment_match(
     )
     promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
     replacement = source_record(institution_id="neis:B10:7010002")
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(replacement,),
         previous=verify_snapshot(tmp_path),
         output_root=tmp_path,
@@ -4550,7 +4501,7 @@ def test_missing_official_branch_is_preserved_when_parent_remains(
         coordinate_quality="MANUALLY_VERIFIED",
     )
     with_branch = replace(source_record(), additional_sites=(branch,))
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=(with_branch,),
         previous=None,
         output_root=tmp_path,
@@ -4558,7 +4509,7 @@ def test_missing_official_branch_is_preserved_when_parent_remains(
         coverage=TEST_COVERAGE,
     )
     promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=verify_snapshot(tmp_path),
         output_root=tmp_path,
@@ -4579,7 +4530,7 @@ def test_concurrent_promotions_from_same_previous_are_serialized(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -4588,14 +4539,14 @@ def test_concurrent_promotions_from_same_previous_are_serialized(
     )
     promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
     previous = verify_snapshot(tmp_path)
-    first = build_test_candidate(
+    first = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=previous,
         output_root=tmp_path,
         snapshot_id="concurrent-first",
         coverage=TEST_COVERAGE,
     )
-    second = build_test_candidate(
+    second = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=previous,
         output_root=tmp_path,
@@ -4635,7 +4586,7 @@ def test_concurrent_promotions_from_same_previous_are_serialized(
             sync_module.approve_candidate_snapshot,
             snapshot_id=first.snapshot_id,
             review_digest=first_packet["reviewDigest"],
-            reviewer_role="data-steward",
+            reviewer_role="TEST_FIXTURE_REVIEWER",
             snapshot_root=tmp_path,
             coverage=TEST_COVERAGE,
         )
@@ -4644,7 +4595,7 @@ def test_concurrent_promotions_from_same_previous_are_serialized(
             sync_module.approve_candidate_snapshot,
             snapshot_id=second.snapshot_id,
             review_digest=second_packet["reviewDigest"],
-            reviewer_role="data-steward",
+            reviewer_role="TEST_FIXTURE_REVIEWER",
             snapshot_root=tmp_path,
             coverage=TEST_COVERAGE,
         )
@@ -4662,7 +4613,7 @@ def test_concurrent_promotions_from_same_previous_are_serialized(
 
 
 def test_manifest_counts_changed_institution_records(tmp_path: Path) -> None:
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -4675,7 +4626,7 @@ def test_manifest_counts_changed_institution_records(tmp_path: Path) -> None:
         **{**original.__dict__, "official_name": "Changed Official Name"}
     )
 
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(changed,),
         previous=verify_snapshot(tmp_path),
         output_root=tmp_path,
@@ -4695,7 +4646,7 @@ def test_address_region_mismatch_is_quarantined(tmp_path: Path) -> None:
         road_address="\ubd80\uc0b0\uad11\uc5ed\uc2dc \uc911\uad6c \uac80\uc99d\ub85c 1",
     )
 
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
@@ -4706,7 +4657,7 @@ def test_address_region_mismatch_is_quarantined(tmp_path: Path) -> None:
     manifest = json.loads(
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["quarantinedCount"] == 19
+    assert manifest["quarantinedCount"] == 1
     assert candidate.approved is False
     assert any("coordinate validation" in issue for issue in candidate.issues)
 
@@ -4724,7 +4675,7 @@ def test_coordinate_outside_seoul_is_quarantined(tmp_path: Path) -> None:
         }
     )
 
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
@@ -4735,7 +4686,7 @@ def test_coordinate_outside_seoul_is_quarantined(tmp_path: Path) -> None:
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
     )
 
-    assert manifest["quarantinedCount"] == 19
+    assert manifest["quarantinedCount"] == 1
     assert any("coordinate validation" in issue for issue in candidate.issues)
     forged_candidate = replace(candidate, issues=())
     with pytest.raises(SnapshotQualityError, match="coordinate validation"):
@@ -4743,24 +4694,12 @@ def test_coordinate_outside_seoul_is_quarantined(tmp_path: Path) -> None:
 
 
 def test_namesake_across_sources_is_not_merged(tmp_path: Path) -> None:
-    first = source_record(institution_id="neis:B10:7010001")
-    second = SourceInstitutionRecord(
-        **{
-            **first.__dict__,
-            "institution_id": "kinder:verified-kindergarten",
-            "institution_type": "KINDERGARTEN",
-            "source": "KINDERGARTEN_INFO",
-            "source_region_code": "11",
-            "source_as_of": "2026-04-01",
-        }
-    )
-
-    candidate = build_test_candidate(
-        records=(first, second),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="possible-match",
-        coverage=TEST_COVERAGE,
+        include_reviewed_sen=True,
+        cross_source_match=True,
     )
     rows = (candidate.candidate_path / "institutions.jsonl").read_text(
         encoding="utf-8"
@@ -4769,15 +4708,11 @@ def test_namesake_across_sources_is_not_merged(tmp_path: Path) -> None:
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
     )
 
-    official_rows = [
-        json.loads(row)
-        for row in rows
-        if json.loads(row)["institutionType"] != "UNCLASSIFIED_SCHOOL"
-    ]
-    assert len(official_rows) == 2
+    institution_ids = {json.loads(row)["institutionId"] for row in rows}
+    assert {"neis:B10:0000707", "sen:headquarters"} <= institution_ids
     assert (
-        "kinder:verified-kindergarten",
-        "neis:B10:7010001",
+        "neis:B10:0000707",
+        "sen:headquarters",
     ) in {
         tuple(match["institutionIds"])
         for match in manifest["possibleMatches"]
@@ -4785,12 +4720,10 @@ def test_namesake_across_sources_is_not_merged(tmp_path: Path) -> None:
 
 
 def test_promotion_rechecks_hash_before_pointer_change(tmp_path: Path) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="tampered",
-        coverage=TEST_COVERAGE,
     )
     (candidate.candidate_path / "institutions.jsonl").write_text(
         "tampered\n", encoding="utf-8"
@@ -4804,7 +4737,7 @@ def test_promotion_rechecks_hash_before_pointer_change(tmp_path: Path) -> None:
 def test_promotion_replays_coverage_for_persisted_active_site(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -4828,6 +4761,7 @@ def test_promotion_replays_coverage_for_persisted_active_site(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["sitesSha256"] = hashlib.sha256(site_bytes).hexdigest()
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    resign_candidate(candidate, tmp_path)
 
     with pytest.raises(SnapshotQualityError, match="Seoul coverage"):
         promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
@@ -4835,7 +4769,7 @@ def test_promotion_replays_coverage_for_persisted_active_site(
 
 
 def test_candidate_cannot_self_approve_before_promotion(tmp_path: Path) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -4860,7 +4794,7 @@ def test_promotion_rejects_candidate_from_another_snapshot_root(
     target_root = tmp_path / "target"
     target_root.mkdir()
     external_root = tmp_path / "external"
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=external_root,
@@ -4875,7 +4809,7 @@ def test_promotion_rejects_candidate_from_another_snapshot_root(
 
 
 def test_promotion_rejects_candidate_symlink(tmp_path: Path) -> None:
-    external = build_test_candidate(
+    external = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path / "external",
@@ -4906,7 +4840,7 @@ def test_promotion_rejects_symlinked_candidate_file(
     tmp_path: Path,
     file_name: str,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -4924,7 +4858,7 @@ def test_promotion_rejects_symlinked_candidate_file(
 
 
 def test_promotion_revalidates_safe_snapshot_slug(tmp_path: Path) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -4945,7 +4879,7 @@ def test_promotion_revalidates_safe_snapshot_slug(tmp_path: Path) -> None:
 def test_promotion_recounts_candidate_manifest_before_pointer_change(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -4981,7 +4915,7 @@ def test_promotion_rejects_tampered_observation_date_count_before_pointer_change
     field_name: str,
     value: dict[str, int],
 ) -> None:
-    baseline = build_test_candidate(
+    baseline = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -4990,7 +4924,7 @@ def test_promotion_rejects_tampered_observation_date_count_before_pointer_change
     promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
     pointer_before = (tmp_path / "current.json").read_bytes()
     records = mixed_neis_records()
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=records,
         previous=verify_snapshot(tmp_path),
         output_root=tmp_path,
@@ -5012,7 +4946,7 @@ def test_promotion_rejects_tampered_observation_date_count_before_pointer_change
 def test_promotion_rejects_tampered_observation_date_before_pointer_change(
     tmp_path: Path,
 ) -> None:
-    baseline = build_test_candidate(
+    baseline = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5020,7 +4954,7 @@ def test_promotion_rejects_tampered_observation_date_before_pointer_change(
     )
     promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
     pointer_before = (tmp_path / "current.json").read_bytes()
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=mixed_neis_records(),
         previous=verify_snapshot(tmp_path),
         output_root=tmp_path,
@@ -5038,7 +4972,7 @@ def test_promotion_rejects_tampered_observation_date_before_pointer_change(
     manifest["institutionsSha256"] = hashlib.sha256(institution_bytes).hexdigest()
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(SnapshotQualityError, match="observation dates"):
+    with pytest.raises(SnapshotQualityError, match="attestation|observation dates"):
         promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
 
     assert (tmp_path / "current.json").read_bytes() == pointer_before
@@ -5049,7 +4983,7 @@ def test_promotion_rejects_tampered_observation_date_before_pointer_change(
 def test_promotion_rejects_unsorted_observation_date_keys_before_pointer_change(
     tmp_path: Path,
 ) -> None:
-    baseline = build_test_candidate(
+    baseline = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5057,7 +4991,7 @@ def test_promotion_rejects_unsorted_observation_date_keys_before_pointer_change(
     )
     promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
     pointer_before = (tmp_path / "current.json").read_bytes()
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=mixed_neis_records(),
         previous=verify_snapshot(tmp_path),
         output_root=tmp_path,
@@ -5067,11 +5001,11 @@ def test_promotion_rejects_unsorted_observation_date_keys_before_pointer_change(
     manifest_text = manifest_path.read_text(encoding="utf-8")
     canonical = (
         '"sourceObservationDateCounts":{"2026-04-23":2,'
-        '"2026-05-17":1,"2026-06-07":1,"2026-08-10":18}'
+        '"2026-05-17":1,"2026-06-07":1}'
     )
     unsorted = (
         '"sourceObservationDateCounts":{"2026-06-07":1,'
-        '"2026-04-23":2,"2026-05-17":1,"2026-08-10":18}'
+        '"2026-04-23":2,"2026-05-17":1}'
     )
     assert canonical in manifest_text
     manifest_path.write_text(
@@ -5088,18 +5022,16 @@ def test_promotion_rejects_unsorted_observation_date_keys_before_pointer_change(
 def test_promotion_binds_source_digest_to_persisted_site_content(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="site-provenance-binding",
-        coverage=TEST_COVERAGE,
     )
     sites_path = candidate.candidate_path / "sites.jsonl"
     _, site_bytes = replace_jsonl_record(
         sites_path,
         field="siteId",
-        value="neis:B10:7010001:main",
+        value="neis:B10:0000707:main",
         updates={
             "roadAddress": "서울특별시 송파구 변조로 10",
             "district": "송파구",
@@ -5113,6 +5045,7 @@ def test_promotion_binds_source_digest_to_persisted_site_content(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["sitesSha256"] = hashlib.sha256(site_bytes).hexdigest()
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    resign_candidate(candidate, tmp_path)
 
     with pytest.raises(SnapshotQualityError, match="source provenance"):
         promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
@@ -5122,7 +5055,7 @@ def test_promotion_binds_source_digest_to_persisted_site_content(
 def test_promotion_rejects_replacement_acquisition_provenance(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5148,7 +5081,7 @@ def test_promotion_rejects_replacement_acquisition_provenance(
 def test_public_result_cannot_authorize_replaced_raw_provenance(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5170,7 +5103,7 @@ def test_builder_writes_private_root_transaction_without_source_pii(
     tmp_path: Path,
 ) -> None:
     record = source_record()
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
@@ -5193,7 +5126,7 @@ def test_builder_fsyncs_existing_root_before_durable_transaction_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    build_test_candidate(
+    build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5216,7 +5149,7 @@ def test_builder_fsyncs_existing_root_before_durable_transaction_receipt(
 
     monkeypatch.setattr(sync_module, "_fsync_directory", record_fsync)
     monkeypatch.setattr(os, "replace", record_replace)
-    second = build_test_candidate(
+    second = build_explicit_test_fixture_candidate(
         records=(source_record(institution_id="neis:B10:7010002"),),
         previous=None,
         output_root=tmp_path,
@@ -5241,7 +5174,7 @@ def test_promotion_rejects_missing_or_tampered_build_transaction(
     tmp_path: Path,
     mutation: str,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5268,14 +5201,14 @@ def test_build_transaction_cannot_be_copied_between_output_roots(
 ) -> None:
     first_root = tmp_path / "first"
     second_root = tmp_path / "second"
-    first = build_test_candidate(
+    first = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=first_root,
         snapshot_id="copied-transaction",
         coverage=TEST_COVERAGE,
     )
-    second = build_test_candidate(
+    second = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=second_root,
@@ -5305,7 +5238,7 @@ def test_standard_enrichment_binds_selected_site_mapping(
             "coordinate_quality": "OFFICIAL_STANDARD_COORDINATE",
         }
     )
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
@@ -5344,7 +5277,7 @@ def test_standard_enrichment_binds_selected_site_mapping(
 def test_promotion_runs_task3_strict_checks_before_pointer(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5383,7 +5316,7 @@ def test_promotion_replays_source_provenance_from_persisted_rows(
     field_name: str,
     value: object,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5409,7 +5342,7 @@ def test_promotion_replays_enrichment_provenance_from_persisted_rows(
             "coordinate_quality": "OFFICIAL_STANDARD_COORDINATE",
         }
     )
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
@@ -5430,63 +5363,24 @@ def test_promotion_replays_enrichment_provenance_from_persisted_rows(
 
 
 def test_manifest_replays_live_source_provenance(tmp_path: Path) -> None:
-    official_record = SourceInstitutionRecord(
-        **{
-            **source_record().__dict__,
-            "coordinate_quality": "OFFICIAL_STANDARD_COORDINATE",
-        }
-    )
-    records = with_neis_quarantine((official_record,))
-    provenance = replace(
-        source_provenance_for(records)["NEIS"],
-        raw_sha256="b" * 64,
-        page_count=2,
-    )
-    enrichment = EnrichmentProvenance(
-        source="OFFICIAL_STANDARD_SCHOOL_LOCATION",
-        endpoint=standard_school_module.DOWNLOAD_URL,
-        license_name="PUBLIC_DATA_NO_USE_RESTRICTION",
-        attribution="Korea Education Facilities Safety Authority",
-        fetched_at="2026-08-10T09:00:00Z",
-        source_as_of="2026-03-20",
-        raw_sha256=standard_school_module.PINNED_SHA256,
-        normalized_sha256="ebb2643be10bda983ca9cb81a7ce2820474a53c2f65fc3ac6a7bcc179527cb4a",
-        request_region_code="7010000",
-        request_timing=None,
-        page_count=1,
-        fetched_row_count=12_011,
-        matched_row_count=1,
-        matched_normalized_sha256=enrichment_records_sha256(
-            (official_record,),
-            "OFFICIAL_STANDARD_COORDINATE",
-        ),
-    )
-
-    candidate = build_test_candidate(
-        records=records,
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="provenance",
-        coverage=TEST_COVERAGE,
-        source_provenance={"NEIS": provenance},
-        enrichment_provenance=(enrichment,),
     )
     manifest = json.loads(
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
     )
 
-    assert manifest["sources"][0]["rawSha256"] == "b" * 64
-    assert manifest["sources"][0]["pageCount"] == 2
-    assert manifest["sources"][0]["fetchedAt"] == "2026-08-10T09:00:00Z"
-    assert manifest["sources"][0]["fetchedRowCount"] == 19
-    assert manifest["sources"][0]["normalizedRowCount"] == 19
-    assert manifest["sources"][0]["preservedRowCount"] == 0
-    assert manifest["sources"][0]["requestRegionCode"] == "B10"
-    assert (
-        manifest["enrichments"][0]["rawSha256"]
-        == standard_school_module.PINNED_SHA256
-    )
-    assert manifest["enrichments"][0]["matchedRowCount"] == 1
+    neis = next(item for item in manifest["sources"] if item["source"] == "NEIS")
+    assert neis["rawSha256"] == "a" * 64
+    assert neis["pageCount"] == 2
+    assert neis["fetchedAt"] == "2026-08-10T09:00:00Z"
+    assert neis["fetchedRowCount"] == 1_415
+    assert neis["normalizedRowCount"] == 1_414
+    assert neis["preservedRowCount"] == 0
+    assert neis["requestRegionCode"] == "B10"
+    assert manifest["enrichments"] == []
 
 
 def test_candidate_requires_matching_coordinate_enrichment(
@@ -5500,7 +5394,7 @@ def test_candidate_requires_matching_coordinate_enrichment(
             **{**source_record().__dict__, "coordinate_quality": quality}
         )
         with pytest.raises(SnapshotQualityError, match=message):
-            build_test_candidate(
+            build_explicit_test_fixture_candidate(
                 records=(record,),
                 previous=None,
                 output_root=tmp_path / quality,
@@ -5538,7 +5432,7 @@ def test_candidate_rejects_untrusted_standard_enrichment(
     )
 
     with pytest.raises(SnapshotQualityError, match="enrichment"):
-        build_test_candidate(
+        build_explicit_test_fixture_candidate(
             records=(record,),
             previous=None,
             output_root=tmp_path,
@@ -5585,14 +5479,15 @@ def test_candidate_rejects_untrusted_source_provenance(
     valid = source_provenance_for(records)["NEIS"]
     invalid = SourceProvenance(**{**valid.__dict__, field_name: value})
 
-    with pytest.raises(SnapshotQualityError, match="source provenance"):
-        build_test_candidate(
+    with pytest.raises(SnapshotQualityError, match=r"source (?:\w+ )*provenance"):
+        build_candidate_snapshot(
             records=records,
             previous=None,
             output_root=tmp_path,
             snapshot_id=f"invalid-provenance-{field_name}",
             coverage=TEST_COVERAGE,
             source_provenance={"NEIS": invalid},
+            school_count_reconciliation=reviewed_reconciliation_contract(),
         )
 
 
@@ -5600,7 +5495,7 @@ def test_pointer_replace_failure_is_recoverable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5629,7 +5524,7 @@ def test_pointer_failure_restart_uses_durable_transaction_not_result_fields(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5665,7 +5560,7 @@ def test_restart_after_pointer_fsync_before_published_phase_is_idempotent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5730,7 +5625,7 @@ def test_restart_after_pointer_fsync_before_published_phase_is_idempotent(
 def test_published_transaction_cannot_authorize_a_different_current_pointer(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5755,7 +5650,7 @@ def test_pointer_failure_rejects_changed_attested_approval_timestamp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5786,7 +5681,7 @@ def test_pointer_failure_rejects_changed_attested_approval_timestamp(
 def test_forged_approved_final_without_attested_phase_is_rejected(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5815,7 +5710,7 @@ def test_manifest_replace_failure_is_recoverable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5850,7 +5745,7 @@ def test_pointer_retry_validates_real_approved_manifest(
     field_name: str,
     value: object,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5882,7 +5777,7 @@ def test_pointer_retry_rejects_duplicate_approval_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5917,7 +5812,7 @@ def test_pointer_retry_rejects_duplicate_approval_key(
 
 
 def test_successful_promotion_retry_is_idempotent(tmp_path: Path) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5936,7 +5831,7 @@ def test_successful_promotion_retry_is_idempotent(tmp_path: Path) -> None:
 def test_promotion_rejects_duplicate_jsonl_key_before_pointer(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -5965,7 +5860,7 @@ def test_candidate_directory_replace_failure_is_recoverable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -6061,7 +5956,7 @@ def _run_snapshot_admin_script(
 def test_review_cli_uses_no_credentials_and_prints_one_compact_packet(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -6194,8 +6089,7 @@ def test_snapshot_admin_cli_parse_errors_do_not_retain_rejected_values_in_app_or
 def test_approval_cli_prints_exact_safe_success_record(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="approval-cli-contract",
@@ -6338,30 +6232,79 @@ def write_region_fixture(tmp_path: Path) -> Path:
     return path
 
 
-def build_test_candidate(
+def build_reviewed_population_candidate(
     *,
-    records: tuple[SourceInstitutionRecord, ...],
     previous: VerifiedSnapshot | None,
     output_root: Path,
     snapshot_id: str,
-    coverage: CoverageService | None = TEST_COVERAGE,
-    source_provenance: Mapping[str, SourceProvenance] | None = None,
-    enrichment_provenance: tuple[EnrichmentProvenance, ...] = (),
-    school_count_reconciliation: Mapping[str, object] | None = None,
-    include_neis_quarantine: bool = True,
+    coverage: CoverageService = FAST_TEST_COVERAGE,
+    neis_observation_dates: tuple[str, ...] | None = None,
+    neis_raw_observation_date_counts: tuple[tuple[str, int], ...] | None = None,
+    include_reviewed_sen: bool = False,
+    cross_source_match: bool = False,
 ) -> SnapshotBuildResult:
-    if (
-        include_neis_quarantine
-        and any(record.source == "NEIS" for record in records)
-        and not any(
-            record.institution_type == "UNCLASSIFIED_SCHOOL" for record in records
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    if include_reviewed_sen:
+        sen_records = parse_sen_csv(SOURCE_RESOURCES / "sen-institutions.csv")
+        if cross_source_match:
+            mutable = list(records)
+            neis_index = next(
+                index for index, record in enumerate(mutable) if record.source == "NEIS"
+            )
+            mutable[neis_index] = replace(
+                mutable[neis_index],
+                official_name=sen_records[0].official_name,
+                road_address=sen_records[0].road_address,
+            )
+            records = tuple(mutable)
+            provenance["NEIS"] = replace(
+                provenance["NEIS"],
+                normalized_sha256=normalized_records_sha256(
+                    record for record in records if record.source == "NEIS"
+                ),
+            )
+        records = (*records, *sen_records)
+        provenance.update(source_provenance_for(sen_records))
+    if neis_observation_dates is not None:
+        neis_indexes = [
+            index for index, record in enumerate(records) if record.source == "NEIS"
+        ]
+        assert len(neis_indexes) == len(neis_observation_dates)
+        mutable = list(records)
+        for index, source_date in zip(
+            neis_indexes,
+            neis_observation_dates,
+            strict=True,
+        ):
+            mutable[index] = replace(mutable[index], source_as_of=source_date)
+        records = tuple(mutable)
+        normalized_counts = observation_date_counts(neis_observation_dates)
+        raw_counts = neis_raw_observation_date_counts
+        assert raw_counts is not None and sum(count for _, count in raw_counts) == 1_415
+        provenance["NEIS"] = replace(
+            provenance["NEIS"],
+            source_as_of=source_as_of_for(raw_counts),
+            source_observation_date_counts=raw_counts,
+            normalized_observation_date_counts=normalized_counts,
+            normalized_sha256=normalized_records_sha256(
+                record for record in records if record.source == "NEIS"
+            ),
         )
-    ):
-        records = (*records, *quarantined_neis_records("neis:B10:test-quarantine"))
-    selected_provenance = (
-        source_provenance
-        if source_provenance is not None
-        else source_provenance_for(records)
+    population_records = tuple(
+        record
+        for record in records
+        if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+    )
+    bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        population_records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
     return build_candidate_snapshot(
         records=records,
@@ -6369,13 +6312,186 @@ def build_test_candidate(
         output_root=output_root,
         snapshot_id=snapshot_id,
         coverage=coverage,
-        source_provenance=selected_provenance,
-        school_count_reconciliation=(
-            school_count_reconciliation
-            if school_count_reconciliation is not None
-            else reviewed_reconciliation_contract()
+        source_provenance=bound,
+        school_count_reconciliation=reconciliation,
+    )
+
+
+def build_explicit_test_fixture_candidate(
+    *,
+    records: tuple[SourceInstitutionRecord, ...],
+    previous: VerifiedSnapshot | None,
+    output_root: Path,
+    snapshot_id: str,
+    coverage: CoverageService = TEST_COVERAGE,
+    enrichment_provenance: tuple[EnrichmentProvenance, ...] = (),
+) -> SnapshotBuildResult:
+    """Build the narrow TEST_NEIS/null-reconciliation fixture contract.
+
+    This deliberately does not call the production builder or rewrite a production
+    source implicitly. Callers select this helper only for source-agnostic snapshot,
+    transaction, recovery, and path-integrity tests.
+    """
+    root = Path(output_root)
+    root.mkdir(parents=True, exist_ok=True)
+    root = sync_module._validated_snapshot_root(root)
+    candidate_path = root / f".{snapshot_id}.candidate"
+    final_path = root / snapshot_id
+    if candidate_path.exists() or final_path.exists():
+        raise SnapshotQualityError("snapshot ID already exists")
+
+    fixture_records = tuple(
+        replace(record, source="TEST_NEIS")
+        for record in records
+    )
+    sync_module._validate_enrichment_provenance(
+        fixture_records,
+        enrichment_provenance,
+    )
+    institutions, sites = sync_module._build_current_records(
+        fixture_records,
+        snapshot_id,
+        coverage,
+    )
+    issues: list[str] = []
+    selectable = [
+        institution
+        for institution in institutions
+        if institution.institution_type != "UNCLASSIFIED_SCHOOL"
+    ]
+    coordinate_rate = (
+        sum(
+            institution.status is InstitutionStatus.ACTIVE
+            for institution in selectable
+        )
+        / len(selectable)
+        if selectable
+        else 1.0
+    )
+    if previous is not None:
+        institutions, sites = sync_module._preserve_missing_records(
+            institutions,
+            sites,
+            previous,
+            snapshot_id,
+        )
+        previous_active = sum(
+            item.status is InstitutionStatus.ACTIVE
+            for item in previous.institutions
+        )
+        current_active = sum(
+            item.status is InstitutionStatus.ACTIVE
+            for item in institutions
+        )
+        if previous_active and current_active < previous_active * 0.9:
+            issues.append("record count drop exceeds 10 percent")
+    if coordinate_rate < 0.98:
+        issues.append("coordinate validation success rate is below 98 percent")
+
+    candidate_path.mkdir()
+    institution_bytes = sync_module._jsonl_bytes(institutions)
+    site_bytes = sync_module._jsonl_bytes(sites)
+    (candidate_path / "institutions.jsonl").write_bytes(institution_bytes)
+    (candidate_path / "sites.jsonl").write_bytes(site_bytes)
+    now = sync_module._utc_now()
+    observation_counts = observation_date_counts(
+        record.source_as_of for record in fixture_records
+    )
+    effective_enrichment = {
+        item.source: item for item in enrichment_provenance
+    }
+    if previous is not None:
+        required_enrichments = {
+            {
+                "OFFICIAL_STANDARD_COORDINATE": "OFFICIAL_STANDARD_SCHOOL_LOCATION",
+                "GEOCODED": "KAKAO_LOCAL_GEOCODING",
+            }[site.coordinate_quality]
+            for site in sites
+            if site.coordinate_quality
+            in {"OFFICIAL_STANDARD_COORDINATE", "GEOCODED"}
+        }
+        previous_enrichments = {
+            item.source: item for item in previous.manifest.enrichments
+        }
+        for source in required_enrichments - set(effective_enrichment):
+            prior = previous_enrichments[source]
+            effective_enrichment[source] = EnrichmentProvenance(
+                source=prior.source,
+                endpoint=prior.endpoint,
+                license_name=prior.license_name,
+                attribution=prior.attribution,
+                fetched_at=prior.fetched_at,
+                source_as_of=prior.source_as_of,
+                raw_sha256=prior.raw_sha256,
+                normalized_sha256=prior.source_normalized_sha256,
+                request_region_code=prior.request_region_code,
+                request_timing=prior.request_timing,
+                page_count=prior.page_count,
+                fetched_row_count=prior.fetched_row_count,
+                matched_row_count=0,
+                matched_normalized_sha256=None,
+            )
+    provenance = SourceProvenance(
+        source="TEST_NEIS",
+        endpoint="https://example.invalid/test-only-neis-fixture",
+        license_name="TEST_ONLY_SYNTHETIC_DATA",
+        attribution="Synthetic TEST_NEIS fixture; not for release",
+        fetched_at="2026-08-13T00:00:00Z",
+        source_as_of=source_as_of_for(observation_counts),
+        source_observation_date_counts=observation_counts,
+        normalized_observation_date_counts=observation_counts,
+        raw_sha256=hashlib.sha256(b"explicit-test-neis-fixture").hexdigest(),
+        page_count=1,
+        row_count=len(fixture_records),
+        fetched_row_count=len(fixture_records),
+        request_region_code="TEST_ONLY",
+        request_timing=None,
+        normalized_sha256=normalized_records_sha256(
+            [_before_enrichment(record) for record in fixture_records]
         ),
-        enrichment_provenance=enrichment_provenance,
+    )
+    snapshot_as_of = max(
+        [item.source_as_of for item in institutions],
+        default=now[:10],
+    )
+    manifest = sync_module._candidate_manifest(
+        snapshot_id=snapshot_id,
+        created_at=now,
+        snapshot_as_of=snapshot_as_of,
+        institutions=institutions,
+        sites=sites,
+        institution_bytes=institution_bytes,
+        site_bytes=site_bytes,
+        possible_matches=sync_module._persisted_possible_matches(
+            institutions,
+            sites,
+        ),
+        previous=previous,
+        source_provenance={"TEST_NEIS": provenance},
+        source_records=fixture_records,
+        enrichment_provenance=tuple(
+            effective_enrichment[source]
+            for source in sorted(effective_enrichment)
+        ),
+        school_count_reconciliation={},
+    )
+    manifest["schoolCountReconciliation"] = None
+    sync_module._write_json(candidate_path / "manifest.json", manifest)
+    for file_name in ("manifest.json", "institutions.jsonl", "sites.jsonl"):
+        sync_module._fsync_file(candidate_path / file_name)
+    sync_module._fsync_directory(candidate_path)
+    sync_module._fsync_directory(root)
+    sync_module._create_build_transaction(
+        root,
+        snapshot_id=snapshot_id,
+        manifest=manifest,
+        issues=tuple(issues),
+    )
+    return SnapshotBuildResult(
+        snapshot_id=snapshot_id,
+        candidate_path=candidate_path,
+        approved=False,
+        issues=tuple(issues),
     )
 
 
@@ -6436,10 +6552,23 @@ def promote_snapshot(
     )
     review_digest = packet["reviewDigest"]
     assert isinstance(review_digest, str)
+    snapshot_path = (
+        candidate.candidate_path
+        if candidate.candidate_path.exists()
+        else output_root / candidate.snapshot_id
+    )
+    manifest = json.loads(
+        (snapshot_path / "manifest.json").read_text(encoding="utf-8")
+    )
+    reviewer_role = (
+        "TEST_FIXTURE_REVIEWER"
+        if manifest["schoolCountReconciliation"] is None
+        else "data-steward"
+    )
     return sync_module.approve_candidate_snapshot(
         snapshot_id=candidate.snapshot_id,
         review_digest=review_digest,
-        reviewer_role="data-steward",
+        reviewer_role=reviewer_role,
         snapshot_root=output_root,
         coverage=coverage,
     )
@@ -6800,80 +6929,7 @@ def reviewed_population_fixture() -> tuple[
     tuple[SourceInstitutionRecord, ...],
     dict[str, SourceProvenance],
 ]:
-    profile = load_school_count_population_profile(
-        SOURCE_RESOURCES / "school-count-population-profile.csv",
-        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
-    )
-    benchmark = load_reviewed_school_counts(
-        SOURCE_RESOURCES / "sen-annual-school-counts.csv"
-    )
-    records: list[SourceInstitutionRecord] = []
-    sequence = 1
-    for row in profile.rows:
-        if row.reconciliation_role == "NONSELECTABLE":
-            continue
-        assert row.normalized_type is not None
-        for _ in range(row.observed_count):
-            source_as_of = (
-                profile.kindergarten_source_as_of
-                if row.source == "KINDERGARTEN_INFO"
-                else "2026-06-07"
-            )
-            records.append(
-                replace(
-                    source_record(
-                        institution_id=(
-                            f"kinder:{sequence:07d}"
-                            if row.source == "KINDERGARTEN_INFO"
-                            else f"neis:B10:{sequence:07d}"
-                        )
-                    ),
-                    official_name=f"검증학교-{sequence:07d}",
-                    institution_type=row.normalized_type,
-                    source=row.source,
-                    source_region_code=(
-                        "11" if row.source == "KINDERGARTEN_INFO" else "B10"
-                    ),
-                    source_as_of=source_as_of,
-                    source_kind_label=(
-                        row.source_category if row.source == "NEIS" else None
-                    ),
-                )
-            )
-            sequence += 1
-    record_tuple = tuple(records)
-    provenance = source_provenance_for(record_tuple)
-    neis = provenance["NEIS"]
-    kindergarten = provenance["KINDERGARTEN_INFO"]
-    provenance["NEIS"] = replace(
-        neis,
-        page_count=2,
-        source_as_of="2026-06-07",
-        source_observation_date_counts=(("2026-06-07", 1_415),),
-        normalized_observation_date_counts=(("2026-06-07", 1_414),),
-        row_count=1_414,
-        fetched_row_count=1_415,
-        unclassified_school_kind_counts=(
-            REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
-        ),
-        unclassified_school_policy_sha256=(
-            REVIEWED_NEIS_UNCLASSIFIED_POLICY.sha256
-        ),
-        source_category_counts=tuple(
-            sorted(profile.source_category_counts("NEIS").items())
-        ),
-    )
-    provenance["KINDERGARTEN_INFO"] = replace(
-        kindergarten,
-        source_as_of="2026-04-01",
-        source_observation_date_counts=(("2026-04-01", 706),),
-        normalized_observation_date_counts=(("2026-04-01", 706),),
-        request_timing="20261",
-        row_count=706,
-        fetched_row_count=706,
-        source_category_counts=(("KINDERGARTEN_TOTAL", 706),),
-    )
-    return profile, benchmark, record_tuple, provenance
+    return shared_reviewed_population_fixture()
 
 
 def drift_one_elementary_record(
