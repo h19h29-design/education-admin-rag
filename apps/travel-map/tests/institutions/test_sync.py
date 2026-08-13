@@ -4256,6 +4256,163 @@ def test_sync_cli_fails_closed_without_credentials(tmp_path: Path) -> None:
     assert not (snapshot_root / "current.json").exists()
 
 
+def _run_snapshot_admin_script(
+    script_name: str,
+    *arguments: str,
+    secret: str = "administrator-key-fixture-must-not-appear",
+) -> subprocess.CompletedProcess[str]:
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": "apps/travel-map",
+        "NEIS_API_KEY": secret,
+        "KINDERGARTEN_API_KEY": secret,
+        "KAKAO_REST_API_KEY": secret,
+    }
+    return subprocess.run(
+        [
+            sys.executable,
+            f"apps/travel-map/scripts/{script_name}",
+            *arguments,
+        ],
+        cwd=Path.cwd(),
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+# Production break caught: review accidentally initializes a credential/network
+# dependency or emits anything other than the one deterministic review packet.
+def test_review_cli_uses_no_credentials_and_prints_one_compact_packet(
+    tmp_path: Path,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="review-cli-contract",
+    )
+
+    completed = _run_snapshot_admin_script(
+        "review-institution-snapshot.py",
+        "--snapshot-id",
+        candidate.snapshot_id,
+        "--snapshot-root",
+        str(tmp_path),
+        "--geodata-root",
+        "apps/travel-map/resources/geodata",
+    )
+
+    assert completed.returncode == 0
+    packet = json.loads(completed.stdout)
+    assert packet["snapshotId"] == candidate.snapshot_id
+    assert packet["status"] == "CANDIDATE_REVIEW_REQUIRED"
+    assert re.fullmatch(r"[0-9a-f]{64}", packet["reviewDigest"])
+    assert completed.stdout == (
+        json.dumps(
+            packet,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    assert completed.stderr == ""
+    assert "administrator-key-fixture-must-not-appear" not in (
+        completed.stdout + completed.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    (
+        "review-institution-snapshot.py",
+        "approve-institution-snapshot.py",
+    ),
+)
+def test_review_and_approval_clis_reject_credential_arguments(
+    script_name: str,
+) -> None:
+    required_arguments = ["--snapshot-id", "credential-argument-check"]
+    if script_name.startswith("approve-"):
+        required_arguments.extend(
+            [
+                "--review-digest",
+                "a" * 64,
+                "--reviewer-role",
+                "data-steward",
+            ]
+        )
+    completed = _run_snapshot_admin_script(
+        script_name,
+        *required_arguments,
+        "--env-file",
+        "administrator-key-fixture-must-not-appear",
+    )
+
+    assert completed.returncode == 2
+    assert "unrecognized arguments: --env-file" in completed.stderr
+    assert "administrator-key-fixture-must-not-appear" not in completed.stdout
+
+
+# Production break caught: approval prints the wrong status/digest or publishes
+# without routing the reviewed digest through approve_candidate_snapshot().
+def test_approval_cli_prints_exact_safe_success_record(
+    tmp_path: Path,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="approval-cli-contract",
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    review_digest = packet["reviewDigest"]
+    assert isinstance(review_digest, str)
+
+    completed = _run_snapshot_admin_script(
+        "approve-institution-snapshot.py",
+        "--snapshot-id",
+        candidate.snapshot_id,
+        "--review-digest",
+        review_digest,
+        "--reviewer-role",
+        "data-steward",
+        "--snapshot-root",
+        str(tmp_path),
+        "--geodata-root",
+        "apps/travel-map/resources/geodata",
+    )
+
+    expected = {
+        "reviewDigest": review_digest,
+        "snapshotId": candidate.snapshot_id,
+        "status": "SNAPSHOT_APPROVED",
+    }
+    assert completed.returncode == 0
+    assert completed.stdout == (
+        json.dumps(
+            expected,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    assert completed.stderr == ""
+    assert "administrator-key-fixture-must-not-appear" not in (
+        completed.stdout + completed.stderr
+    )
+    assert json.loads((tmp_path / "current.json").read_text(encoding="utf-8")) == {
+        "snapshotId": candidate.snapshot_id
+    }
+
+
 def neis_payload(*, source_type: str) -> dict[str, object]:
     payload = copy.deepcopy(load_json("neis-school-info.json"))
     section = payload["schoolInfo"]

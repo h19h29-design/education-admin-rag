@@ -56,15 +56,34 @@ and performance and outage fallback verification.
 
 Production accepts only the normalized snapshot selected by `resources/institution-snapshots/current.json`. Its pointer, approval metadata, hashes, and row schemas are validated at image build and startup. Never copy from `tests/fixtures` to this directory.
 
-With NEIS, kindergarten, and Kakao REST synchronization keys configured:
+The snapshot workflow below is administrator-only. The public map does not
+expose review or approval controls.
 
 ```sh
+# 1. Networked, credentialed: creates .<id>.candidate only.
 uv run --project apps/travel-map python apps/travel-map/scripts/sync-institutions.py \
-  --env-file apps/travel-map/.env
-uv run --project apps/travel-map python -c 'from app.institutions.snapshot import verify_snapshot; print(verify_snapshot("apps/travel-map/resources/institution-snapshots").manifest.snapshot_id)'
+  --env-file /secure/path/travel-map-sync.env
+
+# 2. Credential-free: inspect source counts, observation-date histograms,
+#    quarantine IDs, coordinate quality, provenance hashes, and diff.
+uv run --project apps/travel-map python \
+  apps/travel-map/scripts/review-institution-snapshot.py \
+  --snapshot-id '<candidate-id>'
+
+# 3. After a data steward independently records the review, publish exactly
+#    the inspected digest. This is the only command that can update current.json.
+uv run --project apps/travel-map python \
+  apps/travel-map/scripts/approve-institution-snapshot.py \
+  --snapshot-id '<candidate-id>' --review-digest '<64-lowercase-hex>' \
+  --reviewer-role data-steward
 ```
 
-Use the synchronizer as the only promotion path. An authorized data reviewer must check source scope, counts, quarantined records, coordinate quality, and the diff before approving the manifest. A missing or invalid approved snapshot is a release blocker, never permission to substitute a sample catalog.
+The expected NEIS observation-date distribution is `1413/1/1` until official
+source dates converge. This histogram is review provenance: it is neither an
+automatic rejection nor permission to normalize or collapse distinct dates.
+Release remains blocked until step 3 publishes the independently reviewed
+digest. A missing or invalid approved snapshot is a release blocker, never
+permission to substitute a sample catalog.
 
 ## Live smoke and manual approval
 
