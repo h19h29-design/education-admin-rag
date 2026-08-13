@@ -1,7 +1,10 @@
 """Hash-pinned quarantine policy for reviewed B10 NEIS lifelong schools."""
 
 import csv
+import errno
 import hashlib
+import os
+import stat
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +26,14 @@ _METADATA: Final = (
 _HEADER: Final = ("school_kind", "expected_count", "reason_code")
 _REASON_CODE: Final = "OFFICIAL_CLASSIFICATION_PENDING"
 _EXPECTED_TOTAL: Final = 18
+_REVIEWED_COUNTS: Final = (
+    ("평생학교(고)-2년6학기", 7),
+    ("평생학교(고)-3년6학기", 4),
+    ("평생학교(중)-2년6학기", 5),
+    ("평생학교(초)-3년6학기", 2),
+)
+_REVIEWED_AS_OF: Final = "2026-08-13"
+_REVIEWER_ROLE: Final = "data-steward"
 
 
 @dataclass(frozen=True)
@@ -32,6 +43,18 @@ class NeisUnclassifiedPolicy:
     reviewed_as_of: str
     reviewer_role: str
 
+    def __post_init__(self) -> None:
+        if (
+            type(self.counts) is not tuple
+            or self.counts != _REVIEWED_COUNTS
+            or self.sha256 != PINNED_POLICY_SHA256
+            or self.reviewed_as_of != _REVIEWED_AS_OF
+            or self.reviewer_role != _REVIEWER_ROLE
+        ):
+            raise SourceDataError(
+                "NEIS unclassified policy is not the exact reviewed policy"
+            )
+
     @property
     def labels(self) -> frozenset[str]:
         return frozenset(label for label, _ in self.counts)
@@ -39,16 +62,7 @@ class NeisUnclassifiedPolicy:
 
 def load_neis_unclassified_policy(path: Path) -> NeisUnclassifiedPolicy:
     """Load the one hash-pinned B10 quarantine policy or fail closed."""
-    resource = Path(path)
-    if resource.is_symlink() or not resource.is_file():
-        raise SourceDataError("NEIS unclassified policy must be a regular file")
-    try:
-        with resource.open("rb") as handle:
-            content = handle.read(_MAX_POLICY_BYTES + 1)
-    except OSError:
-        raise SourceDataError("NEIS unclassified policy cannot be read") from None
-    if len(content) > _MAX_POLICY_BYTES:
-        raise SourceDataError("NEIS unclassified policy exceeds the size limit")
+    content = _read_policy_bytes(Path(path))
     if hashlib.sha256(content).hexdigest() != PINNED_POLICY_SHA256:
         raise SourceDataError("NEIS unclassified policy SHA-256 is not reviewed")
     try:
@@ -92,9 +106,50 @@ def load_neis_unclassified_policy(path: Path) -> NeisUnclassifiedPolicy:
     return NeisUnclassifiedPolicy(
         counts=tuple(counts),
         sha256=PINNED_POLICY_SHA256,
-        reviewed_as_of=dict(_METADATA)["reviewedAsOf"],
-        reviewer_role=dict(_METADATA)["reviewerRole"],
+        reviewed_as_of=_REVIEWED_AS_OF,
+        reviewer_role=_REVIEWER_ROLE,
     )
+
+
+def _read_policy_bytes(resource: Path) -> bytes:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise SourceDataError("NEIS unclassified policy requires no-follow support")
+    try:
+        descriptor = os.open(resource, os.O_RDONLY | no_follow)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise SourceDataError(
+                "NEIS unclassified policy must not be a symlink"
+            ) from None
+        raise SourceDataError("NEIS unclassified policy cannot be read") from None
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise SourceDataError("NEIS unclassified policy must be a regular file")
+        if before.st_size > _MAX_POLICY_BYTES:
+            raise SourceDataError("NEIS unclassified policy exceeds the size limit")
+        content = _read_exactly(descriptor, before.st_size)
+        after = os.fstat(descriptor)
+        if after.st_size != before.st_size:
+            raise SourceDataError("NEIS unclassified policy changed while reading")
+        return content
+    except OSError:
+        raise SourceDataError("NEIS unclassified policy cannot be read") from None
+    finally:
+        os.close(descriptor)
+
+
+def _read_exactly(descriptor: int, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(descriptor, remaining)
+        if not chunk:
+            raise SourceDataError("NEIS unclassified policy changed while reading")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def validate_unclassified_school_counts(

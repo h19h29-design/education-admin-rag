@@ -83,11 +83,16 @@ TEST_COVERAGE = CoverageService.from_geojson(
     seoul_path="apps/travel-map/resources/geodata/seoul.geojson",
     buffer_distance_m=12_000,
 )
-EMPTY_NEIS_UNCLASSIFIED_POLICY = NeisUnclassifiedPolicy(
-    counts=(),
-    sha256="0" * 64,
+REVIEWED_NEIS_UNCLASSIFIED_POLICY = NeisUnclassifiedPolicy(
+    counts=(
+        ("평생학교(고)-2년6학기", 7),
+        ("평생학교(고)-3년6학기", 4),
+        ("평생학교(중)-2년6학기", 5),
+        ("평생학교(초)-3년6학기", 2),
+    ),
+    sha256=PINNED_POLICY_SHA256,
     reviewed_as_of="2026-08-13",
-    reviewer_role="test",
+    reviewer_role="data-steward",
 )
 
 
@@ -233,6 +238,81 @@ def test_load_neis_unclassified_policy_accepts_exact_reviewed_resource() -> None
     assert policy.sha256 == PINNED_POLICY_SHA256
     assert policy.reviewed_as_of == "2026-08-13"
     assert policy.reviewer_role == "data-steward"
+
+
+@pytest.mark.parametrize(
+    ("counts", "sha256"),
+    [
+        (
+            (("unreviewed-kind", 18),),
+            PINNED_POLICY_SHA256,
+        ),
+        (
+            (
+                ("평생학교(고)-2년6학기", 8),
+                ("평생학교(고)-3년6학기", 4),
+                ("평생학교(중)-2년6학기", 5),
+                ("평생학교(초)-3년6학기", 1),
+            ),
+            PINNED_POLICY_SHA256,
+        ),
+        (
+            (
+                ("평생학교(고)-2년6학기", 7),
+                ("평생학교(고)-3년6학기", 4),
+                ("평생학교(중)-2년6학기", 5),
+                ("평생학교(초)-3년6학기", 2),
+            ),
+            "0" * 64,
+        ),
+    ],
+)
+def test_neis_unclassified_policy_rejects_caller_supplied_contract_drift(
+    counts: tuple[tuple[str, int], ...],
+    sha256: str,
+) -> None:
+    with pytest.raises(SourceDataError, match="reviewed"):
+        NeisUnclassifiedPolicy(
+            counts=counts,
+            sha256=sha256,
+            reviewed_as_of="2026-08-13",
+            reviewer_role="data-steward",
+        )
+
+
+def test_neis_unclassified_policy_rejects_oversized_file_before_content_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "oversized-policy.csv"
+    path.write_bytes(b"x" * (16 * 1024 + 1))
+
+    def unexpected_content_open(*args: object, **kwargs: object) -> object:
+        raise AssertionError("oversized policy content was opened")
+
+    monkeypatch.setattr(Path, "open", unexpected_content_open)
+
+    with pytest.raises(SourceDataError, match="size limit"):
+        load_neis_unclassified_policy(path)
+
+
+def test_neis_unclassified_policy_uses_no_follow_descriptor_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    actual_open = os.open
+    calls: list[int] = []
+
+    def recording_open(path: object, flags: int, *args: object) -> int:
+        calls.append(flags)
+        return actual_open(path, flags, *args)
+
+    monkeypatch.setattr(neis_classification_module.os, "open", recording_open)
+
+    load_neis_unclassified_policy(resource)
+
+    assert calls
+    assert all(flags & os.O_NOFOLLOW for flags in calls)
 
 
 @pytest.mark.parametrize(
@@ -1924,17 +2004,23 @@ def test_keyless_official_school_csv_only_enriches_matching_neis_identity() -> N
 @pytest.mark.asyncio
 async def test_neis_source_requires_real_key_and_paginates_to_declared_total() -> None:
     requests: list[httpx.Request] = []
+    source_types = (
+        "\ucd08\ub4f1\ud559\uad50",
+        "\ucd08\ub4f1\ud559\uad50",
+        *reviewed_neis_source_types(),
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        payload = neis_payload(source_type="\ucd08\ub4f1\ud559\uad50")
         page = int(request.url.params["pIndex"])
-        section = payload["schoolInfo"]
-        assert type(section) is list
-        section[0]["head"][0]["list_total_count"] = 2
-        row = section[1]["row"][0]
-        row["SD_SCHUL_CODE"] = f"701000{page}"
-        return httpx.Response(200, json=payload)
+        return httpx.Response(
+            200,
+            json=neis_page_payload(
+                source_types,
+                page=page,
+                page_size=10,
+            ),
+        )
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler)
@@ -1942,12 +2028,12 @@ async def test_neis_source_requires_real_key_and_paginates_to_declared_total() -
         source = NeisSource(
             api_key="test-key",
             client=client,
-            unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
-            page_size=1,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            page_size=10,
         )
         result = await source.fetch()
 
-    assert len(result.records) == 2
+    assert len(result.records) == 20
     assert result.provenance.page_count == 2
     assert [request.url.params["pIndex"] for request in requests] == ["1", "2"]
     assert all(request.url.params["ATPT_OFCDC_SC_CODE"] == "B10" for request in requests)
@@ -1956,7 +2042,7 @@ async def test_neis_source_requires_real_key_and_paginates_to_declared_total() -
         NeisSource(
             api_key="",
             client=httpx.AsyncClient(),
-            unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
         )
 
 
@@ -1978,7 +2064,7 @@ async def test_neis_source_rejects_keyless_sample_and_redacts_invalid_key() -> N
             await NeisSource(
                 api_key=secret,
                 client=client,
-                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
             ).fetch()
 
     assert secret not in str(raised.value)
@@ -1998,7 +2084,7 @@ async def test_source_http_failure_traceback_does_not_retain_api_key() -> None:
             await NeisSource(
                 api_key=secret,
                 client=client,
-                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
             ).fetch()
 
     formatted = "".join(
@@ -2024,7 +2110,7 @@ async def test_unexpected_transport_failure_does_not_retain_api_key() -> None:
             await NeisSource(
                 api_key=secret,
                 client=client,
-                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
             ).fetch()
 
     assert_secret_absent_from_app_traceback(raised.value, raised.tb, secret)
@@ -2099,7 +2185,13 @@ async def test_successful_source_fetches_clear_api_keys(tmp_path: Path) -> None:
     kindergarten_secret = "successful-kindergarten-secret"
 
     def neis_handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=neis_payload(source_type="초등학교"))
+        return httpx.Response(
+            200,
+            json=neis_payload_rows(
+                "\ucd08\ub4f1\ud559\uad50",
+                *reviewed_neis_source_types(),
+            ),
+        )
 
     def kindergarten_handler(request: httpx.Request) -> httpx.Response:
         payload = kindergarten_payload()
@@ -2114,7 +2206,7 @@ async def test_successful_source_fetches_clear_api_keys(tmp_path: Path) -> None:
         neis = NeisSource(
             api_key=neis_secret,
             client=client,
-            unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
         )
         await neis.fetch()
     async with httpx.AsyncClient(
@@ -2135,17 +2227,16 @@ async def test_successful_source_fetches_clear_api_keys(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
-        payload = neis_payload(source_type="\ucd08\ub4f1\ud559\uad50")
+        payload = neis_payload_rows(
+            "\ucd08\ub4f1\ud559\uad50",
+            *reviewed_neis_source_types(),
+            "\uacf5\ub3d9\uc2e4\uc2b5\uc18c",
+        )
         sections = payload["schoolInfo"]
         assert type(sections) is list
-        first = sections[1]["row"][0]
-        excluded = dict(first)
-        excluded["SD_SCHUL_CODE"] = "7010999"
-        excluded["SCHUL_KND_SC_NM"] = "\uacf5\ub3d9\uc2e4\uc2b5\uc18c"
-        first["LOAD_DTM"] = "20260423"
-        excluded["LOAD_DTM"] = "20260607"
-        sections[0]["head"][0]["list_total_count"] = 2
-        sections[1]["row"] = [first, excluded]
+        for row in sections[1]["row"][:-1]:
+            row["LOAD_DTM"] = "20260423"
+        sections[1]["row"][-1]["LOAD_DTM"] = "20260607"
         return httpx.Response(200, json=payload)
 
     async with httpx.AsyncClient(
@@ -2154,37 +2245,41 @@ async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
         result = await NeisSource(
             api_key="test-key",
             client=client,
-            unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
-            page_size=2,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            page_size=20,
         ).fetch()
 
-    assert len(result.records) == 1
+    assert len(result.records) == 19
     assert result.provenance.page_count == 1
-    assert result.provenance.fetched_row_count == 2
-    assert result.provenance.row_count == 1
+    assert result.provenance.fetched_row_count == 20
+    assert result.provenance.row_count == 19
     assert result.provenance.source_as_of is None
     assert result.provenance.source_observation_date_counts == (
-        ("2026-04-23", 1),
+        ("2026-04-23", 19),
         ("2026-06-07", 1),
     )
     assert result.provenance.normalized_observation_date_counts == (
-        ("2026-04-23", 1),
+        ("2026-04-23", 19),
     )
 
 
 @pytest.mark.asyncio
 async def test_neis_fetch_records_raw_and_normalized_mixed_vintage_histograms() -> None:
+    source_types = (*reviewed_neis_source_types(), *("\ucd08\ub4f1\ud559\uad50",) * 4)
+
     def handler(request: httpx.Request) -> httpx.Response:
         page = int(request.url.params["pIndex"])
-        payload = load_json("neis-school-info.json")
+        payload = neis_page_payload(source_types, page=page, page_size=11)
         sections = payload["schoolInfo"]
         assert type(sections) is list
-        sections[0]["head"][0]["list_total_count"] = 4
         rows = sections[1]["row"]
         for index, row in enumerate(rows):
-            row["SD_SCHUL_CODE"] = f"70100{page}{index}"
-        rows[0]["LOAD_DTM"] = "20260423"
-        rows[1]["LOAD_DTM"] = "20260517" if page == 1 else "20260607"
+            source_index = (page - 1) * 11 + index
+            row["LOAD_DTM"] = (
+                "20260517"
+                if source_index == 1
+                else "20260607" if source_index == 21 else "20260423"
+            )
         return httpx.Response(200, json=payload)
 
     async with httpx.AsyncClient(
@@ -2193,18 +2288,18 @@ async def test_neis_fetch_records_raw_and_normalized_mixed_vintage_histograms() 
         result = await NeisSource(
             api_key="test-key",
             client=client,
-            unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
-            page_size=2,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            page_size=11,
         ).fetch()
 
     assert result.provenance.source_as_of is None
     assert result.provenance.source_observation_date_counts == (
-        ("2026-04-23", 2),
+        ("2026-04-23", 20),
         ("2026-05-17", 1),
         ("2026-06-07", 1),
     )
     assert result.provenance.normalized_observation_date_counts == (
-        ("2026-04-23", 2),
+        ("2026-04-23", 20),
         ("2026-05-17", 1),
         ("2026-06-07", 1),
     )
@@ -2212,16 +2307,23 @@ async def test_neis_fetch_records_raw_and_normalized_mixed_vintage_histograms() 
 
 @pytest.mark.asyncio
 async def test_neis_source_preserves_different_date_on_excluded_only_page() -> None:
+    source_types = (
+        "\ucd08\ub4f1\ud559\uad50",
+        *reviewed_neis_source_types(),
+        "\uacf5\ub3d9\uc2e4\uc2b5\uc18c",
+    )
+
     def handler(request: httpx.Request) -> httpx.Response:
         page = int(request.url.params["pIndex"])
-        payload = neis_payload(
-            source_type=("초등학교" if page == 1 else "공동실습소")
-        )
+        payload = neis_page_payload(source_types, page=page, page_size=10)
         section = payload["schoolInfo"]
-        section[0]["head"][0]["list_total_count"] = 2  # type: ignore[index]
-        row = section[1]["row"][0]  # type: ignore[index]
-        row["SD_SCHUL_CODE"] = f"701000{page}"
-        row["LOAD_DTM"] = "20260810" if page == 1 else "20260809"
+        rows = section[1]["row"]  # type: ignore[index]
+        for index, row in enumerate(rows):
+            row["LOAD_DTM"] = (
+                "20260809"
+                if (page - 1) * 10 + index == len(source_types) - 1
+                else "20260810"
+            )
         return httpx.Response(200, json=payload)
 
     async with httpx.AsyncClient(
@@ -2230,17 +2332,17 @@ async def test_neis_source_preserves_different_date_on_excluded_only_page() -> N
         result = await NeisSource(
             api_key="test-key",
             client=client,
-            unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
-            page_size=1,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            page_size=10,
         ).fetch()
 
     assert result.provenance.source_as_of is None
     assert result.provenance.source_observation_date_counts == (
         ("2026-08-09", 1),
-        ("2026-08-10", 1),
+        ("2026-08-10", 19),
     )
     assert result.provenance.normalized_observation_date_counts == (
-        ("2026-08-10", 1),
+        ("2026-08-10", 19),
     )
 
 
@@ -2268,7 +2370,7 @@ async def test_neis_source_rejects_five_row_sample_success_shape() -> None:
             await NeisSource(
                 api_key="test-key",
                 client=client,
-                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
             ).fetch()
 
     assert len(requests) == 1
@@ -2303,7 +2405,7 @@ async def test_neis_source_bounds_declared_total_before_second_request(
             await NeisSource(
                 api_key="test-key",
                 client=client,
-                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
                 page_size=1,
             ).fetch()
 
@@ -2328,7 +2430,7 @@ async def test_neis_source_rejects_oversized_response_before_retention(
             await NeisSource(
                 api_key="test-key",
                 client=client,
-                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
             ).fetch()
 
 
@@ -2356,7 +2458,7 @@ async def test_neis_response_stream_stops_after_byte_limit(
             await NeisSource(
                 api_key="test-key",
                 client=client,
-                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
             ).fetch()
 
     assert yielded_chunks < 10
@@ -2383,7 +2485,7 @@ async def test_neis_source_rejects_more_rows_than_requested_page_size() -> None:
             await NeisSource(
                 api_key="test-key",
                 client=client,
-                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
                 page_size=1,
             ).fetch()
 
@@ -2412,7 +2514,7 @@ async def test_neis_source_bounds_actual_page_counter(
             await NeisSource(
                 api_key="test-key",
                 client=client,
-                unclassified_policy=EMPTY_NEIS_UNCLASSIFIED_POLICY,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
                 page_size=1_000,
             ).fetch()
 
@@ -4795,6 +4897,31 @@ def neis_payload_rows(*source_types: str) -> dict[str, object]:
         }
         for index, source_type in enumerate(source_types, start=1)
     ]
+    return payload
+
+
+def reviewed_neis_source_types() -> tuple[str, ...]:
+    return tuple(
+        label
+        for label, count in REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
+        for _ in range(count)
+    )
+
+
+def neis_page_payload(
+    source_types: tuple[str, ...],
+    *,
+    page: int,
+    page_size: int,
+) -> dict[str, object]:
+    offset = (page - 1) * page_size
+    payload = neis_payload_rows(*source_types[offset : offset + page_size])
+    section = payload["schoolInfo"]
+    assert type(section) is list
+    section[0]["head"][0]["list_total_count"] = len(source_types)
+    rows = section[1]["row"]
+    for index, row in enumerate(rows, start=offset + 1):
+        row["SD_SCHUL_CODE"] = f"{7010000 + index}"
     return payload
 
 
