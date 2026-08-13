@@ -198,6 +198,22 @@ def test_school_count_population_profile_rejects_malformed_utf8_resource(
         )
 
 
+def test_school_count_population_profile_rejects_crlf_normalized_resource(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "profile.csv"
+    content = (
+        SOURCE_RESOURCES / "school-count-population-profile.csv"
+    ).read_bytes()
+    path.write_bytes(content.replace(b"\n", b"\r\n"))
+
+    with pytest.raises(SourceDataError, match="LF|SHA-256"):
+        load_school_count_population_profile(
+            path,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+        )
+
+
 def test_school_count_population_profile_rejects_symlinked_resource(
     tmp_path: Path,
 ) -> None:

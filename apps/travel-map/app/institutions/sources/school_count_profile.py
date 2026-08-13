@@ -218,16 +218,18 @@ def load_school_count_population_profile(
         text = content.decode("utf-8")
     except UnicodeDecodeError:
         raise SourceDataError("school count population profile must be UTF-8") from None
-    if not text.endswith("\n"):
-        raise SourceDataError("school count population profile must end with a newline")
-    lines = text.splitlines()
+    if b"\r" in content:
+        raise SourceDataError("school count population profile must use exact LF newlines")
+    if not content.endswith(b"\n"):
+        raise SourceDataError("school count population profile must end with LF")
+    lines = text[:-1].split("\n")
     if not lines or not lines[0].startswith("# normalized_sha256="):
         raise SourceDataError("school count population profile digest is invalid")
     digest = lines[0].removeprefix("# normalized_sha256=")
     if not _is_sha256(digest):
         raise SourceDataError("school count population profile digest is invalid")
-    canonical = "\n".join(lines[1:]) + "\n"
-    actual_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    _, _, canonical = content.partition(b"\n")
+    actual_digest = hashlib.sha256(canonical).hexdigest()
     if digest != actual_digest or digest != PINNED_POPULATION_PROFILE_SHA256:
         raise SourceDataError("school count population profile SHA-256 is not reviewed")
 
