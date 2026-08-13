@@ -21,7 +21,7 @@
 
 ## Approved Execution Sequencing
 
-Tasks 1–3 form one compatibility implementation and review unit.  Execute the RED/GREEN test cycles in their listed order, but do not commit an intermediate state that introduces `sourceAsOf: null` while downstream manifest or candidate validation still requires one date.  Make the first implementation commit only after all Task 1–3 contracts pass together; then perform one combined Task 1 review.  Tasks 4–6 retain their listed sequence and review gates.
+Tasks 1–3 form one compatibility implementation and review unit.  Execute the RED/GREEN test cycles in their listed order, but do not commit an intermediate state that introduces `sourceAsOf: null` while downstream manifest or candidate validation still requires one date.  Make the first implementation commit only after all Task 1–3 contracts pass together; then perform one combined Task 1 review.  Task 4 also removes automatic promotion from the existing synchronizer, because removing the public promotion API while leaving that CLI import/call creates either a bypass shim or an unusable intermediate command.  Task 5 then adds the credential-free review/approval CLIs and administrator documentation.
 
 ---
 
@@ -462,6 +462,7 @@ git commit -m "feat: bind mixed NEIS vintages to snapshots"
 
 **Files:**
 - Modify: `apps/travel-map/app/institutions/sync.py:656-850, 1690-1995, 2149-2520`
+- Modify: `apps/travel-map/scripts/sync-institutions.py:1-270`
 - Modify: `apps/travel-map/tests/institutions/test_sync.py:430-640, 1740-3440`
 - Test: `apps/travel-map/tests/test_release.py`
 
@@ -480,7 +481,7 @@ def approve_candidate_snapshot(
 ) -> str: ...
 ```
 
-The old public `promote_snapshot()` symbol is removed.  Its atomic mutation body remains private and is reachable only after `approve_candidate_snapshot()` has verified a rebuilt packet under the root lock.
+The old public `promote_snapshot()` symbol is removed.  Its atomic mutation body remains private and is reachable only after `approve_candidate_snapshot()` has verified a rebuilt packet under the root lock.  The existing synchronizer stops after an unapproved candidate and prints only its safe candidate-required status; it must neither import nor call a compatibility promotion shim.
 
 - [ ] **Step 1: Write review-packet and approval failures**
 
@@ -582,7 +583,22 @@ For a `PUBLISHED` transaction that already points to this candidate, accept only
 
 In `test_release.py`, create an unapproved candidate via the test helper and assert `stage_release_context()` raises before staging files.  Then obtain a review packet, approve with its exact digest, and assert the resulting selected snapshot is stageable.  Do not change release scripts; they already validate `current.json` through `verify_snapshot()`.
 
-- [ ] **Step 7: Run all approval, recovery, and release regressions**
+- [ ] **Step 7: Remove automatic promotion from the existing synchronizer**
+
+Remove `promote_snapshot` from `sync-institutions.py` imports and delete its promotion call and post-promotion manifest summary.  After a candidate with no quality issues is built, print only the compact, sorted record below and return.  Keep pre-promotion reconciliation audit output and all credential-clearing `finally` paths.
+
+```python
+print(json.dumps(
+    {"status": "CANDIDATE_REVIEW_REQUIRED", "snapshotId": snapshot_id},
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+))
+```
+
+Add a test through the existing `_run_with_keys()` fixture path that asserts this status, no `current.json`, and no `promote_snapshot` import/call.  A candidate quality issue must still fail safely while leaving any prior pointer unchanged.
+
+- [ ] **Step 8: Run all approval, synchronizer, recovery, and release regressions**
 
 Run:
 
@@ -594,10 +610,11 @@ PYTHONWARNINGS=error uv run --project apps/travel-map python -m pytest \
 
 Expected: PASS.  Candidate-only, tampering, locked recheck, state-machine recovery, idempotent retry, and release-blocking behavior all remain covered.
 
-- [ ] **Step 8: Commit human approval enforcement**
+- [ ] **Step 9: Commit human approval enforcement**
 
 ```sh
 git add apps/travel-map/app/institutions/sync.py \
+  apps/travel-map/scripts/sync-institutions.py \
   apps/travel-map/tests/institutions/test_sync.py \
   apps/travel-map/tests/test_release.py
 git commit -m "feat: require review digest for snapshot approval"
