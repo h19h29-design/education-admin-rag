@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import runpy
 import subprocess
 import sys
 import threading
@@ -4331,7 +4332,7 @@ def test_review_cli_uses_no_credentials_and_prints_one_compact_packet(
         "approve-institution-snapshot.py",
     ),
 )
-def test_review_and_approval_clis_reject_credential_arguments(
+def test_review_and_approval_clis_redact_rejected_argument_values(
     script_name: str,
 ) -> None:
     required_arguments = ["--snapshot-id", "credential-argument-check"]
@@ -4352,8 +4353,60 @@ def test_review_and_approval_clis_reject_credential_arguments(
     )
 
     assert completed.returncode == 2
-    assert "unrecognized arguments: --env-file" in completed.stderr
-    assert "administrator-key-fixture-must-not-appear" not in completed.stdout
+    assert "invalid command arguments" in completed.stderr
+    assert "administrator-key-fixture-must-not-appear" not in (
+        completed.stdout + completed.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    (
+        "review-institution-snapshot.py",
+        "approve-institution-snapshot.py",
+    ),
+)
+def test_snapshot_admin_cli_parse_errors_do_not_retain_rejected_values_in_app_frames(
+    script_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "rejected-argument-secret-must-not-appear"
+    required_arguments = ["--snapshot-id", "redacted-argument-check"]
+    if script_name.startswith("approve-"):
+        required_arguments.extend(
+            [
+                "--review-digest",
+                "a" * 64,
+                "--reviewer-role",
+                "data-steward",
+            ]
+        )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            f"apps/travel-map/scripts/{script_name}",
+            *required_arguments,
+            "--env-file",
+            secret,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        runpy.run_path(
+            f"apps/travel-map/scripts/{script_name}",
+            run_name="__main__",
+        )
+
+    assert raised.value.code == 2
+    output = capsys.readouterr()
+    assert secret not in output.out + output.err
+    assert_secret_absent_from_app_traceback(
+        raised.value,
+        raised.value.__traceback__,
+        secret,
+    )
 
 
 # Production break caught: approval prints the wrong status/digest or publishes

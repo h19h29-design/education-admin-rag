@@ -2,13 +2,20 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 from app.institutions.sync import SnapshotQualityError, approve_candidate_snapshot
 from app.policy.coverage import CoverageService
 
 
+class _RedactingArgumentParser(argparse.ArgumentParser):
+    def error(self, _message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: error: invalid command arguments\n")
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = _RedactingArgumentParser(
         description="Approve an independently reviewed institution snapshot."
     )
     parser.add_argument("--snapshot-id", required=True)
