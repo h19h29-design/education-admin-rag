@@ -311,6 +311,35 @@ def test_candidate_rejects_an_extra_production_source(tmp_path: Path) -> None:
     assert not (tmp_path / ".extra-production-source.candidate").exists()
 
 
+# Production break caught: previous-row preservation runs after incoming source
+# validation and must not merge the synthetic fixture identity into production.
+def test_candidate_rejects_test_source_preserved_into_production_output(
+    tmp_path: Path,
+) -> None:
+    fixture = build_explicit_test_fixture_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="fixture-before-production",
+        coverage=FAST_TEST_COVERAGE,
+    )
+    promote_snapshot(fixture, tmp_path, coverage=FAST_TEST_COVERAGE)
+    pointer = tmp_path / "current.json"
+    pointer_before = pointer.read_bytes()
+
+    with pytest.raises(SnapshotQualityError, match="production source set"):
+        build_reviewed_population_candidate(
+            previous=verify_snapshot(tmp_path),
+            output_root=tmp_path,
+            snapshot_id="production-preserving-fixture",
+            include_reviewed_sen=True,
+        )
+
+    assert not (tmp_path / ".production-preserving-fixture.candidate").exists()
+    assert not (tmp_path / "production-preserving-fixture").exists()
+    assert pointer.read_bytes() == pointer_before
+
+
 # Production break caught: an attacker who can rewrite public snapshot metadata
 # and re-sign the transaction can alter the reviewed population after digest review.
 def test_final_approval_replays_population_and_reconciliation_before_pointer_write(

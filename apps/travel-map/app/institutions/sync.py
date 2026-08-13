@@ -1070,6 +1070,8 @@ def build_candidate_snapshot(
 
     effective_source_provenance = dict(source_provenance)
     output_sources = {institution.source for institution in institutions}
+    if output_sources != PRODUCTION_INSTITUTION_SOURCES:
+        raise SnapshotQualityError(_PRODUCTION_SOURCE_SET_MISMATCH)
     if previous is not None:
         previous_sources = {
             item.source: item for item in previous.manifest.sources
