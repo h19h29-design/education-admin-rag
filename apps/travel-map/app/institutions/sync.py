@@ -44,6 +44,9 @@ from app.institutions.sources.neis_classification import (
     PINNED_POLICY_SHA256,
     NeisUnclassifiedPolicy,
 )
+from app.institutions.sources.school_count_profile import (
+    SchoolCountPopulationProfile,
+)
 from app.institutions.sources.sen_counts import ReviewedSchoolCounts
 from app.institutions.sources.standard_school import (
     DOWNLOAD_URL as STANDARD_LOCATION_ENDPOINT,
@@ -240,138 +243,309 @@ class SnapshotBuildResult:
     issues: tuple[str, ...]
 
 
+_POPULATION_SOURCES = frozenset({"NEIS", "KINDERGARTEN_INFO"})
+_POPULATION_MISMATCH = "source population profile does not match fetched data"
+
+
+def _is_exact_population_counts(
+    actual: object,
+    expected: Mapping[str, int],
+) -> bool:
+    return (
+        type(actual) is tuple
+        and all(
+            type(entry) is tuple
+            and len(entry) == 2
+            and type(entry[0]) is str
+            and type(entry[1]) is int
+            for entry in actual
+        )
+        and actual == tuple(sorted(expected.items()))
+    )
+
+
+def _is_canonical_positive_counts(value: object) -> bool:
+    return (
+        type(value) is tuple
+        and all(
+            type(entry) is tuple
+            and len(entry) == 2
+            and type(entry[0]) is str
+            and bool(entry[0])
+            and type(entry[1]) is int
+            and entry[1] > 0
+            for entry in value
+        )
+        and value == tuple(sorted(value))
+        and len({entry[0] for entry in value}) == len(value)
+    )
+
+
+def _require_reviewed_population_profile(
+    profile: SchoolCountPopulationProfile,
+) -> None:
+    if type(profile) is not SchoolCountPopulationProfile:
+        raise SnapshotQualityError(_POPULATION_MISMATCH)
+    try:
+        SchoolCountPopulationProfile(**profile.__dict__)
+    except (TypeError, ValueError):
+        raise SnapshotQualityError(_POPULATION_MISMATCH) from None
+
+
+def bind_school_count_population_profile(
+    provenance: Mapping[str, SourceProvenance],
+    *,
+    profile: SchoolCountPopulationProfile,
+) -> dict[str, SourceProvenance]:
+    """Bind raw source histograms to the exact reviewed population profile."""
+    _require_reviewed_population_profile(profile)
+    if set(provenance).issuperset(_POPULATION_SOURCES) is False:
+        raise SnapshotQualityError(_POPULATION_MISMATCH)
+    bound: dict[str, SourceProvenance] = {}
+    for source, item in provenance.items():
+        if (
+            type(source) is not str
+            or type(item.source) is not str
+            or item.source != source
+        ):
+            raise SnapshotQualityError(_POPULATION_MISMATCH)
+        if source not in _POPULATION_SOURCES:
+            if (
+                item.source_category_counts
+                or item.source_population_role_counts
+                or item.source_population_profile_sha256 is not None
+            ):
+                raise SnapshotQualityError(_POPULATION_MISMATCH)
+            bound[source] = item
+            continue
+        if (
+            not _is_exact_population_counts(
+                item.source_category_counts,
+                profile.source_category_counts(source),
+            )
+            or item.source_population_role_counts
+            or item.source_population_profile_sha256 is not None
+        ):
+            raise SnapshotQualityError(_POPULATION_MISMATCH)
+        if source == "NEIS":
+            valid = (
+                type(item.request_region_code) is str
+                and item.request_region_code == profile.neis_region_code
+                and item.request_timing is None
+                and type(item.fetched_row_count) is int
+                and item.fetched_row_count == profile.neis_fetched_row_count
+                and type(item.row_count) is int
+                and item.row_count == profile.neis_normalized_row_count
+                and _is_canonical_positive_counts(
+                    item.source_observation_date_counts
+                )
+                and _is_canonical_positive_counts(
+                    item.normalized_observation_date_counts
+                )
+                and sum(count for _, count in item.source_observation_date_counts)
+                == profile.neis_fetched_row_count
+                and sum(
+                    count for _, count in item.normalized_observation_date_counts
+                )
+                == profile.neis_normalized_row_count
+                and _is_exact_population_counts(
+                    item.unclassified_school_kind_counts,
+                    {
+                        row.source_category: row.observed_count
+                        for row in profile.rows
+                        if row.source == "NEIS"
+                        and row.reconciliation_role == "QUARANTINED"
+                    },
+                )
+                and type(item.unclassified_school_policy_sha256) is str
+                and item.unclassified_school_policy_sha256
+                == profile.unclassified_policy_sha256
+            )
+        else:
+            valid = (
+                type(item.request_region_code) is str
+                and item.request_region_code == "11"
+                and type(item.request_timing) is str
+                and item.request_timing == profile.kindergarten_timing
+                and type(item.source_as_of) is str
+                and item.source_as_of == profile.kindergarten_source_as_of
+                and type(item.fetched_row_count) is int
+                and item.fetched_row_count
+                == profile.kindergarten_fetched_row_count
+                and type(item.row_count) is int
+                and item.row_count == profile.kindergarten_fetched_row_count
+                and _is_exact_population_counts(
+                    item.source_observation_date_counts,
+                    {
+                        profile.kindergarten_source_as_of: (
+                            profile.kindergarten_fetched_row_count
+                        )
+                    },
+                )
+                and _is_exact_population_counts(
+                    item.normalized_observation_date_counts,
+                    {
+                        profile.kindergarten_source_as_of: (
+                            profile.kindergarten_fetched_row_count
+                        )
+                    },
+                )
+            )
+        if not valid:
+            raise SnapshotQualityError(_POPULATION_MISMATCH)
+        bound[source] = replace(
+            item,
+            source_population_role_counts=tuple(
+                profile.role_counts(source).items()
+            ),
+            source_population_profile_sha256=profile.sha256,
+        )
+    return bound
+
+
 def reconcile_selectable_school_counts(
     records: tuple[SourceInstitutionRecord, ...],
     *,
     benchmark: ReviewedSchoolCounts,
+    population_profile: SchoolCountPopulationProfile,
+    source_provenance: Mapping[str, SourceProvenance],
     unclassified_policy: NeisUnclassifiedPolicy,
-    tolerance: float = 0.01,
 ) -> dict[str, object]:
-    if not 0.0 <= tolerance <= 0.1:
-        raise SnapshotQualityError("school reconciliation tolerance is invalid")
-    if not benchmark.counts or any(
-        type(expected) is not int or expected <= 0
-        for expected in benchmark.counts.values()
-    ):
-        raise SnapshotQualityError("school reconciliation expected count is invalid")
+    _require_reviewed_population_profile(population_profile)
     if (
-        set(benchmark.counts) != set(benchmark.category_evidence)
-        or set(benchmark.counts) != set(benchmark.category_composition)
+        population_profile.unclassified_policy_sha256
+        != unclassified_policy.sha256
+        or set(source_provenance).issuperset(_POPULATION_SOURCES) is False
     ):
-        raise SnapshotQualityError("school reconciliation evidence is incomplete")
-    actual_counts = Counter(record.institution_type for record in records)
-    categories: dict[str, dict[str, object]] = {}
-    for institution_type, expected_count in sorted(benchmark.counts.items()):
-        expected_source = (
-            "KINDERGARTEN_INFO"
-            if institution_type == "KINDERGARTEN"
-            else "NEIS"
+        raise SnapshotQualityError(
+            "school population quarantine does not match reviewed profile"
         )
-        matching_records = tuple(
-            record
-            for record in records
-            if record.institution_type == institution_type
-        )
-        actual_count = actual_counts[institution_type]
-        delta_count = abs(actual_count - expected_count)
-        delta_ratio = delta_count / expected_count
-        actual_sources = sorted({record.source for record in matching_records})
-        actual_source_as_of = sorted(
-            {record.source_as_of for record in matching_records}
-        )
-        actual_source_observation_date_counts = dict(
+    sources: dict[str, dict[str, object]] = {}
+    for source in sorted(_POPULATION_SOURCES):
+        provenance = source_provenance[source]
+        role_counts = population_profile.role_counts(source)
+        if (
+            provenance.source != source
+            or type(provenance.source_population_profile_sha256) is not str
+            or provenance.source_population_profile_sha256
+            != population_profile.sha256
+            or not _is_exact_population_counts(
+                provenance.source_population_role_counts,
+                role_counts,
+            )
+            or not _is_exact_population_counts(
+                provenance.source_category_counts,
+                population_profile.source_category_counts(source),
+            )
+        ):
+            raise SnapshotQualityError(
+                "source population profile binding is invalid"
+            )
+        sources[source] = {"roleCounts": role_counts}
+
+    profile_rows = {
+        (row.source, row.source_category): row
+        for row in population_profile.rows
+    }
+    normalized_category_counts: Counter[tuple[str, str]] = Counter()
+    for record in records:
+        if record.source == "NEIS":
+            if record.source_kind_label is None:
+                raise SnapshotQualityError(
+                    "normalized school category does not match reviewed profile"
+                )
+            row = profile_rows.get((record.source, record.source_kind_label))
+            if row is None or row.normalized_type != record.institution_type:
+                raise SnapshotQualityError(
+                    "normalized school category does not match reviewed profile"
+                )
+            normalized_category_counts[(record.source, record.source_kind_label)] += 1
+        elif record.source == "KINDERGARTEN_INFO":
+            if (
+                record.institution_type != "KINDERGARTEN"
+                or record.source_kind_label is not None
+                or record.source_as_of
+                != population_profile.kindergarten_source_as_of
+            ):
+                raise SnapshotQualityError(
+                    "kindergarten population does not match reviewed profile"
+                )
+            normalized_category_counts[(record.source, "KINDERGARTEN_TOTAL")] += 1
+        else:
+            raise SnapshotQualityError(
+                "school population contains an unrelated source"
+            )
+    for row in population_profile.rows:
+        expected = 0 if row.reconciliation_role == "NONSELECTABLE" else row.observed_count
+        if normalized_category_counts[(row.source, row.source_category)] != expected:
+            raise SnapshotQualityError(
+                "normalized school population does not match reviewed profile"
+            )
+    if (
+        dict(
             sorted(
                 Counter(
-                    record.source_as_of for record in matching_records
+                    record.source_kind_label
+                    for record in records
+                    if record.source == "NEIS"
+                    and record.institution_type == "UNCLASSIFIED_SCHOOL"
+                    and record.source_kind_label is not None
                 ).items()
             )
         )
-        source_validation_passed = (
-            actual_sources == [expected_source]
-            and bool(actual_source_as_of)
+        != dict(unclassified_policy.counts)
+    ):
+        raise SnapshotQualityError(
+            "school population quarantine does not match reviewed profile"
         )
-        evidence = benchmark.category_evidence[institution_type]
+
+    if (
+        not benchmark.counts
+        or any(
+            type(expected) is not int or expected <= 0
+            for expected in benchmark.counts.values()
+        )
+        or set(benchmark.counts)
+        != set(dict(population_profile.approved_variances))
+        or set(benchmark.counts) != set(benchmark.category_evidence)
+        or set(benchmark.counts) != set(benchmark.category_composition)
+        or any(
+            evidence.source_url != population_profile.benchmark_source_url
+            or evidence.source_as_of != population_profile.benchmark_source_as_of
+            or evidence.source_sha256 != population_profile.benchmark_raw_sha256
+            for evidence in benchmark.category_evidence.values()
+        )
+    ):
+        raise SnapshotQualityError(
+            "school count benchmark does not match reviewed profile"
+        )
+    actual_counts: Counter[str] = Counter()
+    for row in population_profile.rows:
+        if row.reconciliation_role == "BENCHMARK" and row.benchmark_type is not None:
+            actual_counts[row.benchmark_type] += row.observed_count
+    categories: dict[str, dict[str, object]] = {}
+    approved_variances = dict(population_profile.approved_variances)
+    for institution_type, expected_count in sorted(benchmark.counts.items()):
+        actual_count = actual_counts[institution_type]
+        delta = actual_count - expected_count
+        if delta != approved_variances[institution_type]:
+            raise SnapshotQualityError(
+                "school count variance does not match reviewed profile"
+            )
         categories[institution_type] = {
             "expectedCount": expected_count,
             "actualCount": actual_count,
-            "deltaCount": delta_count,
-            "deltaRatio": delta_ratio,
-            "threshold": tolerance,
-            "expectedSource": expected_source,
-            "actualSources": actual_sources,
-            "actualSourceAsOf": actual_source_as_of,
-            "actualSourceObservationDateCounts": (
-                actual_source_observation_date_counts
-            ),
-            "sourceValidationPassed": source_validation_passed,
-            "sourceUrl": evidence.source_url,
-            "sourceAsOf": evidence.source_as_of,
-            "sourceSha256": evidence.source_sha256,
-            "evidenceStatus": evidence.status,
-            "composition": benchmark.category_composition[institution_type],
-            "passed": delta_ratio <= tolerance and source_validation_passed,
+            "deltaCount": delta,
+            "status": "MATCHED" if delta == 0 else "REVIEWED_VARIANCE",
         }
-    reported_totals: list[dict[str, object]] = []
-    for total in benchmark.reported_totals:
-        population_types = total.population.split("+")
-        if (
-            total.used_for_gate
-            or not population_types
-            or any(name not in benchmark.counts for name in population_types)
-        ):
-            raise SnapshotQualityError(
-                "school reconciliation reported total is invalid"
-            )
-        reported_totals.append(
-            {
-                "expectedCount": total.expected_count,
-                "actualCount": sum(actual_counts[name] for name in population_types),
-                "population": total.population,
-                "usedForGate": False,
-                "passed": None,
-                "sourceUrl": total.evidence.source_url,
-                "sourceAsOf": total.evidence.source_as_of,
-                "sourceSha256": total.evidence.source_sha256,
-                "evidenceStatus": total.evidence.status,
-            }
-        )
-    unclassified_rows = [
-        record
-        for record in records
-        if record.institution_type == "UNCLASSIFIED_SCHOOL"
-    ]
-    unclassified_school_kind_counts = dict(
-        sorted(
-            Counter(
-                record.source_kind_label
-                for record in unclassified_rows
-                if record.source_kind_label is not None
-            ).items()
-        )
-    )
-    unclassified_policy_passed = (
-        all(
-            record.source == "NEIS" and record.source_kind_label is not None
-            for record in unclassified_rows
-        )
-        and unclassified_school_kind_counts == dict(unclassified_policy.counts)
-    )
-    result: dict[str, object] = {
-        "normalizedSha256": benchmark.normalized_sha256,
-        "threshold": tolerance,
+    return {
+        "profileStatus": population_profile.status,
+        "profileSha256": population_profile.sha256,
+        "benchmarkSha256": benchmark.normalized_sha256,
+        "sources": sources,
         "categories": categories,
-        "reportedTotals": reported_totals,
-        "unclassifiedSchoolKindCounts": unclassified_school_kind_counts,
-        "unclassifiedSchoolPolicySha256": (
-            unclassified_policy.sha256
-        ),
-        "unclassifiedPolicyPassed": unclassified_policy_passed,
-        "passed": all(
-            category["passed"] is True for category in categories.values()
-        )
-        and unclassified_policy_passed,
+        "passed": True,
     }
-    return result
 
 
 def build_sync_preflight_audit(

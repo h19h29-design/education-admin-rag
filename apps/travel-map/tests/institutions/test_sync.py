@@ -1336,157 +1336,282 @@ def test_reviewed_school_count_resource_rejects_mutation(
         load_reviewed_school_counts(tampered)
 
 
-@pytest.mark.parametrize(
-    ("institution_type", "expected", "passing_actual", "failing_actual"),
-    [
-        ("ELEMENTARY_SCHOOL", 609, 603, 602),
-        ("MIDDLE_SCHOOL", 390, 387, 386),
-        ("HIGH_SCHOOL", 318, 315, 314),
-    ],
-)
-def test_school_reconciliation_checks_one_percent_per_category(
-    institution_type: str,
-    expected: int,
-    passing_actual: int,
-    failing_actual: int,
-) -> None:
-    benchmark = reviewed_counts_fixture({institution_type: expected})
-    passing = reconcile_selectable_school_counts(
-        with_neis_quarantine(
-            records_for_type_counts({institution_type: passing_actual})
-        ),
-        benchmark=benchmark,
-        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
-    )
-    failing = reconcile_selectable_school_counts(
-        with_neis_quarantine(
-            records_for_type_counts({institution_type: failing_actual})
-        ),
-        benchmark=benchmark,
-        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+# Production break caught: accepting arbitrary percentage-close populations
+# instead of the exact signed variances approved for the reviewed source mix.
+def test_population_reconciliation_uses_exact_reviewed_signed_variances() -> None:
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    provenance = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
     )
 
-    assert passing["categories"][institution_type]["passed"] is True
-    assert passing["passed"] is True
-    assert failing["categories"][institution_type]["passed"] is False
-    assert failing["passed"] is False
-
-
-def test_school_reconciliation_cannot_hide_swapped_category_losses() -> None:
-    benchmark = reviewed_counts_fixture(
-        {"ELEMENTARY_SCHOOL": 609, "MIDDLE_SCHOOL": 390}
-    )
-    audit = reconcile_selectable_school_counts(
-        with_neis_quarantine(
-            records_for_type_counts(
-                {"ELEMENTARY_SCHOOL": 599, "MIDDLE_SCHOOL": 400}
-            )
-        ),
-        benchmark=benchmark,
-        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
-    )
-
-    assert audit["categories"]["ELEMENTARY_SCHOOL"]["passed"] is False
-    assert audit["categories"]["MIDDLE_SCHOOL"]["passed"] is False
-    assert audit["passed"] is False
-
-
-def test_school_reconciliation_passes_reviewed_real_count_fixture() -> None:
-    benchmark = load_reviewed_school_counts(
-        SOURCE_RESOURCES / "sen-annual-school-counts.csv"
-    )
-    audit = reconcile_selectable_school_counts(
-        with_neis_quarantine(records_for_type_counts(benchmark.counts)),
-        benchmark=benchmark,
-        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
-    )
-
-    assert audit["passed"] is True
-    assert audit["reportedTotals"] == [
-        {
-            "expectedCount": 2_092,
-            "actualCount": 2_092,
-            "population": (
-                "KINDERGARTEN+ELEMENTARY_SCHOOL+MIDDLE_SCHOOL+"
-                "HIGH_SCHOOL+SPECIAL_SCHOOL+MISC_SCHOOL"
-            ),
-            "usedForGate": False,
-            "passed": None,
-            "sourceUrl": (
-                "https://enews.sen.go.kr/uploads/img_smart//"
-                "2026-06-08/20260608075519432.png"
-            ),
-            "sourceAsOf": "2026-03-10",
-            "sourceSha256": (
-                "6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a170"
-                "5db508afeee15e70"
-            ),
-            "evidenceStatus": "PRELIMINARY_2026",
-        }
-    ]
-    assert (
-        audit["categories"]["KINDERGARTEN"]["sourceAsOf"]
-        == "2026-03-10"
-    )
-    assert (
-        audit["categories"]["ELEMENTARY_SCHOOL"]["sourceAsOf"]
-        == "2026-03-10"
-    )
-    assert audit["categories"]["MISC_SCHOOL"]["composition"] == (
-        "각종학교17+고등기술학교1"
-    )
-    assert all(
-        category["deltaCount"] == 0
-        for category in audit["categories"].values()
-    )
-
-
-def test_school_reconciliation_rejects_actual_source_contamination() -> None:
-    benchmark = reviewed_counts_fixture({"KINDERGARTEN": 1})
-    contaminated = (
-        replace(
-            source_record(),
-            institution_type="KINDERGARTEN",
-            source="NEIS",
-            institution_id="neis:B10:7010001",
-        ),
-    )
-
-    audit = reconcile_selectable_school_counts(
-        with_neis_quarantine(contaminated),
-        benchmark=benchmark,
-        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
-    )
-
-    assert audit["categories"]["KINDERGARTEN"]["sourceValidationPassed"] is False
-    assert audit["categories"]["KINDERGARTEN"]["passed"] is False
-    assert audit["passed"] is False
-
-
-# Production break caught: treating a valid mixed-vintage NEIS population as
-# contaminated merely because its raw rows were loaded on multiple dates.
-def test_school_reconciliation_allows_multi_vintage_neis_but_requires_neis_only() -> None:
-    records = with_neis_quarantine(mixed_neis_records())
-    benchmark = reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 4})
-
-    audit = reconcile_selectable_school_counts(
+    reconciliation = reconcile_selectable_school_counts(
         records,
         benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=provenance,
         unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
-    category = audit["categories"]["ELEMENTARY_SCHOOL"]
 
-    assert category["actualSourceAsOf"] == [
-        "2026-04-23",
-        "2026-05-17",
-        "2026-06-07",
-    ]
-    assert category["actualSourceObservationDateCounts"] == {
-        "2026-04-23": 2,
-        "2026-05-17": 1,
-        "2026-06-07": 1,
+    assert reconciliation["categories"] == {
+        "ELEMENTARY_SCHOOL": {
+            "expectedCount": 609,
+            "actualCount": 610,
+            "deltaCount": 1,
+            "status": "REVIEWED_VARIANCE",
+        },
+        "HIGH_SCHOOL": {
+            "expectedCount": 319,
+            "actualCount": 319,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        },
+        "KINDERGARTEN": {
+            "expectedCount": 724,
+            "actualCount": 706,
+            "deltaCount": -18,
+            "status": "REVIEWED_VARIANCE",
+        },
+        "MIDDLE_SCHOOL": {
+            "expectedCount": 390,
+            "actualCount": 390,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        },
+        "MISC_SCHOOL": {
+            "expectedCount": 18,
+            "actualCount": 22,
+            "deltaCount": 4,
+            "status": "REVIEWED_VARIANCE",
+        },
+        "SPECIAL_SCHOOL": {
+            "expectedCount": 32,
+            "actualCount": 32,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        },
     }
-    assert category["sourceValidationPassed"] is True
+    assert reconciliation["sources"]["NEIS"]["roleCounts"] == {
+        "BENCHMARK": 1_373,
+        "NONSELECTABLE": 1,
+        "QUARANTINED": 18,
+        "SUPPLEMENTARY": 23,
+    }
+    assert reconciliation["sources"]["KINDERGARTEN_INFO"][
+        "roleCounts"
+    ] == {"BENCHMARK": 706}
+    assert set(reconciliation) == {
+        "profileStatus",
+        "profileSha256",
+        "benchmarkSha256",
+        "sources",
+        "categories",
+        "passed",
+    }
+    assert reconciliation["passed"] is True
+
+
+def test_population_profile_binding_preserves_unrelated_sen_provenance() -> None:
+    profile, _, _, provenance = reviewed_population_fixture()
+    sen = source_provenance_for(
+        (
+            replace(
+                source_record(institution_id="sen:office"),
+                source="SEN_REVIEWED_CSV",
+                source_region_code="SEOUL",
+                institution_type="HEADQUARTERS",
+            ),
+        )
+    )["SEN_REVIEWED_CSV"]
+    raw = {**provenance, "SEN_REVIEWED_CSV": sen}
+
+    bound = sync_module.bind_school_count_population_profile(raw, profile=profile)
+
+    assert bound["SEN_REVIEWED_CSV"] is sen
+    assert bound["NEIS"].source_population_profile_sha256 == profile.sha256
+    assert bound["NEIS"].source_population_role_counts == (
+        ("BENCHMARK", 1_373),
+        ("NONSELECTABLE", 1),
+        ("QUARANTINED", 18),
+        ("SUPPLEMENTARY", 23),
+    )
+    assert bound["KINDERGARTEN_INFO"].source_population_role_counts == (
+        ("BENCHMARK", 706),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "raw_category_balance",
+        "unknown_raw_label",
+        "kindergarten_timing",
+        "kindergarten_date",
+        "kindergarten_total",
+        "neis_region",
+        "unrelated_population_fields",
+    ],
+)
+def test_population_profile_binding_rejects_source_drift_without_echoing_labels(
+    mutation: str,
+) -> None:
+    profile, _, _, provenance = reviewed_population_fixture()
+    target = "KINDERGARTEN_INFO" if mutation.startswith("kindergarten") else "NEIS"
+    item = provenance[target]
+    if mutation == "raw_category_balance":
+        counts = dict(item.source_category_counts)
+        counts["초등학교"] += 1
+        counts["중학교"] -= 1
+        provenance[target] = replace(
+            item, source_category_counts=tuple(sorted(counts.items()))
+        )
+    elif mutation == "unknown_raw_label":
+        provenance[target] = replace(
+            item,
+            source_category_counts=(*item.source_category_counts, ("SECRET_LABEL", 1)),
+        )
+    elif mutation == "kindergarten_timing":
+        provenance[target] = replace(item, request_timing="20262")
+    elif mutation == "kindergarten_date":
+        provenance[target] = replace(
+            item,
+            source_as_of="2026-10-01",
+            source_observation_date_counts=(("2026-10-01", 706),),
+            normalized_observation_date_counts=(("2026-10-01", 706),),
+        )
+    elif mutation == "kindergarten_total":
+        provenance[target] = replace(
+            item,
+            row_count=705,
+            fetched_row_count=705,
+            source_category_counts=(("KINDERGARTEN_TOTAL", 705),),
+        )
+    elif mutation == "neis_region":
+        provenance[target] = replace(item, request_region_code="C10")
+    else:
+        sen = replace(
+            item,
+            source="SEN_REVIEWED_CSV",
+            source_population_role_counts=(("BENCHMARK", 1),),
+        )
+        provenance["SEN_REVIEWED_CSV"] = sen
+
+    with pytest.raises(
+        SnapshotQualityError,
+        match="^source population profile does not match fetched data$",
+    ) as error:
+        sync_module.bind_school_count_population_profile(provenance, profile=profile)
+
+    assert "SECRET_LABEL" not in str(error.value)
+
+
+def test_supplementary_population_remains_in_records_but_outside_benchmark() -> None:
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    bound = sync_module.bind_school_count_population_profile(
+        provenance, profile=profile
+    )
+
+    reconciliation = reconcile_selectable_school_counts(
+        records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    assert sum(
+        record.source_kind_label in {
+            "방송통신고등학교",
+            "방송통신중학교",
+        }
+        for record in records
+    ) == 6
+    assert sum(record.source_kind_label == "외국인학교" for record in records) == 17
+    assert reconciliation["categories"]["HIGH_SCHOOL"]["actualCount"] == 319
+    assert reconciliation["categories"]["MIDDLE_SCHOOL"]["actualCount"] == 390
+    assert reconciliation["categories"]["MISC_SCHOOL"]["actualCount"] == 22
+    assert sum(
+        record.institution_type == "UNCLASSIFIED_SCHOOL" for record in records
+    ) == 18
+    assert "UNCLASSIFIED_SCHOOL" not in reconciliation["categories"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "record_label_type",
+        "missing_profile_hash",
+        "wrong_profile_hash",
+        "approved_delta_sign",
+        "broadcast_role",
+        "policy_profile",
+    ],
+)
+def test_signed_variance_reconciliation_rejects_reviewed_contract_drift(
+    mutation: str,
+) -> None:
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    bound = sync_module.bind_school_count_population_profile(
+        provenance, profile=profile
+    )
+    policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
+    if mutation == "record_label_type":
+        index = next(
+            index
+            for index, record in enumerate(records)
+            if record.source_kind_label == "초등학교"
+        )
+        mutable_records = list(records)
+        mutable_records[index] = replace(
+            mutable_records[index], institution_type="MIDDLE_SCHOOL"
+        )
+        records = tuple(mutable_records)
+    elif mutation in {"missing_profile_hash", "wrong_profile_hash"}:
+        bound["NEIS"] = replace(
+            bound["NEIS"],
+            source_population_profile_sha256=(
+                None if mutation == "missing_profile_hash" else "0" * 64
+            ),
+        )
+    elif mutation == "approved_delta_sign":
+        object.__setattr__(
+            profile,
+            "approved_variances",
+            tuple(
+                (name, -delta if name == "ELEMENTARY_SCHOOL" else delta)
+                for name, delta in profile.approved_variances
+            ),
+        )
+    elif mutation == "broadcast_role":
+        object.__setattr__(
+            profile,
+            "rows",
+            tuple(
+                replace(
+                    row,
+                    reconciliation_role="BENCHMARK",
+                    benchmark_type="HIGH_SCHOOL",
+                )
+                if row.source_category == "방송통신고등학교"
+                else row
+                for row in profile.rows
+            ),
+        )
+    else:
+        object.__setattr__(policy, "sha256", "0" * 64)
+
+    try:
+        with pytest.raises(SnapshotQualityError):
+            reconcile_selectable_school_counts(
+                records,
+                benchmark=benchmark,
+                population_profile=profile,
+                source_provenance=bound,
+                unclassified_policy=policy,
+            )
+    finally:
+        if mutation == "policy_profile":
+            object.__setattr__(policy, "sha256", PINNED_POLICY_SHA256)
 
 
 # Production break caught: treating reviewed lifelong-school labels as selectable
@@ -1526,11 +1651,6 @@ def test_unclassified_reconciliation_keeps_official_counts_and_forces_status(
     )
     records = (*official_records, *unclassified_records)
 
-    reconciliation = reconcile_selectable_school_counts(
-        records,
-        benchmark=reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 1}),
-        unclassified_policy=policy,
-    )
     candidate = build_test_candidate(
         records=with_neis_quarantine(records),
         previous=None,
@@ -1540,7 +1660,7 @@ def test_unclassified_reconciliation_keeps_official_counts_and_forces_status(
     audit = build_sync_preflight_audit(
         records,
         source_provenance=source_provenance_for(records),
-        reconciliation=reconciliation,
+        reconciliation={"passed": True},
     )
     institutions = [
         json.loads(line)
@@ -1555,10 +1675,6 @@ def test_unclassified_reconciliation_keeps_official_counts_and_forces_status(
         .splitlines()
     ]
 
-    assert reconciliation["categories"]["ELEMENTARY_SCHOOL"]["actualCount"] == 1
-    assert reconciliation["unclassifiedSchoolKindCounts"] == dict(policy.counts)
-    assert reconciliation["unclassifiedSchoolPolicySha256"] == policy.sha256
-    assert reconciliation["unclassifiedPolicyPassed"] is True
     assert audit["statusCounts"] == {
         "PRECHECK_READY_INSTITUTION": 1,
         "PRECHECK_REVIEW_REQUIRED_INSTITUTION": 18,
@@ -1582,14 +1698,7 @@ def test_neis_requires_the_complete_unclassified_quarantine_at_creation(
     tmp_path: Path,
 ) -> None:
     records = (source_record(),)
-    reconciliation = reconcile_selectable_school_counts(
-        records,
-        benchmark=reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 1}),
-        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
-    )
 
-    assert reconciliation["unclassifiedPolicyPassed"] is False
-    assert reconciliation["passed"] is False
     with pytest.raises(SnapshotQualityError, match="unclassified"):
         build_test_candidate(
             records=records,
@@ -2338,18 +2447,25 @@ def test_automatic_promotion_symbol_is_not_public(
 def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    records = with_neis_quarantine(
-        records_for_type_counts({"ELEMENTARY_SCHOOL": 602})
-    )
-    reconciliation = reconcile_selectable_school_counts(
-        records,
-        benchmark=reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 609}),
-        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
-    )
-    provenance = source_provenance_for(records)["NEIS"]
+    _, _, records, provenance = reviewed_population_fixture()
+    reconciliation = {
+        "profileStatus": "TEMPORARY_PRELIMINARY_VARIANCE",
+        "profileSha256": PINNED_POPULATION_PROFILE_SHA256,
+        "benchmarkSha256": "36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332",
+        "sources": {},
+        "categories": {
+            "ELEMENTARY_SCHOOL": {
+                "expectedCount": 609,
+                "actualCount": 609,
+                "deltaCount": 0,
+                "status": "REJECTED",
+            },
+        },
+        "passed": False,
+    }
     audit = build_sync_preflight_audit(
         records,
-        source_provenance={provenance.source: provenance},
+        source_provenance=provenance,
         reconciliation=reconciliation,
     )
 
@@ -2364,11 +2480,10 @@ def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
     assert parsed["auditStage"] == "PRE_PROMOTION_RECONCILIATION"
     assert parsed["passed"] is False
     assert parsed["reconciliation"]["passed"] is False
-    assert parsed["typeCounts"] == {
-        "ELEMENTARY_SCHOOL": 602,
-        "UNCLASSIFIED_SCHOOL": 18,
+    assert set(parsed["reconciliation"]["categories"]) == {
+        "ELEMENTARY_SCHOOL"
     }
-    assert parsed["sourceCounts"]["NEIS"]["normalized"] == 620
+    assert parsed["sourceCounts"]["NEIS"]["normalized"] == 1_414
     assert len(parsed["districtCounts"]) == 25
     assert "statusCounts" in parsed
     assert "quarantinedInstitutionIds" in parsed
@@ -2458,6 +2573,11 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
     )
     monkeypatch.setattr(
         module,
+        "bind_school_count_population_profile",
+        lambda provenance, *, profile: provenance,
+    )
+    monkeypatch.setattr(
+        module,
         "reconcile_selectable_school_counts",
         lambda *_args, **_kwargs: {"passed": False},
     )
@@ -2466,6 +2586,9 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
         sen_csv=SOURCE_RESOURCES / "sen-institutions.csv",
         region_codes=SOURCE_RESOURCES / "kindergarten-region-codes.csv",
         school_counts=SOURCE_RESOURCES / "sen-annual-school-counts.csv",
+        school_count_population_profile=(
+            SOURCE_RESOURCES / "school-count-population-profile.csv"
+        ),
         neis_unclassified_policy=(
             SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
         ),
@@ -2510,6 +2633,9 @@ def test_sync_cli_defaults_to_the_reviewed_neis_unclassified_policy(
     assert args.neis_unclassified_policy == (
         SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
     )
+    assert args.school_count_population_profile == (
+        SOURCE_RESOURCES / "school-count-population-profile.csv"
+    )
 
 
 @pytest.mark.asyncio
@@ -2531,10 +2657,13 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
     neis_records = (source_record(),)
     neis_provenance = source_provenance_for(neis_records)["NEIS"]
     loaded_policy = False
+    loaded_profile = False
+    population_calls: list[str] = []
 
     class FakeAsyncClient:
         def __init__(self, **_kwargs: object) -> None:
             assert loaded_policy, "policy must load before network clients"
+            assert loaded_profile, "population profile must load before network clients"
 
         async def __aenter__(self) -> object:
             return self
@@ -2658,6 +2787,35 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
         "load_reviewed_school_counts",
         lambda _path: object(),
     )
+    real_profile_loader = module.load_school_count_population_profile
+
+    def load_profile(
+        path: Path,
+        *,
+        unclassified_policy: NeisUnclassifiedPolicy,
+    ) -> SchoolCountPopulationProfile:
+        nonlocal loaded_profile
+        assert path == SOURCE_RESOURCES / "school-count-population-profile.csv"
+        assert unclassified_policy is REVIEWED_NEIS_UNCLASSIFIED_POLICY
+        loaded_profile = True
+        return real_profile_loader(path, unclassified_policy=unclassified_policy)
+
+    def bind_population(
+        provenance: Mapping[str, SourceProvenance],
+        *,
+        profile: SchoolCountPopulationProfile,
+    ) -> Mapping[str, SourceProvenance]:
+        assert loaded_profile
+        assert profile.sha256 == PINNED_POPULATION_PROFILE_SHA256
+        population_calls.append("bind")
+        return provenance
+
+    monkeypatch.setattr(module, "load_school_count_population_profile", load_profile)
+    monkeypatch.setattr(
+        module,
+        "bind_school_count_population_profile",
+        bind_population,
+    )
     monkeypatch.setattr(
         module,
         "build_candidate_snapshot",
@@ -2667,9 +2825,19 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
     def reconcile(
         *_args: object,
         unclassified_policy: NeisUnclassifiedPolicy,
+        population_profile: SchoolCountPopulationProfile,
+        source_provenance: Mapping[str, SourceProvenance],
         **_kwargs: object,
     ) -> dict[str, object]:
         assert unclassified_policy is REVIEWED_NEIS_UNCLASSIFIED_POLICY
+        assert population_profile.sha256 == PINNED_POPULATION_PROFILE_SHA256
+        assert set(source_provenance) == {
+            "NEIS",
+            "KINDERGARTEN_INFO",
+            "SEN_REVIEWED_CSV",
+        }
+        assert population_calls == ["bind"]
+        population_calls.append("reconcile")
         return {
             "passed": True,
             "unclassifiedSchoolKindCounts": dict(unclassified_policy.counts),
@@ -2693,6 +2861,9 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
         sen_csv=tmp_path / "sen.csv",
         region_codes=tmp_path / "regions.csv",
         school_counts=tmp_path / "counts.csv",
+        school_count_population_profile=(
+            SOURCE_RESOURCES / "school-count-population-profile.csv"
+        ),
         neis_unclassified_policy=(
             SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
         ),
@@ -2723,6 +2894,7 @@ async def test_sync_cli_stops_at_candidate_review_without_pointer_or_promotion(
     )
     assert (snapshot_root / ".candidate-only-cli.candidate").is_dir()
     assert not (snapshot_root / "current.json").exists()
+    assert population_calls == ["bind", "reconcile"]
 
 
 @pytest.mark.parametrize(
@@ -6251,6 +6423,86 @@ def reviewed_counts_fixture(counts: Mapping[str, int]) -> ReviewedSchoolCounts:
             ),
         ),
     )
+
+
+def reviewed_population_fixture() -> tuple[
+    SchoolCountPopulationProfile,
+    ReviewedSchoolCounts,
+    tuple[SourceInstitutionRecord, ...],
+    dict[str, SourceProvenance],
+]:
+    profile = load_school_count_population_profile(
+        SOURCE_RESOURCES / "school-count-population-profile.csv",
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+    benchmark = load_reviewed_school_counts(
+        SOURCE_RESOURCES / "sen-annual-school-counts.csv"
+    )
+    records: list[SourceInstitutionRecord] = []
+    sequence = 1
+    for row in profile.rows:
+        if row.reconciliation_role == "NONSELECTABLE":
+            continue
+        assert row.normalized_type is not None
+        for _ in range(row.observed_count):
+            source_as_of = (
+                profile.kindergarten_source_as_of
+                if row.source == "KINDERGARTEN_INFO"
+                else "2026-06-07"
+            )
+            records.append(
+                replace(
+                    source_record(
+                        institution_id=(
+                            f"kinder:{sequence:07d}"
+                            if row.source == "KINDERGARTEN_INFO"
+                            else f"neis:B10:{sequence:07d}"
+                        )
+                    ),
+                    institution_type=row.normalized_type,
+                    source=row.source,
+                    source_region_code=(
+                        "11" if row.source == "KINDERGARTEN_INFO" else "B10"
+                    ),
+                    source_as_of=source_as_of,
+                    source_kind_label=(
+                        row.source_category if row.source == "NEIS" else None
+                    ),
+                )
+            )
+            sequence += 1
+    record_tuple = tuple(records)
+    provenance = source_provenance_for(record_tuple)
+    neis = provenance["NEIS"]
+    kindergarten = provenance["KINDERGARTEN_INFO"]
+    provenance["NEIS"] = replace(
+        neis,
+        source_as_of="2026-06-07",
+        source_observation_date_counts=(("2026-06-07", 1_415),),
+        normalized_observation_date_counts=(("2026-06-07", 1_414),),
+        row_count=1_414,
+        fetched_row_count=1_415,
+        unclassified_school_kind_counts=(
+            REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
+        ),
+        unclassified_school_policy_sha256=(
+            REVIEWED_NEIS_UNCLASSIFIED_POLICY.sha256
+        ),
+        source_category_counts=tuple(
+            sorted(profile.source_category_counts("NEIS").items())
+        ),
+    )
+    provenance["KINDERGARTEN_INFO"] = replace(
+        kindergarten,
+        source_as_of="2026-04-01",
+        source_observation_date_counts=(("2026-04-01", 706),),
+        normalized_observation_date_counts=(("2026-04-01", 706),),
+        request_timing="20261",
+        row_count=706,
+        fetched_row_count=706,
+        source_category_counts=(("KINDERGARTEN_TOTAL", 706),),
+    )
+    return profile, benchmark, record_tuple, provenance
 
 
 def records_for_type_counts(

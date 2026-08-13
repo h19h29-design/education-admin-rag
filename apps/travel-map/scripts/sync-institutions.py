@@ -16,6 +16,9 @@ from app.institutions.sources.neis import NeisSource
 from app.institutions.sources.neis_classification import (
     load_neis_unclassified_policy,
 )
+from app.institutions.sources.school_count_profile import (
+    load_school_count_population_profile,
+)
 from app.institutions.sources.sen import SenCsvSource
 from app.institutions.sources.sen_counts import load_reviewed_school_counts
 from app.institutions.sources.standard_school import (
@@ -24,6 +27,7 @@ from app.institutions.sources.standard_school import (
 )
 from app.institutions.sync import (
     SnapshotQualityError,
+    bind_school_count_population_profile,
     build_candidate_snapshot,
     build_sync_preflight_audit,
     emit_sync_preflight_audit,
@@ -74,6 +78,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--school-count-population-profile",
+        type=Path,
+        default=Path(
+            "apps/travel-map/resources/institution-sources/"
+            "school-count-population-profile.csv"
+        ),
+    )
+    parser.add_argument(
         "--neis-unclassified-policy",
         type=Path,
         default=Path(
@@ -118,6 +130,10 @@ async def _run_with_keys(
     ],
 ) -> None:
     policy = load_neis_unclassified_policy(args.neis_unclassified_policy)
+    population_profile = load_school_count_population_profile(
+        args.school_count_population_profile,
+        unclassified_policy=policy,
+    )
     timeout = httpx.Timeout(5.0, connect=2.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
         neis_source = NeisSource(
@@ -148,22 +164,27 @@ async def _run_with_keys(
             standard_result.locations,
         )
         benchmark = load_reviewed_school_counts(args.school_counts)
-        reconciliation = reconcile_selectable_school_counts(
-            neis_result.records + kindergarten_result.records,
-            benchmark=benchmark,
-            unclassified_policy=policy,
-        )
         all_records = (
             neis_records + kindergarten_result.records + sen_result.records
         )
-        source_provenance = {
-            item.source: item
-            for item in (
-                neis_result.provenance,
-                kindergarten_result.provenance,
-                sen_result.provenance,
-            )
-        }
+        source_provenance = bind_school_count_population_profile(
+            {
+                item.source: item
+                for item in (
+                    neis_result.provenance,
+                    kindergarten_result.provenance,
+                    sen_result.provenance,
+                )
+            },
+            profile=population_profile,
+        )
+        reconciliation = reconcile_selectable_school_counts(
+            neis_result.records + kindergarten_result.records,
+            benchmark=benchmark,
+            population_profile=population_profile,
+            source_provenance=source_provenance,
+            unclassified_policy=policy,
+        )
         emit_sync_preflight_audit(
             build_sync_preflight_audit(
                 all_records,
