@@ -286,7 +286,7 @@ def sha256(path: Path) -> str:
 def normalize_timestamp(value: str | None) -> str:
     if value is None:
         value = datetime.now(UTC).replace(microsecond=0).isoformat()
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("collected-at must include a timezone")
     return (

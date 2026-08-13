@@ -352,7 +352,7 @@ def round_coordinates(value: Any) -> Any:
 def normalize_collected_at(value: str | None) -> str:
     if value is None:
         value = datetime.now(UTC).replace(microsecond=0).isoformat()
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("collected-at must include a timezone")
     return (
@@ -364,7 +364,7 @@ def normalize_provenance_collected_at(value: object) -> str:
     if not isinstance(value, str):
         raise TypeError("source provenance collectedAt must be a string")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except ValueError as error:
         raise ValueError(
             "source provenance collectedAt must be a timezone-aware ISO-8601 timestamp"
