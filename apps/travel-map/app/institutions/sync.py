@@ -2898,7 +2898,7 @@ def _validate_build_transaction(
             raise SnapshotQualityError("build transaction approval phase is invalid")
     elif (
         type(approval_values[0]) is not str
-        or _SHA256.fullmatch(cast(str, approval_values[0])) is None
+        or _SHA256.fullmatch(approval_values[0]) is None
         or type(approval_values[1]) is not str
         or approval_values[2] not in {"data-steward", "TEST_FIXTURE_REVIEWER"}
     ):

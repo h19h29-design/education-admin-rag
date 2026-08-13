@@ -3,6 +3,7 @@ import unicodedata
 from collections import Counter
 from collections.abc import Mapping
 from datetime import date
+from typing import cast
 
 import httpx
 
@@ -236,7 +237,7 @@ def _neis_rows(payload: Mapping[str, object]) -> list[object]:
         rows = rows_node["row"]
     except KeyError as exc:
         raise SourceDataError("NEIS schoolInfo response shape is invalid") from exc
-    return rows
+    return cast(list[object], rows)
 
 
 def _raise_neis_error(payload: Mapping[str, object]) -> None:

@@ -17,7 +17,7 @@ from shapely.geometry import (  # type: ignore[import-untyped]
     Polygon,
     mapping,
 )
-from shapely.geometry import shape as shape_geometry  # type: ignore[import-untyped]
+from shapely.geometry import shape as shape_geometry
 from shapely.geometry.base import BaseGeometry  # type: ignore[import-untyped]
 from shapely.ops import transform, unary_union  # type: ignore[import-untyped]
 

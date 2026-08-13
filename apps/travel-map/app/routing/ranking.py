@@ -1,5 +1,5 @@
 from collections.abc import Mapping, Sequence
-from math import isfinite
+from math import hypot, isfinite
 
 from pyproj import Transformer
 from shapely.geometry import LineString  # type: ignore[import-untyped]
@@ -155,4 +155,4 @@ def _point_distance(
     left: tuple[float, float],
     right: tuple[float, float],
 ) -> float:
-    return ((left[0] - right[0]) ** 2 + (left[1] - right[1]) ** 2) ** 0.5
+    return hypot(left[0] - right[0], left[1] - right[1])
