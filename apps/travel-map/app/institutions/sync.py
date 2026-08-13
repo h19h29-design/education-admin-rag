@@ -40,6 +40,10 @@ from app.institutions.sources.common import (
     source_as_of_for,
     validate_observation_date_counts,
 )
+from app.institutions.sources.neis_classification import (
+    PINNED_POLICY_SHA256,
+    NeisUnclassifiedPolicy,
+)
 from app.institutions.sources.sen_counts import ReviewedSchoolCounts
 from app.institutions.sources.standard_school import (
     DOWNLOAD_URL as STANDARD_LOCATION_ENDPOINT,
@@ -78,6 +82,7 @@ _ALLOWED_TYPES_BY_SOURCE = {
         "HIGH_SCHOOL",
         "SPECIAL_SCHOOL",
         "MISC_SCHOOL",
+        "UNCLASSIFIED_SCHOOL",
     },
     "KINDERGARTEN_INFO": {"KINDERGARTEN"},
     "SEN_REVIEWED_CSV": {
@@ -239,6 +244,7 @@ def reconcile_selectable_school_counts(
     records: tuple[SourceInstitutionRecord, ...],
     *,
     benchmark: ReviewedSchoolCounts,
+    unclassified_policy: NeisUnclassifiedPolicy | None = None,
     tolerance: float = 0.01,
 ) -> dict[str, object]:
     if not 0.0 <= tolerance <= 0.1:
@@ -329,14 +335,47 @@ def reconcile_selectable_school_counts(
                 "evidenceStatus": total.evidence.status,
             }
         )
+    unclassified_rows = [
+        record
+        for record in records
+        if record.institution_type == "UNCLASSIFIED_SCHOOL"
+    ]
+    unclassified_school_kind_counts = dict(
+        sorted(
+            Counter(
+                record.source_kind_label
+                for record in unclassified_rows
+                if record.source_kind_label is not None
+            ).items()
+        )
+    )
+    unclassified_policy_passed = (
+        not unclassified_rows
+        if unclassified_policy is None
+        else (
+            all(
+                record.source == "NEIS" and record.source_kind_label is not None
+                for record in unclassified_rows
+            )
+            and unclassified_school_kind_counts == dict(unclassified_policy.counts)
+        )
+    )
     result: dict[str, object] = {
         "normalizedSha256": benchmark.normalized_sha256,
         "threshold": tolerance,
         "categories": categories,
         "reportedTotals": reported_totals,
+        "unclassifiedSchoolKindCounts": unclassified_school_kind_counts,
+        "unclassifiedSchoolPolicySha256": (
+            unclassified_policy.sha256
+            if unclassified_policy is not None
+            else None
+        ),
+        "unclassifiedPolicyPassed": unclassified_policy_passed,
         "passed": all(
             category["passed"] is True for category in categories.values()
-        ),
+        )
+        and unclassified_policy_passed,
     }
     return result
 
@@ -355,13 +394,14 @@ def build_sync_preflight_audit(
     for record in records:
         if record.district in district_counts:
             district_counts[record.district] += 1
-        if record.latitude is None:
+        is_unclassified = record.institution_type == "UNCLASSIFIED_SCHOOL"
+        if is_unclassified or record.latitude is None:
             quarantined_institution_ids.append(record.institution_id)
             quarantined_site_ids.append(f"{record.institution_id}:main")
         else:
             ready_institutions += 1
         for site in record.additional_sites:
-            if site.latitude is None:
+            if is_unclassified or site.latitude is None:
                 quarantined_site_ids.append(
                     f"{record.institution_id}:{site.site_code}"
                 )
@@ -508,14 +548,19 @@ def build_candidate_snapshot(
     _validate_enrichment_provenance(records, enrichment_provenance)
 
     institutions, sites = _build_current_records(records, snapshot_id, coverage)
+    selectable_institutions = [
+        institution
+        for institution in institutions
+        if institution.institution_type != "UNCLASSIFIED_SCHOOL"
+    ]
     current_coordinate_rate = (
         sum(
             institution.status is InstitutionStatus.ACTIVE
-            for institution in institutions
+            for institution in selectable_institutions
         )
-        / len(institutions)
-        if records
-        else 0.0
+        / len(selectable_institutions)
+        if selectable_institutions
+        else 1.0
     )
     if previous is not None:
         institutions, sites = _preserve_missing_records(
@@ -564,6 +609,12 @@ def build_candidate_snapshot(
                 request_region_code=prior.request_region_code,
                 request_timing=prior.request_timing,
                 normalized_sha256=prior.source_normalized_sha256,
+                unclassified_school_kind_counts=tuple(
+                    prior.unclassified_school_kind_counts.items()
+                ),
+                unclassified_school_policy_sha256=(
+                    prior.unclassified_school_policy_sha256
+                ),
             )
 
     effective_enrichment_provenance = {
@@ -757,6 +808,8 @@ def _review_packet_from_loaded_candidate(
         "sourceObservationDateCounts": source_observation_counts,
         "normalizedObservationDateCounts": normalized_observation_counts,
         "preservedObservationDateCounts": preserved_observation_counts,
+        "unclassifiedSchoolKindCounts": {},
+        "unclassifiedSchoolPolicySha256": None,
         "institutionTypeCounts": dict(
             cast(dict[str, int], manifest["countsByType"])
         ),
@@ -787,6 +840,21 @@ def _review_packet_from_loaded_candidate(
             manifest["enrichments"]
         ),
     }
+    neis_entry = next(
+        (
+            entry
+            for entry in source_entries
+            if entry["source"] == "NEIS"
+        ),
+        None,
+    )
+    if neis_entry is not None:
+        packet["unclassifiedSchoolKindCounts"] = dict(
+            cast(dict[str, int], neis_entry["unclassifiedSchoolKindCounts"])
+        )
+        packet["unclassifiedSchoolPolicySha256"] = neis_entry[
+            "unclassifiedSchoolPolicySha256"
+        ]
     packet["reviewDigest"] = _manifest_section_sha256(packet)
     return packet
 
@@ -1143,6 +1211,7 @@ def _build_current_records(
     institutions: list[Institution] = []
     sites: list[InstitutionSite] = []
     for record in sorted(records, key=lambda item: item.institution_id):
+        is_unclassified = record.institution_type == "UNCLASSIFIED_SCHOOL"
         source_sites = (
             SourceInstitutionSiteRecord(
                 site_code="main",
@@ -1158,18 +1227,9 @@ def _build_current_records(
         built_sites: list[InstitutionSite] = []
         for source_site in source_sites:
             site_status = (
-                InstitutionStatus.ACTIVE
-                if source_site.latitude is not None
-                and source_site.longitude is not None
-                and _is_seoul_address(source_site.road_address)
-                and coverage.classify(
-                    Coordinate(
-                        latitude=source_site.latitude,
-                        longitude=source_site.longitude,
-                    )
-                )
-                is CoverageState.SEOUL
-                else InstitutionStatus.REVIEW_REQUIRED
+                InstitutionStatus.REVIEW_REQUIRED
+                if is_unclassified
+                else _status_from_coordinate_and_coverage(source_site, coverage)
             )
             built_sites.append(
                 InstitutionSite(
@@ -1190,12 +1250,16 @@ def _build_current_records(
                 )
             )
         status = (
-            InstitutionStatus.ACTIVE
-            if any(
-                site.is_default and site.status is InstitutionStatus.ACTIVE
-                for site in built_sites
+            InstitutionStatus.REVIEW_REQUIRED
+            if is_unclassified
+            else (
+                InstitutionStatus.ACTIVE
+                if any(
+                    site.is_default and site.status is InstitutionStatus.ACTIVE
+                    for site in built_sites
+                )
+                else InstitutionStatus.REVIEW_REQUIRED
             )
-            else InstitutionStatus.REVIEW_REQUIRED
         )
         institutions.append(
             Institution(
@@ -1205,7 +1269,11 @@ def _build_current_records(
                 foundation_type=record.foundation_type,
                 education_office=record.education_office,
                 status=status,
-                status_source=record.source,
+                status_source=(
+                    "OFFICIAL_CLASSIFICATION_PENDING"
+                    if is_unclassified
+                    else record.source
+                ),
                 effective_from=record.source_as_of,
                 effective_to=None,
                 last_seen_snapshot=snapshot_id,
@@ -1219,6 +1287,26 @@ def _build_current_records(
         )
         sites.extend(built_sites)
     return institutions, sites
+
+
+def _status_from_coordinate_and_coverage(
+    source_site: SourceInstitutionSiteRecord,
+    coverage: CoverageService,
+) -> InstitutionStatus:
+    if (
+        source_site.latitude is not None
+        and source_site.longitude is not None
+        and _is_seoul_address(source_site.road_address)
+        and coverage.classify(
+            Coordinate(
+                latitude=source_site.latitude,
+                longitude=source_site.longitude,
+            )
+        )
+        is CoverageState.SEOUL
+    ):
+        return InstitutionStatus.ACTIVE
+    return InstitutionStatus.REVIEW_REQUIRED
 
 
 def _is_seoul_address(address: str) -> bool:
@@ -1235,6 +1323,11 @@ def _validate_source_record(record: SourceInstitutionRecord) -> None:
         raise SnapshotQualityError("source identifier namespace mismatch")
     if record.institution_type not in _ALLOWED_TYPES_BY_SOURCE[record.source]:
         raise SnapshotQualityError("unsupported institution type")
+    if record.institution_type == "UNCLASSIFIED_SCHOOL":
+        if record.source != "NEIS" or not record.source_kind_label:
+            raise SnapshotQualityError("unclassified school source label is invalid")
+    elif record.source_kind_label is not None:
+        raise SnapshotQualityError("source kind label is reserved for unclassified schools")
     if record.foundation_type not in _ALLOWED_FOUNDATION_TYPES:
         raise SnapshotQualityError("unsupported foundation type")
     if record.coordinate_quality not in _ALLOWED_COORDINATE_QUALITIES:
@@ -1337,6 +1430,15 @@ def _validate_source_provenance(
         != _PINNED_SOURCE_NORMALIZED_SHA256[source_name]
     ):
         raise SnapshotQualityError("source provenance does not match normalized rows")
+    if not _source_unclassified_provenance_matches(
+        source_name,
+        provenance.unclassified_school_kind_counts,
+        provenance.unclassified_school_policy_sha256,
+        records,
+    ):
+        raise SnapshotQualityError(
+            "source provenance unclassified school policy does not match rows"
+        )
     if source_name == "KINDERGARTEN_INFO":
         if (
             expected_timing is None
@@ -1373,6 +1475,47 @@ def _validate_source_provenance(
         source_date.date() > fetched_at.date() for source_date in source_dates
     ):
         raise SnapshotQualityError("source provenance chronology is invalid")
+
+
+def _source_unclassified_provenance_matches(
+    source_name: str,
+    declared_counts: tuple[tuple[str, int], ...],
+    declared_sha256: str | None,
+    records: list[SourceInstitutionRecord],
+) -> bool:
+    if source_name != "NEIS":
+        return declared_counts == () and declared_sha256 is None
+    actual_counts = tuple(
+        sorted(
+            Counter(
+                record.source_kind_label
+                for record in records
+                if record.institution_type == "UNCLASSIFIED_SCHOOL"
+                and record.source_kind_label is not None
+            ).items()
+        )
+    )
+    unclassified_count = sum(
+        record.institution_type == "UNCLASSIFIED_SCHOOL" for record in records
+    )
+    if not unclassified_count:
+        return declared_counts == () and declared_sha256 is None
+    if (
+        declared_counts != actual_counts
+        or sum(count for _, count in declared_counts) != unclassified_count
+        or declared_sha256 != PINNED_POLICY_SHA256
+    ):
+        return False
+    try:
+        NeisUnclassifiedPolicy(
+            counts=declared_counts,
+            sha256=declared_sha256,
+            reviewed_as_of="2026-08-13",
+            reviewer_role="data-steward",
+        )
+    except ValueError:
+        return False
+    return True
 
 
 def _record_before_enrichment(
@@ -1768,6 +1911,12 @@ def _candidate_manifest(
                 "normalizedRowCount": len(current_rows),
                 "preservedRowCount": len(preserved_rows),
                 "rowCount": len(source_rows),
+                "unclassifiedSchoolKindCounts": dict(
+                    provenance.unclassified_school_kind_counts
+                ),
+                "unclassifiedSchoolPolicySha256": (
+                    provenance.unclassified_school_policy_sha256
+                ),
             }
         )
     previous_ids = (
@@ -2516,6 +2665,10 @@ def _recheck_source_provenance(
             raise SnapshotQualityError(
                 "candidate source provenance does not match persisted rows"
             )
+        if not _persisted_unclassified_provenance_matches(source, entry, rows):
+            raise SnapshotQualityError(
+                "candidate unclassified source provenance does not match records"
+            )
         if source == "KINDERGARTEN_INFO":
             if (
                 type(timing) is not str
@@ -2551,6 +2704,45 @@ def _recheck_source_provenance(
             raise SnapshotQualityError(
                 "candidate source provenance count is invalid"
             )
+
+
+def _persisted_unclassified_provenance_matches(
+    source: str,
+    entry: Mapping[str, object],
+    rows: list[Institution],
+) -> bool:
+    declared_counts = entry.get("unclassifiedSchoolKindCounts")
+    declared_sha256 = entry.get("unclassifiedSchoolPolicySha256")
+    if type(declared_counts) is not dict:
+        return False
+    if (
+        list(declared_counts) != sorted(declared_counts)
+        or any(type(label) is not str or not label.strip() for label in declared_counts)
+        or any(type(count) is not int or count <= 0 for count in declared_counts.values())
+    ):
+        return False
+    if source != "NEIS":
+        return declared_counts == {} and declared_sha256 is None
+    unclassified_count = sum(
+        row.institution_type == "UNCLASSIFIED_SCHOOL" for row in rows
+    )
+    if not unclassified_count:
+        return declared_counts == {} and declared_sha256 is None
+    if (
+        sum(declared_counts.values()) != unclassified_count
+        or declared_sha256 != PINNED_POLICY_SHA256
+    ):
+        return False
+    try:
+        NeisUnclassifiedPolicy(
+            counts=tuple(declared_counts.items()),
+            sha256=declared_sha256,
+            reviewed_as_of="2026-08-13",
+            reviewer_role="data-steward",
+        )
+    except ValueError:
+        return False
+    return True
 
 
 def _recheck_enrichment_provenance(
@@ -2831,14 +3023,32 @@ def _recheck_promotion_quality(
     sites: list[InstitutionSite],
     coverage: CoverageService,
 ) -> None:
+    institutions_by_id = {
+        institution.institution_id: institution for institution in institutions
+    }
     for institution in institutions:
         _validate_persisted_institution(institution)
+        if institution.institution_type == "UNCLASSIFIED_SCHOOL" and (
+            institution.status is not InstitutionStatus.REVIEW_REQUIRED
+            or institution.status_source != "OFFICIAL_CLASSIFICATION_PENDING"
+        ):
+            raise SnapshotQualityError(
+                "unclassified institution must remain pending official classification"
+            )
     if any(
         site.coordinate_quality not in _ALLOWED_COORDINATE_QUALITIES
         for site in sites
     ):
         raise SnapshotQualityError("unsupported coordinate quality")
     for site in sites:
+        if (
+            institutions_by_id[site.institution_id].institution_type
+            == "UNCLASSIFIED_SCHOOL"
+            and site.status is not InstitutionStatus.REVIEW_REQUIRED
+        ):
+            raise SnapshotQualityError(
+                "unclassified institution sites must remain review required"
+            )
         if site.status is not InstitutionStatus.ACTIVE:
             continue
         if (
@@ -2910,7 +3120,21 @@ def _recheck_promotion_quality(
             raise SnapshotQualityError(
                 "active candidate institution needs an active default site"
             )
-    coordinate_rate = len(active) / len(current) if current else 0.0
+    selectable_current = [
+        institution
+        for institution in current
+        if institution.institution_type != "UNCLASSIFIED_SCHOOL"
+    ]
+    selectable_active = [
+        institution
+        for institution in active
+        if institution.institution_type != "UNCLASSIFIED_SCHOOL"
+    ]
+    coordinate_rate = (
+        len(selectable_active) / len(selectable_current)
+        if selectable_current
+        else 1.0
+    )
     if coordinate_rate < 0.98:
         raise SnapshotQualityError(
             "coordinate validation success rate is below 98 percent"

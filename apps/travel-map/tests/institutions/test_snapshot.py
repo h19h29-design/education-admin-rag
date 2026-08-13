@@ -13,6 +13,58 @@ from pydantic import ValidationError
 SNAPSHOT_ROOT = Path("apps/travel-map/tests/fixtures/institutions/snapshot")
 
 
+# Production break caught: accepting source provenance that omits the required
+# privacy-safe unclassified-school aggregate fields for a non-NEIS source.
+def test_snapshot_requires_empty_unclassified_provenance_for_other_sources(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    source = manifest["sources"][0]
+    source["unclassifiedSchoolKindCounts"] = {}
+    source["unclassifiedSchoolPolicySha256"] = None
+    write_manifest(fixture, manifest)
+
+    verified = verify_snapshot(fixture)
+
+    assert verified.manifest.sources[0].unclassified_school_kind_counts == {}
+    assert verified.manifest.sources[0].unclassified_school_policy_sha256 is None
+
+
+@pytest.mark.parametrize("target", ["institution", "site"])
+def test_snapshot_rejects_active_unclassified_records(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    institution_index = 0 if target == "institution" else 8
+    change_jsonl_record(
+        fixture,
+        "institutions.jsonl",
+        record_index=institution_index,
+        field_name="institutionType",
+        value="UNCLASSIFIED_SCHOOL",
+    )
+    change_jsonl_record(
+        fixture,
+        "institutions.jsonl",
+        record_index=institution_index,
+        field_name="source",
+        value="NEIS",
+    )
+    if target == "site":
+        change_jsonl_record(
+            fixture,
+            "institutions.jsonl",
+            record_index=institution_index,
+            field_name="statusSource",
+            value="OFFICIAL_CLASSIFICATION_PENDING",
+        )
+
+    with pytest.raises(SnapshotIntegrityError, match="unclassified"):
+        verify_snapshot(fixture)
+
+
 # Production break caught: loading bytes that no longer match the approved manifest.
 def test_snapshot_hash_mismatch_is_rejected(tmp_path: Path) -> None:
     fixture = copy_fixture_snapshot(tmp_path)

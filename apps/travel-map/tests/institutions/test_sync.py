@@ -1198,6 +1198,322 @@ def test_school_reconciliation_allows_multi_vintage_neis_but_requires_neis_only(
     assert category["sourceValidationPassed"] is True
 
 
+# Production break caught: treating reviewed lifelong-school labels as selectable
+# categories, or letting their valid coordinates bypass the pending-classification
+# quarantine.
+def test_unclassified_reconciliation_keeps_official_counts_and_forces_status(
+    tmp_path: Path,
+) -> None:
+    policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
+    official_records = records_for_type_counts({"ELEMENTARY_SCHOOL": 1})
+    unclassified_records = tuple(
+        replace(
+            source_record(institution_id=f"neis:B10:lifelong-{index:02d}"),
+            official_name=f"검토 평생학교 {index}",
+            institution_type="UNCLASSIFIED_SCHOOL",
+            source_kind_label=label,
+            additional_sites=(
+                SourceInstitutionSiteRecord(
+                    site_code="branch",
+                    site_name="분교장",
+                    road_address="서울특별시 중구 검증로 2",
+                    district="중구",
+                    latitude=37.561,
+                    longitude=126.971,
+                    coordinate_quality="MANUALLY_VERIFIED",
+                ),
+            ),
+        )
+        for index, label in enumerate(
+            (
+                label
+                for label, count in policy.counts
+                for _ in range(count)
+            ),
+            start=1,
+        )
+    )
+    records = (*official_records, *unclassified_records)
+
+    reconciliation = reconcile_selectable_school_counts(
+        records,
+        benchmark=reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 1}),
+        unclassified_policy=policy,
+    )
+    candidate = build_test_candidate(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="unclassified-status",
+    )
+    audit = build_sync_preflight_audit(
+        records,
+        source_provenance=source_provenance_for(records),
+        reconciliation=reconciliation,
+    )
+    institutions = [
+        json.loads(line)
+        for line in (candidate.candidate_path / "institutions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    sites = [
+        json.loads(line)
+        for line in (candidate.candidate_path / "sites.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+
+    assert reconciliation["categories"]["ELEMENTARY_SCHOOL"]["actualCount"] == 1
+    assert reconciliation["unclassifiedSchoolKindCounts"] == dict(policy.counts)
+    assert reconciliation["unclassifiedSchoolPolicySha256"] == policy.sha256
+    assert reconciliation["unclassifiedPolicyPassed"] is True
+    assert audit["statusCounts"] == {
+        "PRECHECK_READY_INSTITUTION": 1,
+        "PRECHECK_REVIEW_REQUIRED_INSTITUTION": 18,
+    }
+    assert all(
+        institution["status"] == InstitutionStatus.REVIEW_REQUIRED
+        and institution["statusSource"] == "OFFICIAL_CLASSIFICATION_PENDING"
+        for institution in institutions
+        if institution["institutionType"] == "UNCLASSIFIED_SCHOOL"
+    )
+    assert all(
+        site["status"] == InstitutionStatus.REVIEW_REQUIRED
+        for site in sites
+        if site["institutionId"].startswith("neis:B10:lifelong-")
+    )
+
+
+# Production break caught: dropping the reviewed raw-label aggregate from the
+# candidate source provenance or from the digest-bound review packet.
+def test_unclassified_provenance_is_manifested_and_bound_to_review_digest(
+    tmp_path: Path,
+) -> None:
+    policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
+    records = tuple(
+        replace(
+            source_record(institution_id=f"neis:B10:review-{index:02d}"),
+            institution_type="UNCLASSIFIED_SCHOOL",
+            source_kind_label=label,
+        )
+        for index, label in enumerate(
+            (
+                label
+                for label, count in policy.counts
+                for _ in range(count)
+            ),
+            start=1,
+        )
+    )
+    candidate = build_test_candidate(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="unclassified-provenance",
+    )
+    manifest = json.loads(
+        (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
+    )
+    source = manifest["sources"][0]
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+
+    assert source["unclassifiedSchoolKindCounts"] == dict(policy.counts)
+    assert source["unclassifiedSchoolPolicySha256"] == policy.sha256
+    assert packet["unclassifiedSchoolKindCounts"] == dict(policy.counts)
+    assert packet["unclassifiedSchoolPolicySha256"] == policy.sha256
+    assert "평생학교(고)-2년6학기" not in (
+        candidate.candidate_path / "institutions.jsonl"
+    ).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("unclassifiedSchoolKindCounts", {"평생학교(고)-2년6학기": 8}),
+        ("unclassifiedSchoolPolicySha256", "f" * 64),
+    ],
+)
+def test_unclassified_provenance_tampering_fails_before_pointer_mutation(
+    tmp_path: Path,
+    field_name: str,
+    value: object,
+) -> None:
+    baseline = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="unclassified-tamper-baseline",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    original_pointer = (tmp_path / "current.json").read_bytes()
+    policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
+    records = (
+        source_record(institution_id="neis:B10:ordinary"),
+        *tuple(
+            replace(
+                source_record(institution_id=f"neis:B10:tamper-{index:02d}"),
+                institution_type="UNCLASSIFIED_SCHOOL",
+                source_kind_label=label,
+            )
+            for index, label in enumerate(
+                (
+                    label
+                    for label, count in policy.counts
+                    for _ in range(count)
+                ),
+                start=1,
+            )
+        ),
+    )
+    candidate = build_test_candidate(
+        records=records,
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id=f"unclassified-tamper-{field_name}",
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sources"][0][field_name] = value
+    sync_module._write_json(manifest_path, manifest)
+    resign_candidate(candidate, tmp_path)
+
+    with pytest.raises(SnapshotQualityError, match="unclassified"):
+        sync_module.build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+    assert (tmp_path / "current.json").read_bytes() == original_pointer
+
+
+@pytest.mark.parametrize("tamper", ["missing", "extra", "unsorted"])
+def test_unclassified_manifest_fields_are_strict_before_review(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
+    records = tuple(
+        replace(
+            source_record(institution_id=f"neis:B10:fields-{index:02d}"),
+            institution_type="UNCLASSIFIED_SCHOOL",
+            source_kind_label=label,
+        )
+        for index, label in enumerate(
+            (
+                label
+                for label, count in policy.counts
+                for _ in range(count)
+            ),
+            start=1,
+        )
+    )
+    candidate = build_test_candidate(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id=f"unclassified-fields-{tamper}",
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    source = manifest["sources"][0]
+    if tamper == "missing":
+        source.pop("unclassifiedSchoolPolicySha256")
+    elif tamper == "extra":
+        source["unclassifiedSchoolKindsRaw"] = ["must-not-persist"]
+    else:
+        source["unclassifiedSchoolKindCounts"] = dict(
+            reversed(list(source["unclassifiedSchoolKindCounts"].items()))
+        )
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SnapshotQualityError, match="manifest fields|schema"):
+        sync_module.build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+    assert not (tmp_path / "current.json").exists()
+
+
+@pytest.mark.parametrize("target", ["institution", "site"])
+def test_unclassified_active_record_tampering_fails_before_pointer_mutation(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
+    records = (
+        source_record(institution_id="neis:B10:ordinary"),
+        *tuple(
+            replace(
+                source_record(institution_id=f"neis:B10:active-{index:02d}"),
+                institution_type="UNCLASSIFIED_SCHOOL",
+                source_kind_label=label,
+            )
+            for index, label in enumerate(
+                (
+                    label
+                    for label, count in policy.counts
+                    for _ in range(count)
+                ),
+                start=1,
+            )
+        ),
+    )
+    candidate = build_test_candidate(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id=f"unclassified-active-{target}",
+    )
+    pointer = tmp_path / "current.json"
+    original_pointer = pointer.read_bytes() if pointer.exists() else None
+    filename = "institutions.jsonl" if target == "institution" else "sites.jsonl"
+    rows_path = candidate.candidate_path / filename
+    rows = [
+        json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()
+    ]
+    row = next(
+        item
+        for item in rows
+        if item.get("institutionType") == "UNCLASSIFIED_SCHOOL"
+        or item.get("institutionId", "").startswith("neis:B10:active-")
+    )
+    row["status"] = "ACTIVE"
+    rows[rows.index(row)] = row
+    row_bytes = (
+        "\n".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) for item in rows)
+        + "\n"
+    ).encode("utf-8")
+    rows_path.write_bytes(row_bytes)
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["institutionsSha256" if target == "institution" else "sitesSha256"] = (
+        hashlib.sha256(row_bytes).hexdigest()
+    )
+    if target == "institution":
+        manifest["quarantinedCount"] -= 1
+        manifest["countsByStatus"]["REVIEW_REQUIRED"] -= 1
+        manifest["countsByStatus"]["ACTIVE"] += 1
+    sync_module._write_json(manifest_path, manifest)
+    resign_candidate(candidate, tmp_path)
+
+    with pytest.raises(SnapshotQualityError, match="unclassified"):
+        sync_module.build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+    assert (pointer.read_bytes() if pointer.exists() else None) == original_pointer
+
+
 # Production break caught: collapsing a production-shaped mixed NEIS candidate's
 # row dates or publishing a source entry that omits their measured distribution.
 def test_mixed_vintage_neis_candidate_keeps_row_dates_and_manifest_histogram(
@@ -1308,10 +1624,12 @@ def test_review_packet_is_deterministic_and_only_contains_safe_aggregates(
         "snapshotAsOf",
         "previousSnapshotId",
         "sourceCounts",
-        "sourceObservationDateCounts",
-        "normalizedObservationDateCounts",
-        "preservedObservationDateCounts",
-        "institutionTypeCounts",
+            "sourceObservationDateCounts",
+            "normalizedObservationDateCounts",
+            "preservedObservationDateCounts",
+            "unclassifiedSchoolKindCounts",
+            "unclassifiedSchoolPolicySha256",
+            "institutionTypeCounts",
         "foundationCounts",
         "districtCounts",
         "statusCounts",
@@ -5023,6 +5341,35 @@ def promote_snapshot(
     )
 
 
+def resign_candidate(candidate: SnapshotBuildResult, snapshot_root: Path) -> None:
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    transaction_path = (
+        snapshot_root / ".sync-transactions" / f"{candidate.snapshot_id}.json"
+    )
+    transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+    unapproved = dict(manifest)
+    unapproved["approved"] = False
+    unapproved["approvedAt"] = None
+    unapproved["approvedByRole"] = None
+    transaction["manifestSha256"] = sync_module._manifest_section_sha256(unapproved)
+    transaction["sourcesSha256"] = sync_module._manifest_section_sha256(
+        manifest["sources"]
+    )
+    transaction["enrichmentsSha256"] = sync_module._manifest_section_sha256(
+        manifest["enrichments"]
+    )
+    transaction["institutionsSha256"] = manifest["institutionsSha256"]
+    transaction["sitesSha256"] = manifest["sitesSha256"]
+    transaction["previousSnapshotId"] = manifest["diff"]["previousSnapshotId"]
+    transaction.pop("signature")
+    sync_module._write_signed_transaction(
+        snapshot_root,
+        transaction,
+        replace_existing=True,
+    )
+
+
 def source_provenance_for(
     records: tuple[SourceInstitutionRecord, ...],
 ) -> dict[str, SourceProvenance]:
@@ -5097,6 +5444,28 @@ def source_provenance_for(
             ),
             normalized_sha256=normalized_records_sha256(
                 [_before_enrichment(record) for record in source_records]
+            ),
+            unclassified_school_kind_counts=(
+                tuple(
+                    sorted(
+                        Counter(
+                            record.source_kind_label
+                            for record in source_records
+                            if record.source_kind_label is not None
+                        ).items()
+                    )
+                )
+                if source == "NEIS"
+                else ()
+            ),
+            unclassified_school_policy_sha256=(
+                PINNED_POLICY_SHA256
+                if source == "NEIS"
+                and any(
+                    record.source_kind_label is not None
+                    for record in source_records
+                )
+                else None
             ),
         )
         for source, source_records in grouped.items()

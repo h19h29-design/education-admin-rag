@@ -26,7 +26,9 @@
       "fetchedRowCount": 10,
       "normalizedRowCount": 9,
       "preservedRowCount": 1,
-      "rowCount": 10
+      "rowCount": 10,
+      "unclassifiedSchoolKindCounts": {},
+      "unclassifiedSchoolPolicySha256": null
     }
   ],
   "enrichments": [],

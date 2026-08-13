@@ -102,6 +102,21 @@ def test_search_lists_only_active_sites_of_active_institutions() -> None:
     assert store.search(query="비활성", limit=20) == ()
 
 
+# Production break caught: allowing a review-required school with valid Seoul
+# coordinates to re-enter the public store index by name or direct site lookup.
+def test_review_required_school_is_excluded_from_every_public_store_boundary() -> None:
+    store = InstitutionStore.load(SNAPSHOT_ROOT)
+    quarantined_site_id = "test-neis:B10:REVIEW-PARENT:main"
+
+    assert store.search(query="검토학교", limit=20) == ()
+    assert all(
+        item.site_id != quarantined_site_id
+        for item in store.search(query="", institution_type="ELEMENTARY_SCHOOL")
+    )
+    with pytest.raises(UnknownSiteError, match="unknown or inactive institution site"):
+        store.require_site(quarantined_site_id)
+
+
 # Production break caught: treating canonically equivalent Hangul, whitespace, or
 # parentheses as different search text.
 def test_search_normalizes_unicode_nfc_whitespace_and_parentheses() -> None:

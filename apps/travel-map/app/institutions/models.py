@@ -256,6 +256,8 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
     normalized_row_count: int = Field(ge=0)
     preserved_row_count: int = Field(ge=0)
     row_count: int = Field(ge=0)
+    unclassified_school_kind_counts: dict[str, int]
+    unclassified_school_policy_sha256: str | None
 
     @field_validator(
         "source",
@@ -277,6 +279,29 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
     @classmethod
     def raw_hash_is_lowercase_sha256(cls, value: str) -> str:
         return _require_sha256(value)
+
+    @field_validator("unclassified_school_kind_counts")
+    @classmethod
+    def unclassified_kind_counts_are_canonical(
+        cls,
+        values: dict[str, int],
+    ) -> dict[str, int]:
+        if (
+            type(values) is not dict
+            or list(values) != sorted(values)
+            or any(type(name) is not str or not name.strip() for name in values)
+            or any(type(count) is not int or count <= 0 for count in values.values())
+        ):
+            raise ValueError("unclassifiedSchoolKindCounts must be sorted positive counts")
+        return values
+
+    @field_validator("unclassified_school_policy_sha256")
+    @classmethod
+    def unclassified_policy_hash_is_lowercase_sha256(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        return None if value is None else _require_sha256(value)
 
     @field_validator("source_as_of")
     @classmethod

@@ -16,6 +16,10 @@ from app.institutions.models import (
     InstitutionStatus,
     SnapshotManifest,
 )
+from app.institutions.sources.neis_classification import (
+    PINNED_POLICY_SHA256,
+    NeisUnclassifiedPolicy,
+)
 
 _SAFE_SNAPSHOT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _MANIFEST_FIELDS = {
@@ -61,6 +65,8 @@ _SOURCE_FIELDS = {
     "normalizedRowCount",
     "preservedRowCount",
     "rowCount",
+    "unclassifiedSchoolKindCounts",
+    "unclassifiedSchoolPolicySha256",
 }
 _ENRICHMENT_FIELDS = {
     "source",
@@ -431,6 +437,9 @@ def _verify_records(
         (item.institution_id for item in institutions),
         "institutionId",
     )
+    institutions_by_id = {
+        institution.institution_id: institution for institution in institutions
+    }
     _unique_ids((item.site_id for item in sites), "siteId")
     _verify_lineage(institutions, institution_ids)
     for institution in institutions:
@@ -446,6 +455,14 @@ def _verify_records(
             raise SnapshotIntegrityError(
                 f"ACTIVE institution {institution.institution_id} is not effective "
                 "on snapshotAsOf"
+            )
+        if institution.institution_type == "UNCLASSIFIED_SCHOOL" and (
+            institution.source != "NEIS"
+            or institution.status is not InstitutionStatus.REVIEW_REQUIRED
+            or institution.status_source != "OFFICIAL_CLASSIFICATION_PENDING"
+        ):
+            raise SnapshotIntegrityError(
+                "unclassified institution must remain pending official classification"
             )
     for site in sites:
         if site.institution_id not in institution_ids:
@@ -470,6 +487,14 @@ def _verify_records(
         ):
             raise SnapshotIntegrityError(
                 f"ACTIVE site {site.site_id} is not effective on snapshotAsOf"
+            )
+        if (
+            institutions_by_id[site.institution_id].institution_type
+            == "UNCLASSIFIED_SCHOOL"
+            and site.status is not InstitutionStatus.REVIEW_REQUIRED
+        ):
+            raise SnapshotIntegrityError(
+                "unclassified institution sites must remain review required"
             )
 
     _verify_count_map(
@@ -637,10 +662,63 @@ def _verify_source_counts(
             source=source.source,
             label="preserved",
         )
+        unclassified_rows = [
+            institution
+            for institution in institutions
+            if institution.source == source.source
+            and institution.institution_type == "UNCLASSIFIED_SCHOOL"
+        ]
+        if source.source != "NEIS":
+            if (
+                source.unclassified_school_kind_counts
+                or source.unclassified_school_policy_sha256 is not None
+            ):
+                raise SnapshotIntegrityError(
+                    "unclassified provenance is reserved for NEIS"
+                )
+            continue
+        if not unclassified_rows:
+            if (
+                source.unclassified_school_kind_counts
+                or source.unclassified_school_policy_sha256 is not None
+            ):
+                raise SnapshotIntegrityError(
+                    "unclassified provenance does not match institution records"
+                )
+            continue
+        if (
+            sum(source.unclassified_school_kind_counts.values())
+            != len(unclassified_rows)
+            or not _matches_pinned_unclassified_policy(
+                source.unclassified_school_kind_counts,
+                source.unclassified_school_policy_sha256,
+            )
+        ):
+            raise SnapshotIntegrityError(
+                "unclassified provenance does not match reviewed policy"
+            )
     if sum(declared.values()) != len(institutions):
         raise SnapshotIntegrityError(
             "source rowCount sum does not match institutionCount"
         )
+
+
+def _matches_pinned_unclassified_policy(
+    counts: dict[str, int],
+    sha256: str | None,
+) -> bool:
+    if sha256 != PINNED_POLICY_SHA256:
+        return False
+    try:
+        NeisUnclassifiedPolicy(
+            counts=tuple(counts.items()),
+            sha256=sha256,
+            reviewed_as_of="2026-08-13",
+            reviewer_role="data-steward",
+        )
+    except ValueError:
+        return False
+    return True
 
 
 def _assert_observation_histogram(
