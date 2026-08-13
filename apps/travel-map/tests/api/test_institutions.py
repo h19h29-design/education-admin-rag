@@ -1,3 +1,8 @@
+from pathlib import Path
+
+from tests.institutions.test_store import load_store_with_verified_unclassified_school
+
+
 # Break caught: returning a private snapshot record or snake_case API field names.
 def test_institutions_search_returns_public_camel_case_records(client) -> None:
     response = client.get("/api/v1/institutions", params={"q": "샘물"})
@@ -43,3 +48,23 @@ def test_institutions_api_excludes_review_required_school_from_name_and_filters(
     assert "test-neis:B10:REVIEW-PARENT:main" not in {
         item["siteId"] for item in by_filter.json()["items"]
     }
+
+
+def test_institutions_api_excludes_verified_unclassified_school_from_name_and_filters(
+    client,
+    tmp_path: Path,
+) -> None:
+    client.app.state.dependencies.institutions = (
+        load_store_with_verified_unclassified_school(tmp_path)
+    )
+
+    by_name = client.get("/api/v1/institutions", params={"q": "공개 제외"})
+    by_filter = client.get(
+        "/api/v1/institutions",
+        params={"institution_type": "UNCLASSIFIED_SCHOOL"},
+    )
+
+    assert by_name.status_code == 200
+    assert by_name.json()["items"] == []
+    assert by_filter.status_code == 200
+    assert by_filter.json()["items"] == []

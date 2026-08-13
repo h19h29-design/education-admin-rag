@@ -244,7 +244,7 @@ def reconcile_selectable_school_counts(
     records: tuple[SourceInstitutionRecord, ...],
     *,
     benchmark: ReviewedSchoolCounts,
-    unclassified_policy: NeisUnclassifiedPolicy | None = None,
+    unclassified_policy: NeisUnclassifiedPolicy,
     tolerance: float = 0.01,
 ) -> dict[str, object]:
     if not 0.0 <= tolerance <= 0.1:
@@ -350,15 +350,11 @@ def reconcile_selectable_school_counts(
         )
     )
     unclassified_policy_passed = (
-        not unclassified_rows
-        if unclassified_policy is None
-        else (
-            all(
-                record.source == "NEIS" and record.source_kind_label is not None
-                for record in unclassified_rows
-            )
-            and unclassified_school_kind_counts == dict(unclassified_policy.counts)
+        all(
+            record.source == "NEIS" and record.source_kind_label is not None
+            for record in unclassified_rows
         )
+        and unclassified_school_kind_counts == dict(unclassified_policy.counts)
     )
     result: dict[str, object] = {
         "normalizedSha256": benchmark.normalized_sha256,
@@ -368,8 +364,6 @@ def reconcile_selectable_school_counts(
         "unclassifiedSchoolKindCounts": unclassified_school_kind_counts,
         "unclassifiedSchoolPolicySha256": (
             unclassified_policy.sha256
-            if unclassified_policy is not None
-            else None
         ),
         "unclassifiedPolicyPassed": unclassified_policy_passed,
         "passed": all(
@@ -1498,8 +1492,6 @@ def _source_unclassified_provenance_matches(
     unclassified_count = sum(
         record.institution_type == "UNCLASSIFIED_SCHOOL" for record in records
     )
-    if not unclassified_count:
-        return declared_counts == () and declared_sha256 is None
     if (
         declared_counts != actual_counts
         or sum(count for _, count in declared_counts) != unclassified_count
@@ -2726,8 +2718,6 @@ def _persisted_unclassified_provenance_matches(
     unclassified_count = sum(
         row.institution_type == "UNCLASSIFIED_SCHOOL" for row in rows
     )
-    if not unclassified_count:
-        return declared_counts == {} and declared_sha256 is None
     if (
         sum(declared_counts.values()) != unclassified_count
         or declared_sha256 != PINNED_POLICY_SHA256

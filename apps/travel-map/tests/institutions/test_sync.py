@@ -25,8 +25,12 @@ import app.institutions.sync as sync_module
 import app.providers.kakao_local as kakao_module
 import httpx
 import pytest
-from app.institutions.models import InstitutionStatus
-from app.institutions.snapshot import VerifiedSnapshot, verify_snapshot
+from app.institutions.models import Institution, InstitutionSite, InstitutionStatus
+from app.institutions.snapshot import (
+    SnapshotIntegrityError,
+    VerifiedSnapshot,
+    verify_snapshot,
+)
 from app.institutions.sources.common import (
     EnrichmentProvenance,
     SourceDataError,
@@ -867,7 +871,7 @@ def test_reviewed_sen_multisite_survives_snapshot_and_store(
     neis_records = tuple(
         source_record(institution_id=f"neis:B10:7011{index:03d}")
         for index in range(9)
-    )
+    ) + quarantined_neis_records("neis:B10:reviewed-sen-quarantine")
     records = geocoded_sen + neis_records
     geocoded_count = sum(
         record.coordinate_quality == "GEOCODED"
@@ -1076,12 +1080,18 @@ def test_school_reconciliation_checks_one_percent_per_category(
 ) -> None:
     benchmark = reviewed_counts_fixture({institution_type: expected})
     passing = reconcile_selectable_school_counts(
-        records_for_type_counts({institution_type: passing_actual}),
+        with_neis_quarantine(
+            records_for_type_counts({institution_type: passing_actual})
+        ),
         benchmark=benchmark,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
     failing = reconcile_selectable_school_counts(
-        records_for_type_counts({institution_type: failing_actual}),
+        with_neis_quarantine(
+            records_for_type_counts({institution_type: failing_actual})
+        ),
         benchmark=benchmark,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
 
     assert passing["categories"][institution_type]["passed"] is True
@@ -1095,10 +1105,13 @@ def test_school_reconciliation_cannot_hide_swapped_category_losses() -> None:
         {"ELEMENTARY_SCHOOL": 609, "MIDDLE_SCHOOL": 390}
     )
     audit = reconcile_selectable_school_counts(
-        records_for_type_counts(
-            {"ELEMENTARY_SCHOOL": 599, "MIDDLE_SCHOOL": 400}
+        with_neis_quarantine(
+            records_for_type_counts(
+                {"ELEMENTARY_SCHOOL": 599, "MIDDLE_SCHOOL": 400}
+            )
         ),
         benchmark=benchmark,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
 
     assert audit["categories"]["ELEMENTARY_SCHOOL"]["passed"] is False
@@ -1111,8 +1124,9 @@ def test_school_reconciliation_passes_reviewed_real_count_fixture() -> None:
         SOURCE_RESOURCES / "sen-annual-school-counts.csv"
     )
     audit = reconcile_selectable_school_counts(
-        records_for_type_counts(benchmark.counts),
+        with_neis_quarantine(records_for_type_counts(benchmark.counts)),
         benchmark=benchmark,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
 
     assert audit["passed"] is True
@@ -1167,8 +1181,9 @@ def test_school_reconciliation_rejects_actual_source_contamination() -> None:
     )
 
     audit = reconcile_selectable_school_counts(
-        contaminated,
+        with_neis_quarantine(contaminated),
         benchmark=benchmark,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
 
     assert audit["categories"]["KINDERGARTEN"]["sourceValidationPassed"] is False
@@ -1179,10 +1194,14 @@ def test_school_reconciliation_rejects_actual_source_contamination() -> None:
 # Production break caught: treating a valid mixed-vintage NEIS population as
 # contaminated merely because its raw rows were loaded on multiple dates.
 def test_school_reconciliation_allows_multi_vintage_neis_but_requires_neis_only() -> None:
-    records = mixed_neis_records()
+    records = with_neis_quarantine(mixed_neis_records())
     benchmark = reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 4})
 
-    audit = reconcile_selectable_school_counts(records, benchmark=benchmark)
+    audit = reconcile_selectable_school_counts(
+        records,
+        benchmark=benchmark,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
     category = audit["categories"]["ELEMENTARY_SCHOOL"]
 
     assert category["actualSourceAsOf"] == [
@@ -1241,7 +1260,7 @@ def test_unclassified_reconciliation_keeps_official_counts_and_forces_status(
         unclassified_policy=policy,
     )
     candidate = build_test_candidate(
-        records=records,
+        records=with_neis_quarantine(records),
         previous=None,
         output_root=tmp_path,
         snapshot_id="unclassified-status",
@@ -1283,6 +1302,99 @@ def test_unclassified_reconciliation_keeps_official_counts_and_forces_status(
         for site in sites
         if site["institutionId"].startswith("neis:B10:lifelong-")
     )
+
+
+# Production break caught: treating an absent quarantine population as a valid
+# NEIS reconciliation or allowing candidate creation with empty policy fields.
+def test_neis_requires_the_complete_unclassified_quarantine_at_creation(
+    tmp_path: Path,
+) -> None:
+    records = (source_record(),)
+    reconciliation = reconcile_selectable_school_counts(
+        records,
+        benchmark=reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 1}),
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    assert reconciliation["unclassifiedPolicyPassed"] is False
+    assert reconciliation["passed"] is False
+    with pytest.raises(SnapshotQualityError, match="unclassified"):
+        build_test_candidate(
+            records=records,
+            previous=None,
+            output_root=tmp_path,
+            snapshot_id="missing-unclassified-at-creation",
+            include_neis_quarantine=False,
+        )
+
+
+# Production break caught: a reattested candidate with every quarantined NEIS
+# row removed can otherwise be reviewed or approved as an ordinary school feed.
+@pytest.mark.parametrize("operation", ["review", "approve"])
+def test_zero_quarantine_neis_candidate_cannot_review_or_approve(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    records = (
+        source_record(institution_id="neis:B10:ordinary"),
+        *quarantined_neis_records("neis:B10:review-zero"),
+    )
+    baseline = build_test_candidate(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id=f"zero-quarantine-baseline-{operation}",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    original_pointer = (tmp_path / "current.json").read_bytes()
+    candidate = build_test_candidate(
+        records=records,
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id=f"zero-quarantine-candidate-{operation}",
+    )
+    remove_unclassified_rows(
+        candidate.candidate_path,
+        resign_root=tmp_path,
+        candidate=candidate,
+    )
+
+    with pytest.raises(SnapshotQualityError, match="unclassified"):
+        if operation == "review":
+            sync_module.build_candidate_review_packet(
+                snapshot_id=candidate.snapshot_id,
+                snapshot_root=tmp_path,
+                coverage=TEST_COVERAGE,
+            )
+        else:
+            sync_module.approve_candidate_snapshot(
+                snapshot_id=candidate.snapshot_id,
+                review_digest="a" * 64,
+                reviewer_role="data-steward",
+                snapshot_root=tmp_path,
+                coverage=TEST_COVERAGE,
+            )
+    assert (tmp_path / "current.json").read_bytes() == original_pointer
+
+
+# Production break caught: a verified snapshot can otherwise lose all 18
+# quarantined institutions and replace the NEIS aggregate with empty values.
+def test_verified_snapshot_rejects_zero_quarantine_neis_source(tmp_path: Path) -> None:
+    records = (
+        source_record(institution_id="neis:B10:ordinary"),
+        *quarantined_neis_records("neis:B10:verified-zero"),
+    )
+    candidate = build_test_candidate(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="verified-zero-quarantine",
+    )
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    remove_unclassified_rows(tmp_path / candidate.snapshot_id)
+
+    with pytest.raises(SnapshotIntegrityError, match="unclassified"):
+        verify_snapshot(tmp_path)
 
 
 # Production break caught: dropping the reviewed raw-label aggregate from the
@@ -1532,12 +1644,12 @@ def test_mixed_vintage_neis_candidate_keeps_row_dates_and_manifest_histogram(
         for index, source_date in enumerate(dates)
     )
     provenance = replace(
-        source_provenance_for(records)["NEIS"],
+        source_provenance_for(with_neis_quarantine(records))["NEIS"],
         page_count=2,
     )
 
     candidate = build_test_candidate(
-        records=records,
+        records=with_neis_quarantine(records),
         previous=None,
         output_root=tmp_path,
         snapshot_id="mixed-vintage-neis",
@@ -1553,6 +1665,7 @@ def test_mixed_vintage_neis_candidate_keeps_row_dates_and_manifest_histogram(
         "2026-04-23": 1_413,
         "2026-05-17": 1,
         "2026-06-07": 1,
+        "2026-08-10": 18,
     }
     assert (
         neis["normalizedObservationDateCounts"]
@@ -1566,7 +1679,12 @@ def test_mixed_vintage_neis_candidate_keeps_row_dates_and_manifest_histogram(
         .splitlines()
     )
     assert persisted_dates == Counter(
-        {"2026-04-23": 1_413, "2026-05-17": 1, "2026-06-07": 1}
+        {
+            "2026-04-23": 1_413,
+            "2026-05-17": 1,
+            "2026-06-07": 1,
+            "2026-08-10": 18,
+        }
     )
 
 
@@ -1594,11 +1712,11 @@ def test_review_packet_is_deterministic_and_only_contains_safe_aggregates(
         for index, source_date in enumerate(dates)
     )
     provenance = replace(
-        source_provenance_for(records)["NEIS"],
+        source_provenance_for(with_neis_quarantine(records))["NEIS"],
         page_count=2,
     )
     build_test_candidate(
-        records=records,
+        records=with_neis_quarantine(records),
         previous=None,
         output_root=tmp_path,
         snapshot_id="mixed-vintage-review",
@@ -1650,6 +1768,7 @@ def test_review_packet_is_deterministic_and_only_contains_safe_aggregates(
             "2026-04-23": 1_413,
             "2026-05-17": 1,
             "2026-06-07": 1,
+            "2026-08-10": 18,
         }
     }
     assert isinstance(first["reviewDigest"], str)
@@ -1947,10 +2066,13 @@ def test_automatic_promotion_symbol_is_not_public(
 def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    records = records_for_type_counts({"ELEMENTARY_SCHOOL": 602})
+    records = with_neis_quarantine(
+        records_for_type_counts({"ELEMENTARY_SCHOOL": 602})
+    )
     reconciliation = reconcile_selectable_school_counts(
         records,
         benchmark=reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 609}),
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
     provenance = source_provenance_for(records)["NEIS"]
     audit = build_sync_preflight_audit(
@@ -1970,8 +2092,11 @@ def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
     assert parsed["auditStage"] == "PRE_PROMOTION_RECONCILIATION"
     assert parsed["passed"] is False
     assert parsed["reconciliation"]["passed"] is False
-    assert parsed["typeCounts"] == {"ELEMENTARY_SCHOOL": 602}
-    assert parsed["sourceCounts"]["NEIS"]["normalized"] == 602
+    assert parsed["typeCounts"] == {
+        "ELEMENTARY_SCHOOL": 602,
+        "UNCLASSIFIED_SCHOOL": 18,
+    }
+    assert parsed["sourceCounts"]["NEIS"]["normalized"] == 620
     assert len(parsed["districtCounts"]) == 25
     assert "statusCounts" in parsed
     assert "quarantinedInstitutionIds" in parsed
@@ -2058,6 +2183,11 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
         module,
         "load_reviewed_school_counts",
         lambda _path: reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 609}),
+    )
+    monkeypatch.setattr(
+        module,
+        "reconcile_selectable_school_counts",
+        lambda *_args, **_kwargs: {"passed": False},
     )
     snapshot_root = tmp_path / "snapshots"
     args = argparse.Namespace(
@@ -3197,12 +3327,23 @@ def test_source_record_persists_official_branch_as_second_site(
     promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
 
-    assert len(verified.institutions) == 1
-    assert {site.site_id for site in verified.sites} == {
+    official_institutions = tuple(
+        institution
+        for institution in verified.institutions
+        if institution.institution_type != "UNCLASSIFIED_SCHOOL"
+    )
+    official_sites = tuple(
+        site
+        for site in verified.sites
+        if site.institution_id == "neis:B10:7010001"
+    )
+
+    assert len(official_institutions) == 1
+    assert {site.site_id for site in official_sites} == {
         "neis:B10:7010001:main",
         "neis:B10:7010001:gayang",
     }
-    assert sum(site.is_default for site in verified.sites) == 1
+    assert sum(site.is_default for site in official_sites) == 1
 
 
 def test_missing_coordinate_branch_is_persisted_for_review(
@@ -3262,15 +3403,18 @@ def test_manifest_persists_cross_source_possible_match_pairs(
     promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
 
-    assert {item.institution_id for item in verified.institutions} == {
+    assert {
+        item.institution_id
+        for item in verified.institutions
+        if item.institution_type != "UNCLASSIFIED_SCHOOL"
+    } == {
         "neis:B10:7010001",
         "kinder:K12345678",
     }
-    assert verified.manifest.possible_match_count == 1
-    assert verified.manifest.possible_matches[0].institution_ids == (
+    assert (
         "kinder:K12345678",
         "neis:B10:7010001",
-    )
+    ) in {match.institution_ids for match in verified.manifest.possible_matches}
 
 
 def test_candidate_rejects_mixed_row_dates_with_single_date_provenance_before_writing(
@@ -3284,16 +3428,17 @@ def test_candidate_rejects_mixed_row_dates_with_single_date_provenance_before_wr
         }
     )
 
+    records = with_neis_quarantine((first, second))
     provenance = replace(
-        source_provenance_for((first, second))["NEIS"],
+        source_provenance_for(records)["NEIS"],
         source_as_of="2026-08-10",
-        source_observation_date_counts=(("2026-08-10", 2),),
-        normalized_observation_date_counts=(("2026-08-10", 2),),
+        source_observation_date_counts=(("2026-08-10", 20),),
+        normalized_observation_date_counts=(("2026-08-10", 20),),
     )
 
     with pytest.raises(SnapshotQualityError, match="observation dates"):
         build_test_candidate(
-            records=(first, second),
+            records=records,
             previous=None,
             output_root=tmp_path,
             snapshot_id="mixed-source-dates",
@@ -3445,7 +3590,8 @@ def test_coordinate_gate_uses_only_current_rows_and_stale_sites_are_inactive(
     stale_sites = [
         row
         for row in site_rows
-        if int(row["institutionId"].rsplit(":", 1)[-1]) >= 90
+        if row["institutionId"].rsplit(":", 1)[-1].isdigit()
+        and int(row["institutionId"].rsplit(":", 1)[-1]) >= 90
     ]
     assert stale_sites
     assert {row["status"] for row in stale_sites} == {"MISSING_FROM_SOURCE"}
@@ -3660,7 +3806,7 @@ def test_address_region_mismatch_is_quarantined(tmp_path: Path) -> None:
     manifest = json.loads(
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["quarantinedCount"] == 1
+    assert manifest["quarantinedCount"] == 19
     assert candidate.approved is False
     assert any("coordinate validation" in issue for issue in candidate.issues)
 
@@ -3689,7 +3835,7 @@ def test_coordinate_outside_seoul_is_quarantined(tmp_path: Path) -> None:
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
     )
 
-    assert manifest["quarantinedCount"] == 1
+    assert manifest["quarantinedCount"] == 19
     assert any("coordinate validation" in issue for issue in candidate.issues)
     forged_candidate = replace(candidate, issues=())
     with pytest.raises(SnapshotQualityError, match="coordinate validation"):
@@ -3723,8 +3869,19 @@ def test_namesake_across_sources_is_not_merged(tmp_path: Path) -> None:
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
     )
 
-    assert len(rows) == 2
-    assert manifest["possibleMatchCount"] == 1
+    official_rows = [
+        json.loads(row)
+        for row in rows
+        if json.loads(row)["institutionType"] != "UNCLASSIFIED_SCHOOL"
+    ]
+    assert len(official_rows) == 2
+    assert (
+        "kinder:verified-kindergarten",
+        "neis:B10:7010001",
+    ) in {
+        tuple(match["institutionIds"])
+        for match in manifest["possibleMatches"]
+    }
 
 
 def test_promotion_rechecks_hash_before_pointer_change(tmp_path: Path) -> None:
@@ -3755,16 +3912,17 @@ def test_promotion_replays_coverage_for_persisted_active_site(
         coverage=TEST_COVERAGE,
     )
     sites_path = candidate.candidate_path / "sites.jsonl"
-    site = json.loads(sites_path.read_text(encoding="utf-8"))
-    site.update(
-        {
+    _, site_bytes = replace_jsonl_record(
+        sites_path,
+        field="siteId",
+        value="neis:B10:7010001:main",
+        updates={
             "latitude": 35.1796,
             "longitude": 129.0756,
             "routingAnchorLatitude": 35.1796,
             "routingAnchorLongitude": 129.0756,
-        }
+        },
     )
-    site_bytes = (json.dumps(site, ensure_ascii=False) + "\n").encode()
     sites_path.write_bytes(site_bytes)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -4009,11 +4167,11 @@ def test_promotion_rejects_unsorted_observation_date_keys_before_pointer_change(
     manifest_text = manifest_path.read_text(encoding="utf-8")
     canonical = (
         '"sourceObservationDateCounts":{"2026-04-23":2,'
-        '"2026-05-17":1,"2026-06-07":1}'
+        '"2026-05-17":1,"2026-06-07":1,"2026-08-10":18}'
     )
     unsorted = (
         '"sourceObservationDateCounts":{"2026-06-07":1,'
-        '"2026-04-23":2,"2026-05-17":1}'
+        '"2026-04-23":2,"2026-05-17":1,"2026-08-10":18}'
     )
     assert canonical in manifest_text
     manifest_path.write_text(
@@ -4038,19 +4196,19 @@ def test_promotion_binds_source_digest_to_persisted_site_content(
         coverage=TEST_COVERAGE,
     )
     sites_path = candidate.candidate_path / "sites.jsonl"
-    site = json.loads(sites_path.read_text(encoding="utf-8"))
-    site.update(
-        {
+    _, site_bytes = replace_jsonl_record(
+        sites_path,
+        field="siteId",
+        value="neis:B10:7010001:main",
+        updates={
             "roadAddress": "서울특별시 송파구 변조로 10",
             "district": "송파구",
             "latitude": 37.51,
             "longitude": 127.10,
             "routingAnchorLatitude": 37.51,
             "routingAnchorLongitude": 127.10,
-        }
+        },
     )
-    site_bytes = (json.dumps(site, ensure_ascii=False) + "\n").encode()
-    sites_path.write_bytes(site_bytes)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["sitesSha256"] = hashlib.sha256(site_bytes).hexdigest()
@@ -4258,17 +4416,17 @@ def test_standard_enrichment_binds_selected_site_mapping(
         ),
     )
     sites_path = candidate.candidate_path / "sites.jsonl"
-    site = json.loads(sites_path.read_text(encoding="utf-8"))
-    site.update(
-        {
+    _, site_bytes = replace_jsonl_record(
+        sites_path,
+        field="siteId",
+        value="neis:B10:7010001:main",
+        updates={
             "latitude": 37.51,
             "longitude": 127.10,
             "routingAnchorLatitude": 37.51,
             "routingAnchorLongitude": 127.10,
-        }
+        },
     )
-    site_bytes = (json.dumps(site, ensure_ascii=False) + "\n").encode()
-    sites_path.write_bytes(site_bytes)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     tampered_record = replace(record, latitude=37.51, longitude=127.10)
@@ -4294,12 +4452,12 @@ def test_promotion_runs_task3_strict_checks_before_pointer(
         coverage=TEST_COVERAGE,
     )
     institutions_path = candidate.candidate_path / "institutions.jsonl"
-    institution = json.loads(institutions_path.read_text(encoding="utf-8"))
-    institution["lastSeenSnapshot"] = "other-snapshot"
-    institution_bytes = (
-        json.dumps(institution, ensure_ascii=False) + "\n"
-    ).encode()
-    institutions_path.write_bytes(institution_bytes)
+    _, institution_bytes = replace_jsonl_record(
+        institutions_path,
+        field="institutionId",
+        value="neis:B10:7010001",
+        updates={"lastSeenSnapshot": "other-snapshot"},
+    )
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["institutionsSha256"] = hashlib.sha256(institution_bytes).hexdigest()
@@ -4378,24 +4536,11 @@ def test_manifest_replays_live_source_provenance(tmp_path: Path) -> None:
             "coordinate_quality": "OFFICIAL_STANDARD_COORDINATE",
         }
     )
-    provenance = SourceProvenance(
-        source="NEIS",
-        endpoint="https://open.neis.go.kr/hub/schoolInfo",
-        license_name="PUBLIC_DATA_NO_USE_RESTRICTION",
-        attribution="Ministry of Education NEIS education data",
-        fetched_at="2026-08-10T09:00:00Z",
-        source_as_of="2026-08-10",
-        source_observation_date_counts=(("2026-08-10", 2),),
-        normalized_observation_date_counts=(("2026-08-10", 1),),
+    records = with_neis_quarantine((official_record,))
+    provenance = replace(
+        source_provenance_for(records)["NEIS"],
         raw_sha256="b" * 64,
         page_count=2,
-        row_count=1,
-        fetched_row_count=2,
-        request_region_code="B10",
-        request_timing=None,
-        normalized_sha256=normalized_records_sha256(
-            [_before_enrichment(official_record)]
-        ),
     )
     enrichment = EnrichmentProvenance(
         source="OFFICIAL_STANDARD_SCHOOL_LOCATION",
@@ -4418,7 +4563,7 @@ def test_manifest_replays_live_source_provenance(tmp_path: Path) -> None:
     )
 
     candidate = build_test_candidate(
-        records=(official_record,),
+        records=records,
         previous=None,
         output_root=tmp_path,
         snapshot_id="provenance",
@@ -4433,8 +4578,8 @@ def test_manifest_replays_live_source_provenance(tmp_path: Path) -> None:
     assert manifest["sources"][0]["rawSha256"] == "b" * 64
     assert manifest["sources"][0]["pageCount"] == 2
     assert manifest["sources"][0]["fetchedAt"] == "2026-08-10T09:00:00Z"
-    assert manifest["sources"][0]["fetchedRowCount"] == 2
-    assert manifest["sources"][0]["normalizedRowCount"] == 1
+    assert manifest["sources"][0]["fetchedRowCount"] == 19
+    assert manifest["sources"][0]["normalizedRowCount"] == 19
     assert manifest["sources"][0]["preservedRowCount"] == 0
     assert manifest["sources"][0]["requestRegionCode"] == "B10"
     assert (
@@ -5302,7 +5447,16 @@ def build_test_candidate(
     coverage: CoverageService | None = TEST_COVERAGE,
     source_provenance: Mapping[str, SourceProvenance] | None = None,
     enrichment_provenance: tuple[EnrichmentProvenance, ...] = (),
+    include_neis_quarantine: bool = True,
 ) -> SnapshotBuildResult:
+    if (
+        include_neis_quarantine
+        and any(record.source == "NEIS" for record in records)
+        and not any(
+            record.institution_type == "UNCLASSIFIED_SCHOOL" for record in records
+        )
+    ):
+        records = (*records, *quarantined_neis_records("neis:B10:test-quarantine"))
     selected_provenance = (
         source_provenance
         if source_provenance is not None
@@ -5368,6 +5522,131 @@ def resign_candidate(candidate: SnapshotBuildResult, snapshot_root: Path) -> Non
         transaction,
         replace_existing=True,
     )
+
+
+def quarantined_neis_records(prefix: str) -> tuple[SourceInstitutionRecord, ...]:
+    return tuple(
+        replace(
+            source_record(institution_id=f"{prefix}-{index:02d}"),
+            institution_type="UNCLASSIFIED_SCHOOL",
+            source_kind_label=label,
+        )
+        for index, label in enumerate(
+            (
+                label
+                for label, count in REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
+                for _ in range(count)
+            ),
+            start=1,
+        )
+    )
+
+
+def with_neis_quarantine(
+    records: tuple[SourceInstitutionRecord, ...],
+) -> tuple[SourceInstitutionRecord, ...]:
+    if not any(record.source == "NEIS" for record in records) or any(
+        record.institution_type == "UNCLASSIFIED_SCHOOL" for record in records
+    ):
+        return records
+    return (*records, *quarantined_neis_records("neis:B10:reconciliation-quarantine"))
+
+
+def replace_jsonl_record(
+    path: Path,
+    *,
+    field: str,
+    value: str,
+    updates: Mapping[str, object],
+) -> tuple[dict[str, object], bytes]:
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    record = next(row for row in rows if row[field] == value)
+    record.update(updates)
+    contents = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+    result = contents.encode()
+    path.write_bytes(result)
+    return record, result
+
+
+def remove_unclassified_rows(
+    snapshot_path: Path,
+    *,
+    resign_root: Path | None = None,
+    candidate: SnapshotBuildResult | None = None,
+) -> None:
+    institution_path = snapshot_path / "institutions.jsonl"
+    site_path = snapshot_path / "sites.jsonl"
+    institutions = [
+        Institution.model_validate_json(line)
+        for line in institution_path.read_text(encoding="utf-8").splitlines()
+    ]
+    quarantined_ids = {
+        institution.institution_id
+        for institution in institutions
+        if institution.institution_type == "UNCLASSIFIED_SCHOOL"
+    }
+    institutions = [
+        institution
+        for institution in institutions
+        if institution.institution_id not in quarantined_ids
+    ]
+    sites = [
+        InstitutionSite.model_validate_json(line)
+        for line in site_path.read_text(encoding="utf-8").splitlines()
+    ]
+    sites = [site for site in sites if site.institution_id not in quarantined_ids]
+    institution_path.write_bytes(sync_module._jsonl_bytes(institutions))
+    site_path.write_bytes(sync_module._jsonl_bytes(sites))
+    sites_by_parent = {institution.institution_id: [] for institution in institutions}
+    for site in sites:
+        sites_by_parent[site.institution_id].append(site)
+    manifest_path = snapshot_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["institutionsSha256"] = hashlib.sha256(
+        institution_path.read_bytes()
+    ).hexdigest()
+    manifest["sitesSha256"] = hashlib.sha256(site_path.read_bytes()).hexdigest()
+    manifest["institutionCount"] = len(institutions)
+    manifest["siteCount"] = len(sites)
+    manifest["quarantinedCount"] = sum(
+        institution.status is InstitutionStatus.REVIEW_REQUIRED
+        for institution in institutions
+    )
+    manifest["countsByType"] = dict(
+        Counter(institution.institution_type for institution in institutions)
+    )
+    manifest["countsByFoundation"] = dict(
+        Counter(institution.foundation_type for institution in institutions)
+    )
+    manifest["countsByStatus"] = dict(
+        Counter(institution.status.value for institution in institutions)
+    )
+    manifest["coordinateQualityCounts"] = dict(
+        Counter(site.coordinate_quality for site in sites)
+    )
+    source = manifest["sources"][0]
+    source["normalizedObservationDateCounts"] = dict(
+        observation_date_counts(institution.source_as_of for institution in institutions)
+    )
+    source["normalizedRowCount"] = len(institutions)
+    source["preservedRowCount"] = 0
+    source["rowCount"] = len(institutions)
+    source["sourceNormalizedSha256"] = (
+        sync_module._normalized_persisted_source_sha256(
+            institutions,
+            sites_by_parent,
+            before_enrichment=True,
+        )
+    )
+    source["normalizedSha256"] = sync_module._normalized_persisted_source_sha256(
+        institutions,
+        sites_by_parent,
+    )
+    source["unclassifiedSchoolKindCounts"] = {}
+    source["unclassifiedSchoolPolicySha256"] = None
+    sync_module._write_json(manifest_path, manifest)
+    if resign_root is not None and candidate is not None:
+        resign_candidate(candidate, resign_root)
 
 
 def source_provenance_for(

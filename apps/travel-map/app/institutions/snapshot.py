@@ -677,15 +677,6 @@ def _verify_source_counts(
                     "unclassified provenance is reserved for NEIS"
                 )
             continue
-        if not unclassified_rows:
-            if (
-                source.unclassified_school_kind_counts
-                or source.unclassified_school_policy_sha256 is not None
-            ):
-                raise SnapshotIntegrityError(
-                    "unclassified provenance does not match institution records"
-                )
-            continue
         if (
             sum(source.unclassified_school_kind_counts.values())
             != len(unclassified_rows)

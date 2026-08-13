@@ -3,9 +3,119 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from app.institutions.sources.common import (
+    SourceInstitutionRecord,
+    SourceProvenance,
+    normalized_records_sha256,
+    observation_date_counts,
+)
+from app.institutions.sources.neis_classification import (
+    load_neis_unclassified_policy,
+)
 from app.institutions.store import InstitutionStore, UnknownSiteError
+from app.institutions.sync import (
+    approve_candidate_snapshot,
+    build_candidate_review_packet,
+    build_candidate_snapshot,
+)
+from app.policy.coverage import CoverageService
 
 SNAPSHOT_ROOT = Path("apps/travel-map/tests/fixtures/institutions/snapshot")
+_POLICY_PATH = Path(
+    "apps/travel-map/resources/institution-sources/"
+    "neis-unclassified-school-kinds.csv"
+)
+
+
+def load_store_with_verified_unclassified_school(tmp_path: Path) -> InstitutionStore:
+    policy = load_neis_unclassified_policy(_POLICY_PATH)
+    active_record = SourceInstitutionRecord(
+        institution_id="neis:B10:public-school",
+        official_name="공개학교",
+        institution_type="ELEMENTARY_SCHOOL",
+        foundation_type="PUBLIC",
+        education_office="서울특별시교육청",
+        road_address="서울특별시 중구 공개로 1",
+        district="중구",
+        latitude=37.56,
+        longitude=126.98,
+        source="NEIS",
+        source_region_code="B10",
+        source_as_of="2026-08-10",
+        coordinate_quality="MANUALLY_VERIFIED",
+    )
+    unclassified_records = tuple(
+        SourceInstitutionRecord(
+            institution_id=f"neis:B10:quarantine-{index:02d}",
+            official_name=f"공개 제외 평생학교 {index:02d}",
+            institution_type="UNCLASSIFIED_SCHOOL",
+            foundation_type="PUBLIC",
+            education_office="서울특별시교육청",
+            road_address="서울특별시 중구 검토로 1",
+            district="중구",
+            latitude=37.56,
+            longitude=126.98,
+            source="NEIS",
+            source_region_code="B10",
+            source_as_of="2026-08-10",
+            coordinate_quality="MANUALLY_VERIFIED",
+            source_kind_label=label,
+        )
+        for index, label in enumerate(
+            (
+                label
+                for label, count in policy.counts
+                for _ in range(count)
+            ),
+            start=1,
+        )
+    )
+    records = (active_record, *unclassified_records)
+    dates = observation_date_counts(record.source_as_of for record in records)
+    provenance = SourceProvenance(
+        source="NEIS",
+        endpoint="https://open.neis.go.kr/hub/schoolInfo",
+        license_name="PUBLIC_DATA_NO_USE_RESTRICTION",
+        attribution="Ministry of Education NEIS education data",
+        fetched_at="2026-08-13T09:00:00Z",
+        source_as_of="2026-08-10",
+        source_observation_date_counts=dates,
+        normalized_observation_date_counts=dates,
+        raw_sha256="a" * 64,
+        page_count=1,
+        row_count=len(records),
+        fetched_row_count=len(records),
+        request_region_code="B10",
+        normalized_sha256=normalized_records_sha256(records),
+        unclassified_school_kind_counts=policy.counts,
+        unclassified_school_policy_sha256=policy.sha256,
+    )
+    coverage = CoverageService.from_geojson(
+        seoul_path="apps/travel-map/tests/fixtures/geodata/seoul-square.geojson",
+        buffer_distance_m=12_000,
+    )
+    snapshot_root = tmp_path / "verified-unclassified"
+    candidate = build_candidate_snapshot(
+        records=records,
+        previous=None,
+        output_root=snapshot_root,
+        snapshot_id="verified-unclassified",
+        coverage=coverage,
+        source_provenance={"NEIS": provenance},
+    )
+    review = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=snapshot_root,
+        coverage=coverage,
+    )
+    approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=str(review["reviewDigest"]),
+        reviewer_role="data-steward",
+        snapshot_root=snapshot_root,
+        coverage=coverage,
+    )
+    return InstitutionStore.load(snapshot_root)
 
 
 # Production break caught: collapsing two institutions because they share an address.
@@ -112,6 +222,27 @@ def test_review_required_school_is_excluded_from_every_public_store_boundary() -
     assert all(
         item.site_id != quarantined_site_id
         for item in store.search(query="", institution_type="ELEMENTARY_SCHOOL")
+    )
+    with pytest.raises(UnknownSiteError, match="unknown or inactive institution site"):
+        store.require_site(quarantined_site_id)
+
+
+# The quarantine type must remain excluded even when its rows form a valid,
+# signed NEIS snapshot with complete policy provenance and valid coordinates.
+def test_verified_unclassified_school_is_excluded_from_every_public_store_boundary(
+    tmp_path: Path,
+) -> None:
+    store = load_store_with_verified_unclassified_school(tmp_path)
+    quarantined_site_id = "neis:B10:quarantine-01:main"
+
+    assert store.search(query="공개 제외", limit=20) == ()
+    assert (
+        store.search(
+            query="",
+            institution_type="UNCLASSIFIED_SCHOOL",
+            limit=20,
+        )
+        == ()
     )
     with pytest.raises(UnknownSiteError, match="unknown or inactive institution site"):
         store.require_site(quarantined_site_id)
