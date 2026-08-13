@@ -55,6 +55,12 @@ from app.institutions.sources.neis_classification import (
     load_neis_unclassified_policy,
     validate_unclassified_school_counts,
 )
+from app.institutions.sources.school_count_profile import (
+    PINNED_POPULATION_PROFILE_SHA256,
+    SchoolCountPopulationProfile,
+    SchoolPopulationRow,
+    load_school_count_population_profile,
+)
 from app.institutions.sources.sen import SenCsvSource, parse_sen_csv
 from app.institutions.sources.sen_counts import (
     ReportedSchoolTotal,
@@ -98,6 +104,190 @@ REVIEWED_NEIS_UNCLASSIFIED_POLICY = NeisUnclassifiedPolicy(
     reviewed_as_of="2026-08-13",
     reviewer_role="data-steward",
 )
+
+
+def test_school_count_population_profile_loads_exact_reviewed_contract() -> None:
+    profile = load_school_count_population_profile(
+        SOURCE_RESOURCES / "school-count-population-profile.csv",
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    assert profile.sha256 == PINNED_POPULATION_PROFILE_SHA256
+    assert profile.status == "TEMPORARY_PRELIMINARY_VARIANCE"
+    assert profile.approved_variances == (
+        ("ELEMENTARY_SCHOOL", 1),
+        ("HIGH_SCHOOL", 0),
+        ("KINDERGARTEN", -18),
+        ("MIDDLE_SCHOOL", 0),
+        ("MISC_SCHOOL", 4),
+        ("SPECIAL_SCHOOL", 0),
+    )
+    assert profile.source_totals() == {
+        "KINDERGARTEN_INFO": 706,
+        "NEIS": 1_415,
+    }
+    assert profile.role_counts("NEIS") == {
+        "BENCHMARK": 1_373,
+        "NONSELECTABLE": 1,
+        "QUARANTINED": 18,
+        "SUPPLEMENTARY": 23,
+    }
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("각종학교(고)", "각종학교(고) "),
+        ("NEIS,고등학교,319", "NEIS,고등학교,320"),
+        ("NONSELECTABLE", "SUPPLEMENTARY"),
+        ("MISC_SCHOOL,BENCHMARK,MISC_SCHOOL", "HIGH_SCHOOL,BENCHMARK,MISC_SCHOOL"),
+        ("KINDERGARTEN,BENCHMARK,KINDERGARTEN", "KINDERGARTEN,BENCHMARK,MISC_SCHOOL"),
+        ("kindergarten_timing=20261", "kindergarten_timing=20262"),
+        ("kindergarten_source_as_of=2026-04-01", "kindergarten_source_as_of=2026-04-02"),
+        (
+            "benchmark_raw_sha256=6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70",
+            "benchmark_raw_sha256=" + "0" * 64,
+        ),
+        (
+            "unclassified_policy_sha256=2a9222d34083261c42ba51fd4430dd6b84b2210908a13e377a64cc69298c51a1",
+            "unclassified_policy_sha256=" + "0" * 64,
+        ),
+        (
+            "NEIS,각종학교(고),13,MISC_SCHOOL,BENCHMARK,MISC_SCHOOL\nNEIS,각종학교(중),7,MISC_SCHOOL,BENCHMARK,MISC_SCHOOL",
+            "NEIS,각종학교(중),7,MISC_SCHOOL,BENCHMARK,MISC_SCHOOL\nNEIS,각종학교(고),13,MISC_SCHOOL,BENCHMARK,MISC_SCHOOL",
+        ),
+        (
+            "NEIS,특수학교,32,SPECIAL_SCHOOL,BENCHMARK,SPECIAL_SCHOOL\n",
+            "NEIS,특수학교,32,SPECIAL_SCHOOL,BENCHMARK,SPECIAL_SCHOOL\nNEIS,특수학교,32,SPECIAL_SCHOOL,BENCHMARK,SPECIAL_SCHOOL\n",
+        ),
+        ("# reviewer_role=data-steward", "# reviewer_role=data-steward\n# unreviewed=1"),
+        (
+            "source,source_category,observed_count,normalized_type,reconciliation_role,benchmark_type",
+            "source,source_category,observed_count,normalized_type,reconciliation_role,benchmark_type,extra",
+        ),
+    ],
+)
+def test_school_count_population_profile_rejects_resource_trust_boundary_mutations(
+    tmp_path: Path,
+    old: str,
+    new: str,
+) -> None:
+    path = tmp_path / "profile.csv"
+    content = (SOURCE_RESOURCES / "school-count-population-profile.csv").read_text(
+        encoding="utf-8"
+    )
+    path.write_text(content.replace(old, new, 1), encoding="utf-8")
+
+    with pytest.raises(SourceDataError):
+        load_school_count_population_profile(
+            path,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+        )
+
+
+def test_school_count_population_profile_rejects_malformed_utf8_resource(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "profile.csv"
+    path.write_bytes(b"# normalized_sha256=" + b"0" * 64 + b"\n\xff")
+
+    with pytest.raises(SourceDataError):
+        load_school_count_population_profile(
+            path,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+        )
+
+
+def test_school_count_population_profile_rejects_symlinked_resource(
+    tmp_path: Path,
+) -> None:
+    link = tmp_path / "profile-link.csv"
+    link.symlink_to(SOURCE_RESOURCES / "school-count-population-profile.csv")
+
+    with pytest.raises(SourceDataError, match="symlink|regular"):
+        load_school_count_population_profile(
+            link,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+        )
+
+
+def test_school_count_population_profile_rejects_oversized_resource_before_decode(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "profile.csv"
+    path.write_bytes(b"x" * 16_385)
+
+    with pytest.raises(SourceDataError, match="size limit"):
+        load_school_count_population_profile(
+            path,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+        )
+
+
+def test_school_count_population_profile_rejects_subclass_spoofs_and_contract_drift() -> None:
+    profile = load_school_count_population_profile(
+        SOURCE_RESOURCES / "school-count-population-profile.csv",
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    class SpoofedString(str):
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        def __ne__(self, other: object) -> bool:
+            return False
+
+    class SpoofedTuple(tuple):
+        def __eq__(self, other: object) -> bool:
+            return True
+
+    with pytest.raises(ValueError):
+        SchoolPopulationRow(
+            source=SpoofedString("NEIS"),
+            source_category="고등학교",
+            observed_count=319,
+            normalized_type="HIGH_SCHOOL",
+            reconciliation_role="BENCHMARK",
+            benchmark_type="HIGH_SCHOOL",
+        )
+    with pytest.raises(ValueError):
+        SchoolCountPopulationProfile(
+            sha256=SpoofedString(PINNED_POPULATION_PROFILE_SHA256),
+            status=profile.status,
+            reviewed_as_of=profile.reviewed_as_of,
+            reviewer_role=profile.reviewer_role,
+            neis_region_code=profile.neis_region_code,
+            neis_fetched_row_count=profile.neis_fetched_row_count,
+            neis_normalized_row_count=profile.neis_normalized_row_count,
+            kindergarten_timing=profile.kindergarten_timing,
+            kindergarten_source_as_of=profile.kindergarten_source_as_of,
+            kindergarten_fetched_row_count=profile.kindergarten_fetched_row_count,
+            benchmark_source_url=profile.benchmark_source_url,
+            benchmark_source_as_of=profile.benchmark_source_as_of,
+            benchmark_raw_sha256=profile.benchmark_raw_sha256,
+            unclassified_policy_sha256=profile.unclassified_policy_sha256,
+            approved_variances=SpoofedTuple(profile.approved_variances),
+            rows=profile.rows,
+        )
+    with pytest.raises(ValueError):
+        SchoolCountPopulationProfile(
+            sha256=profile.sha256,
+            status="APPROVED",
+            reviewed_as_of=profile.reviewed_as_of,
+            reviewer_role=profile.reviewer_role,
+            neis_region_code=profile.neis_region_code,
+            neis_fetched_row_count=profile.neis_fetched_row_count,
+            neis_normalized_row_count=profile.neis_normalized_row_count,
+            kindergarten_timing=profile.kindergarten_timing,
+            kindergarten_source_as_of=profile.kindergarten_source_as_of,
+            kindergarten_fetched_row_count=profile.kindergarten_fetched_row_count,
+            benchmark_source_url=profile.benchmark_source_url,
+            benchmark_source_as_of=profile.benchmark_source_as_of,
+            benchmark_raw_sha256=profile.benchmark_raw_sha256,
+            unclassified_policy_sha256=profile.unclassified_policy_sha256,
+            approved_variances=profile.approved_variances,
+            rows=profile.rows,
+        )
 
 
 def load_json(name: str) -> dict[str, object]:

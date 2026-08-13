@@ -1,0 +1,39 @@
+# normalized_sha256=e904a254ab4f0fa264a0ec3894827e6bebbb2b94ab263bf635594c812dd7df06
+# schema_version=1
+# profile_status=TEMPORARY_PRELIMINARY_VARIANCE
+# reviewed_as_of=2026-08-13
+# reviewer_role=data-steward
+# neis_region_code=B10
+# neis_fetched_row_count=1415
+# neis_normalized_row_count=1414
+# kindergarten_timing=20261
+# kindergarten_source_as_of=2026-04-01
+# kindergarten_fetched_row_count=706
+# benchmark_source_url=https://enews.sen.go.kr/uploads/img_smart//2026-06-08/20260608075519432.png
+# benchmark_source_as_of=2026-03-10
+# benchmark_raw_sha256=6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70
+# unclassified_policy_sha256=2a9222d34083261c42ba51fd4430dd6b84b2210908a13e377a64cc69298c51a1
+# approved_variance_ELEMENTARY_SCHOOL=1
+# approved_variance_HIGH_SCHOOL=0
+# approved_variance_KINDERGARTEN=-18
+# approved_variance_MIDDLE_SCHOOL=0
+# approved_variance_MISC_SCHOOL=4
+# approved_variance_SPECIAL_SCHOOL=0
+source,source_category,observed_count,normalized_type,reconciliation_role,benchmark_type
+KINDERGARTEN_INFO,KINDERGARTEN_TOTAL,706,KINDERGARTEN,BENCHMARK,KINDERGARTEN
+NEIS,각종학교(고),13,MISC_SCHOOL,BENCHMARK,MISC_SCHOOL
+NEIS,각종학교(중),7,MISC_SCHOOL,BENCHMARK,MISC_SCHOOL
+NEIS,각종학교(초),1,MISC_SCHOOL,BENCHMARK,MISC_SCHOOL
+NEIS,고등기술학교,1,MISC_SCHOOL,BENCHMARK,MISC_SCHOOL
+NEIS,고등학교,319,HIGH_SCHOOL,BENCHMARK,HIGH_SCHOOL
+NEIS,공동실습소,1,,NONSELECTABLE,
+NEIS,방송통신고등학교,5,HIGH_SCHOOL,SUPPLEMENTARY,
+NEIS,방송통신중학교,1,MIDDLE_SCHOOL,SUPPLEMENTARY,
+NEIS,외국인학교,17,MISC_SCHOOL,SUPPLEMENTARY,
+NEIS,중학교,390,MIDDLE_SCHOOL,BENCHMARK,MIDDLE_SCHOOL
+NEIS,초등학교,610,ELEMENTARY_SCHOOL,BENCHMARK,ELEMENTARY_SCHOOL
+NEIS,특수학교,32,SPECIAL_SCHOOL,BENCHMARK,SPECIAL_SCHOOL
+NEIS,평생학교(고)-2년6학기,7,UNCLASSIFIED_SCHOOL,QUARANTINED,
+NEIS,평생학교(고)-3년6학기,4,UNCLASSIFIED_SCHOOL,QUARANTINED,
+NEIS,평생학교(중)-2년6학기,5,UNCLASSIFIED_SCHOOL,QUARANTINED,
+NEIS,평생학교(초)-3년6학기,2,UNCLASSIFIED_SCHOOL,QUARANTINED,
