@@ -77,6 +77,22 @@ async def test_opinet_requires_certkey_uses_official_codes_and_caches() -> None:
     assert secret not in repr(client)
 
 
+@pytest.mark.asyncio
+async def test_opinet_accepts_its_documented_json_payload_when_labeled_text_html() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/html; charset=utf-8"},
+            json=load_json("opinet-average.json"),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = OpinetClient(http=http, cert_key=SecretStr("test-key"))
+        price = await client.average_price(FuelType.GASOLINE)
+
+    assert price.krw_per_liter == 1700.0
+
+
 # Break caught: the production-default fuel cache refreshing before the required
 # one-day TTL has elapsed.
 @pytest.mark.asyncio

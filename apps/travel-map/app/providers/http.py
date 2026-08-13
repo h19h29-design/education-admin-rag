@@ -13,6 +13,7 @@ from app.routing.models import ProviderWarning
 _T = TypeVar("_T")
 _UNSET = object()
 _MAX_SCHEMA_DEPTH = 64
+_JSON_CONTENT_TYPES = frozenset({"application/json"})
 
 
 class ProviderRequestError(RuntimeError):
@@ -81,10 +82,10 @@ class BoundedHttpClient:
         params: Mapping[str, str],
         header_secret: SecretStr | None = None,
         query_secret: tuple[str, SecretStr | None] | None = None,
+        accepted_content_types: frozenset[str] = _JSON_CONTENT_TYPES,
     ) -> Coroutine[Any, Any, dict[str, Any]]:
         self.last_status_code = None
         self.last_schema_fingerprint = None
-        accepted_content_types = frozenset({"application/json"})
         _validate_request_fields(
             url=url,
             params=params,

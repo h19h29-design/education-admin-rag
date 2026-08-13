@@ -16,6 +16,7 @@ from app.routing.models import (
 )
 
 _AVERAGE_URL = "https://www.opinet.co.kr/api/avgAllPrice.do"
+_AVERAGE_JSON_CONTENT_TYPES = frozenset({"application/json", "text/html"})
 _PRODUCT_CODES = {
     FuelType.GASOLINE: "B027",
     FuelType.DIESEL: "D047",
@@ -103,6 +104,7 @@ class OpinetClient:
                 url=_AVERAGE_URL,
                 params={"out": "json"},
                 query_secret=("certkey", self._cert_key),
+                accepted_content_types=_AVERAGE_JSON_CONTENT_TYPES,
             )
             prices = _parse_prices(payload)
             if fuel_type not in prices:
