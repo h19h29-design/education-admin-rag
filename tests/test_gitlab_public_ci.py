@@ -36,6 +36,18 @@ def test_public_gate_entrypoint_is_valid_shell() -> None:
     subprocess.run(["bash", "-n", str(ENTRYPOINT)], check=True)
 
 
+def test_public_gate_quality_isolates_and_tests_both_python_projects() -> None:
+    text = ENTRYPOINT.read_text(encoding="utf-8")
+
+    assert "uv run pytest -q tests" in text
+    assert "uv run pytest -q\n" not in text
+    assert "uv sync --project apps/travel-map --frozen --dev" in text
+    assert (
+        "uv run --project apps/travel-map pytest apps/travel-map/tests -q -W error"
+        in text
+    )
+
+
 def test_public_gate_policy_mode_executes_repository_policy() -> None:
     result = subprocess.run(
         ["bash", str(ENTRYPOINT), "policy"],
