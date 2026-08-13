@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import traceback
+import unicodedata
 from collections import Counter
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -761,7 +762,7 @@ async def test_neis_rejects_school_kind_whitespace_before_candidate_or_pointer_m
     tmp_path: Path,
 ) -> None:
     source_types = list(reviewed_neis_source_types())
-    source_types[source_types.index("평생학교(고)-2년6학기")] += " "
+    source_types.insert(0, "고등학교 ")
     payload = neis_payload_rows(*source_types)
     snapshot_root = tmp_path / "snapshots"
     snapshot_root.mkdir()
@@ -782,6 +783,13 @@ async def test_neis_rejects_school_kind_whitespace_before_candidate_or_pointer_m
 
     assert not (snapshot_root / ".whitespace.candidate").exists()
     assert pointer.read_bytes() == original_pointer
+
+
+def test_neis_rejects_non_nfc_school_kind_before_histogram_collection() -> None:
+    with pytest.raises(SourceDataError, match="exact string"):
+        neis_module._required_school_kind_label(
+            {"SCHUL_KND_SC_NM": unicodedata.normalize("NFD", "고등학교")}
+        )
 
 
 def test_neis_rejects_unknown_lifelong_school_label_before_candidate_creation() -> None:
@@ -3018,6 +3026,35 @@ async def test_successful_source_fetches_clear_api_keys(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_kindergarten_source_category_counts_reports_total_raw_category(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = kindergarten_payload()
+        payload["sggList"] = request.url.params["sggCode"]
+        row = payload["kinderInfo"][0]  # type: ignore[index]
+        row["kinderCode"] = f"K{request.url.params['sggCode']}"
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await KindergartenSource(
+            api_key="test-key",
+            client=client,
+            region_codes_path=write_region_fixture(tmp_path),
+            timing="20261",
+        ).fetch()
+
+    assert result.provenance.source_category_counts == (
+        ("KINDERGARTEN_TOTAL", len(result.records)),
+    )
+    assert type(result.provenance.source_category_counts) is tuple
+    assert type(result.provenance.source_category_counts[0][0]) is str
+    assert type(result.provenance.source_category_counts[0][1]) is int
+
+
+@pytest.mark.asyncio
 async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         payload = neis_payload_rows(
@@ -3054,6 +3091,57 @@ async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
     assert result.provenance.normalized_observation_date_counts == (
         ("2026-04-23", 19),
     )
+
+
+@pytest.mark.asyncio
+async def test_neis_collects_raw_school_kind_histogram_before_filtering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_types = ("고등학교", "공동실습소", "방송통신고등학교")
+    monkeypatch.setattr(
+        neis_module,
+        "validate_unclassified_school_counts",
+        lambda _records, _policy: {},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=neis_page_payload(
+                source_types,
+                page=int(request.url.params["pIndex"]),
+                page_size=2,
+            ),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await NeisSource(
+            api_key="test-key",
+            client=client,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            page_size=2,
+        ).fetch()
+
+    assert result.provenance.source_category_counts == (
+        ("고등학교", 1),
+        ("공동실습소", 1),
+        ("방송통신고등학교", 1),
+    )
+    assert type(result.provenance.source_category_counts) is tuple
+    assert tuple(label for label, _ in result.provenance.source_category_counts) == (
+        "고등학교",
+        "공동실습소",
+        "방송통신고등학교",
+    )
+    assert all(
+        type(label) is str and type(count) is int
+        for label, count in result.provenance.source_category_counts
+    )
+    assert len(result.records) == 2
+    assert result.provenance.fetched_row_count == 3
+    assert result.provenance.row_count == 2
 
 
 @pytest.mark.asyncio

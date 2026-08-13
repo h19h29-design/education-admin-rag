@@ -159,6 +159,7 @@ class KindergartenSource:
                 request_region_code="11",
                 request_timing=self._timing,
                 normalized_sha256=normalized_records_sha256(records),
+                source_category_counts=(("KINDERGARTEN_TOTAL", len(records)),),
             ),
         )
 

@@ -127,6 +127,9 @@ class SourceProvenance:
     normalized_sha256: str | None = None
     unclassified_school_kind_counts: tuple[tuple[str, int], ...] = ()
     unclassified_school_policy_sha256: str | None = None
+    source_category_counts: tuple[tuple[str, int], ...] = ()
+    source_population_role_counts: tuple[tuple[str, int], ...] = ()
+    source_population_profile_sha256: str | None = None
 
 
 @dataclass(frozen=True)

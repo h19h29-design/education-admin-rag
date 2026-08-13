@@ -1,4 +1,6 @@
 import hashlib
+import unicodedata
+from collections import Counter
 from collections.abc import Mapping
 from datetime import date
 
@@ -84,6 +86,7 @@ class NeisSource:
         records: list[SourceInstitutionRecord] = []
         seen_page_ids: set[tuple[str, ...]] = set()
         raw_source_dates: list[str] = []
+        raw_school_kind_counts: Counter[str] = Counter()
         declared_total: int | None = None
         raw_row_count = 0
         cumulative_raw_bytes = 0
@@ -124,6 +127,8 @@ class NeisSource:
                 raise SourceDataError("NEIS list_total_count changed during pagination")
             raw_rows = _neis_rows(payload)
             raw_source_dates.extend(_raw_neis_load_dates(raw_rows))
+            raw_labels = tuple(_required_school_kind_label(row) for row in raw_rows)
+            raw_school_kind_counts.update(raw_labels)
             if len(raw_rows) > self._page_size:
                 raise SourceDataError("NEIS returned more rows than requested page size")
             if raw_row_count + len(raw_rows) > declared_total:
@@ -186,6 +191,7 @@ class NeisSource:
                 normalized_sha256=normalized_records_sha256(records),
                 unclassified_school_kind_counts=tuple(unclassified_counts.items()),
                 unclassified_school_policy_sha256=self._unclassified_policy.sha256,
+                source_category_counts=tuple(sorted(raw_school_kind_counts.items())),
             ),
         )
 
@@ -323,7 +329,12 @@ def _required_school_kind_label(row: object) -> str:
     if type(row) is not dict:
         raise SourceDataError("NEIS row must be an object")
     value = row.get("SCHUL_KND_SC_NM")
-    if type(value) is not str or not value or value != value.strip():
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or not unicodedata.is_normalized("NFC", value)
+    ):
         raise SourceDataError(
             "NEIS school kind label must be a nonblank exact string"
         )
