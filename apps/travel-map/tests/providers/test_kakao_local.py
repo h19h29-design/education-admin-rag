@@ -2,6 +2,7 @@ import copy
 
 import httpx
 import pytest
+from app.institutions.sources.common import SourceDataError
 from app.providers.kakao_local import BoundingBox, KakaoLocalClient, PlaceCandidate
 from app.routing.models import Coordinate
 from pydantic import SecretStr
@@ -16,6 +17,19 @@ class _ChunkedBody(httpx.AsyncByteStream):
         return None
 
 
+def kakao_address_document(
+    address: str,
+    *,
+    x: str = "126.968",
+    y: str = "37.571",
+) -> dict[str, object]:
+    return {
+        "x": x,
+        "y": y,
+        "road_address": {"address_name": address},
+    }
+
+
 def test_place_candidate_and_bounds_reject_wrong_types_nonfinite_and_order() -> None:
     with pytest.raises(TypeError):
         BoundingBox(west=True, south=37.4, east=127.3, north=37.75)  # type: ignore[arg-type]
@@ -25,6 +39,74 @@ def test_place_candidate_and_bounds_reject_wrong_types_nonfinite_and_order() -> 
         BoundingBox(west=126.7, south=float("nan"), east=127.3, north=37.75)
     with pytest.raises(TypeError):
         PlaceCandidate("id", "name", "road", "lot", 37, 127.0)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "documents",
+    (
+        [],
+        [kakao_address_document("서울 종로구 송월길 49")],
+        [
+            kakao_address_document("서울 종로구 송월길 48"),
+            kakao_address_document("서울특별시 종로구 송월길 48"),
+        ],
+        [{"x": "126.968", "y": "37.571", "road_address": None}],
+    ),
+)
+@pytest.mark.asyncio
+async def test_kakao_geocoder_rejects_nonexact_or_ambiguous_alias_results(
+    documents: list[object],
+) -> None:
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, json={"documents": documents})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = KakaoLocalClient(api_key="test-key", client=http)
+        result = await client.geocode("서울특별시 종로구 송월길 48")
+
+    assert result is None
+    assert requests == 1
+
+
+@pytest.mark.parametrize(
+    ("x", "y"),
+    (
+        ("nan", "37.571"),
+        ("126.968", "inf"),
+        ("181", "37.571"),
+        ("126.968", "91"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_kakao_geocoder_rejects_invalid_coordinate(
+    x: str,
+    y: str,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "documents": [
+                    kakao_address_document(
+                        "서울 종로구 송월길 48",
+                        x=x,
+                        y=y,
+                    )
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = KakaoLocalClient(api_key="test-key", client=http)
+        with pytest.raises(
+            SourceDataError,
+            match="Kakao Local coordinates are invalid",
+        ):
+            await client.geocode("서울특별시 종로구 송월길 48")
 
 
 @pytest.mark.asyncio

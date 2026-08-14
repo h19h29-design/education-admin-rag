@@ -89,7 +89,7 @@ from app.institutions.sync import (
 )
 from app.policy.coverage import CoverageService
 from app.policy.models import CoverageState
-from app.providers.kakao_local import KakaoLocalClient
+from app.providers.kakao_local import GeocodeResult, KakaoLocalClient
 from tests.institutions.population_fixtures import (
     reviewed_population_fixture as shared_reviewed_population_fixture,
 )
@@ -4397,6 +4397,49 @@ def test_kakao_road_address_canonicalization_is_limited_to_seoul_prefix(
         kakao_module._canonicalize_road_address(left)
         == kakao_module._canonicalize_road_address(right)
     ) is matches
+
+
+@pytest.mark.asyncio
+async def test_kakao_geocoder_accepts_one_seoul_prefix_alias_without_fallback() -> (
+    None
+):
+    requested = "서울특별시  종로구 송월길 48"
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.url.params["query"] == requested
+        return httpx.Response(
+            200,
+            json={
+                "documents": [
+                    {
+                        "x": "126.9680",
+                        "y": "37.5710",
+                        "road_address": {
+                            "address_name": "서울 종로구 송월길 48"
+                        },
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as http:
+        client = KakaoLocalClient(api_key="test-key", client=http)
+        result = await client.geocode(requested)
+        provenance = client.provenance()
+
+    assert result == GeocodeResult(
+        road_address="서울특별시 종로구 송월길 48",
+        latitude=37.571,
+        longitude=126.968,
+        confidence="EXACT_ROAD_ADDRESS",
+    )
+    assert len(seen) == 1
+    assert provenance.fetched_row_count == 1
+    assert provenance.matched_row_count == 1
 
 
 @pytest.mark.asyncio
