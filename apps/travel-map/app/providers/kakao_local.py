@@ -20,6 +20,7 @@ _KEYWORD_ENDPOINT = "https://dapi.kakao.com/v2/local/search/keyword.json"
 _REVERSE_ENDPOINT = "https://dapi.kakao.com/v2/local/geo/coord2address.json"
 _MAX_REQUEST_COUNT = 5_000
 _MAX_CUMULATIVE_BYTES = 25 * 1024 * 1024
+_SEOUL_ADDRESS_PREFIXES = frozenset({"서울", "서울시", "서울특별시"})
 
 
 @dataclass(frozen=True)
@@ -294,8 +295,20 @@ class KakaoLocalClient:
         )
 
 
-def _normalize_address(value: str) -> str:
+def _normalize_address_whitespace(value: str) -> str:
     return " ".join(value.split())
+
+
+def _canonicalize_road_address(value: str) -> str:
+    normalized = _normalize_address_whitespace(value)
+    prefix, separator, remainder = normalized.partition(" ")
+    if separator and prefix in _SEOUL_ADDRESS_PREFIXES:
+        return f"서울 {remainder}"
+    return normalized
+
+
+def _normalize_address(value: str) -> str:
+    return _normalize_address_whitespace(value)
 
 
 def _required_string(value: dict[object, object], name: str) -> str:

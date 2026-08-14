@@ -4372,6 +4372,33 @@ async def test_kakao_geocoder_does_not_retain_unbounded_raw_bodies(
     assert not hasattr(kakao, "_raw_responses")
 
 
+@pytest.mark.parametrize(
+    ("left", "right", "matches"),
+    (
+        ("서울특별시 종로구 송월길 48", "서울 종로구 송월길 48", True),
+        ("서울시  종로구  송월길 48", "서울 종로구 송월길 48", True),
+        ("서울 종로구 송월길 48", "서울특별시 종로구 송월길 48", True),
+        ("서울특별시 종로구 송월길 48", "서울 종로구 송월길 49", False),
+        ("서울특별시 종로구 송월길 48", "서울 중구 송월길 48", False),
+        ("경기도 가평군 교육원로 1", "서울 가평군 교육원로 1", False),
+        (
+            "기관 서울특별시 종로구 송월길 48",
+            "기관 서울 종로구 송월길 48",
+            False,
+        ),
+    ),
+)
+def test_kakao_road_address_canonicalization_is_limited_to_seoul_prefix(
+    left: str,
+    right: str,
+    matches: bool,
+) -> None:
+    assert (
+        kakao_module._canonicalize_road_address(left)
+        == kakao_module._canonicalize_road_address(right)
+    ) is matches
+
+
 @pytest.mark.asyncio
 async def test_kakao_geocode_accepts_one_exact_road_address_and_redacts_key() -> None:
     secret = "never-show-kakao-key"
