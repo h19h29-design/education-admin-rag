@@ -57,6 +57,64 @@ async def test_kakao_public_transit_returns_all_routes_with_fares_and_geometry()
     assert all(route.source_as_of == NOW for route in result.routes)
 
 
+# Break caught: Kakao's live public-transit response can contain 15 valid routes,
+# but the default provider limit rejected the complete response before fallback.
+@pytest.mark.asyncio
+async def test_kakao_public_transit_default_accepts_fifteen_valid_routes() -> None:
+    payload = load_json("kakao-publictraffic.json")
+    payload["routes"] = [
+        copy.deepcopy(route)
+        for _ in range(5)
+        for route in payload["routes"]  # type: ignore[union-attr]
+    ]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await KakaoTransitProvider(
+            http=http,
+            rest_key=SecretStr("test-key"),
+        ).get_routes(route_query(TravelMode.TRANSIT))
+
+    assert len(result.routes) == 15
+    assert result.warnings == ()
+
+
+# Break caught: live Kakao transit responses can provide only an official fare
+# range. Treating the missing exact value as schema drift discarded valid routes.
+@pytest.mark.asyncio
+async def test_kakao_public_transit_keeps_route_with_range_only_fare_unknown() -> None:
+    payload = load_json("kakao-publictraffic.json")
+    payload["routes"] = [payload["routes"][0]]  # type: ignore[index]
+    fare = payload["routes"][0]["properties"]["fare"]  # type: ignore[index]
+    fare.pop("value")
+    fare.update({"min": 1_500, "max": 2_500})
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await KakaoTransitProvider(
+            http=http,
+            rest_key=SecretStr("test-key"),
+        ).get_routes(route_query(TravelMode.TRANSIT))
+
+    assert len(result.routes) == 1
+    assert result.routes[0].mobility_cost_krw is None
+    assert result.routes[0].cost_status is CostStatus.UNKNOWN
+    assert result.routes[0].cost_breakdown is None
+    assert result.routes[0].warnings == ("FARE_RANGE_ONLY",)
+
+
 @pytest.mark.asyncio
 async def test_kakao_walk_calls_three_modes_and_returns_distinct_deterministic_ids() -> (
     None

@@ -42,7 +42,7 @@ class _KakaoMapProvider:
         now: Callable[[], datetime] | None = None,
         timeout_seconds: float = 5.0,
         max_response_bytes: int = 1_000_000,
-        max_routes: int = 10,
+        max_routes: int = 15,
         max_geometry_points: int = 20_000,
     ) -> None:
         if rest_key is not None and type(rest_key) is not SecretStr:
@@ -281,26 +281,47 @@ def _parse_transit(
         fare = _object(properties, "fare")
         duration = _integer(properties, "totalTime")
         distance = _integer(properties, "totalDistance")
-        fare_value = _integer(fare, "value")
+        fare_value, fare_identity, fare_warnings = _transit_fare(fare)
         steps = raw_route.get("steps")
         geometry = _steps_geometry(steps, max_geometry_points)
         routes.append(
             RouteOption(
                 id=_route_id(
-                    "KAKAO_TRANSIT", index, duration, distance, fare_value, geometry
+                    "KAKAO_TRANSIT", index, duration, distance, fare_identity, geometry
                 ),
                 mode=TravelMode.TRANSIT,
                 duration_seconds=duration,
                 distance_meters=distance,
                 mobility_cost_krw=fare_value,
-                cost_status=CostStatus.KNOWN,
-                cost_breakdown=RouteCostBreakdown(fare_krw=fare_value),
+                cost_status=(
+                    CostStatus.KNOWN if fare_value is not None else CostStatus.UNKNOWN
+                ),
+                cost_breakdown=(
+                    RouteCostBreakdown(fare_krw=fare_value)
+                    if fare_value is not None
+                    else None
+                ),
                 geometry=geometry,
                 source="KAKAO_TRANSIT",
                 source_as_of=source_time,
+                warnings=fare_warnings,
             )
         )
     return tuple(routes)
+
+
+def _transit_fare(
+    fare: Mapping[str, object],
+) -> tuple[int | None, object, tuple[str, ...]]:
+    if "value" in fare:
+        value = _integer(fare, "value")
+        return value, value, ()
+
+    minimum = _integer(fare, "min")
+    maximum = _integer(fare, "max")
+    if minimum > maximum:
+        raise ValueError
+    return None, ("range", minimum, maximum), ("FARE_RANGE_ONLY",)
 
 
 def _parse_walk(

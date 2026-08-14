@@ -34,14 +34,17 @@ FIXTURE_SNAPSHOT = ROOT / "tests/fixtures/institutions/snapshot"
 
 # Production break caught: a release check treating the intentionally absent
 # production snapshot as an empty-but-deployable institution catalog.
-def test_release_preflight_blocks_when_the_production_snapshot_is_absent() -> None:
+def test_release_preflight_blocks_when_the_production_snapshot_is_absent(
+    tmp_path: Path,
+) -> None:
     completed = _run_smoke(
         {
             "TRAVEL_MAP_LIVE_SMOKE": "1",
             "KAKAO_REST_API_KEY": "test-rest",
             "SEOUL_TRANSIT_SERVICE_KEY": "test-transit",
             "OPINET_CERT_KEY": "test-opinet",
-        }
+        },
+        smoke=_isolated_smoke_without_snapshot(tmp_path),
     )
 
     assert completed.returncode == 2
@@ -494,6 +497,7 @@ def test_live_smoke_reads_an_explicit_env_file_without_echoing_credentials(
     completed = _run_smoke(
         {"TRAVEL_MAP_LIVE_SMOKE": "1"},
         arguments=("--env-file", str(env_file)),
+        smoke=_isolated_smoke_without_snapshot(tmp_path),
     )
 
     assert completed.returncode == 2
@@ -749,6 +753,7 @@ def _run_smoke(
     extra_environment: dict[str, str],
     *,
     arguments: tuple[str, ...] = (),
+    smoke: Path = SMOKE,
 ) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     for name in (
@@ -760,10 +765,17 @@ def _run_smoke(
         environment.pop(name, None)
     environment.update(extra_environment)
     return subprocess.run(
-        [sys.executable, str(SMOKE.resolve()), *arguments],
+        [sys.executable, str(smoke.resolve()), *arguments],
         cwd=Path.cwd(),
         env=environment,
         check=False,
         capture_output=True,
         text=True,
     )
+
+
+def _isolated_smoke_without_snapshot(tmp_path: Path) -> Path:
+    smoke = tmp_path / "travel-map/scripts/smoke-live.py"
+    smoke.parent.mkdir(parents=True)
+    shutil.copy2(SMOKE, smoke)
+    return smoke
