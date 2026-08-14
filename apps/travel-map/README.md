@@ -85,6 +85,17 @@ Release remains blocked until step 3 publishes the independently reviewed
 digest. A missing or invalid approved snapshot is a release blocker, never
 permission to substitute a sample catalog.
 
+Coordinate recovery remains fail-closed. The geocoder treats only the leading
+`서울특별시`, `서울시`, and `서울` tokens as equivalent; the district, road name,
+building number, and every remaining token must match exactly, and exactly one
+Kakao road-address result must remain. It does not issue fallback or keyword
+requests and does not lower the 98% quality gate.
+
+Completing offline tests does not authorize another live sync. Obtain explicit
+approval for one candidate-only run, inspect only aggregate coordinate-quality
+and provenance counts, then use the separate review and approval commands. Never
+approve a candidate that still reports a coordinate-quality issue.
+
 ### Temporary school-count variance review (administrators only)
 
 The temporary population profile exists because the official preliminary
