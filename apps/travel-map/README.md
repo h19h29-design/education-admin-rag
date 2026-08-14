@@ -203,3 +203,50 @@ docker run --rm --init -p 8080:8080 \
   --env-file /secure/path/travel-map-production.env \
   seoul-education-travel-map:0.1.0
 ```
+
+## NAS production operations (administrators only)
+
+The public NAS deployment is available at
+<https://travel.h19h19.synology.me>. As of 2026-08-14 it runs commit
+`2aa034b` in image
+`seoul-education-travel-map:20260814T004744Z-2aa034b`, using approved snapshot
+`20260814T004744Z`.
+
+Keep the stateless application and Docker image on SSD volume `/volume1`. The
+image is about 271 MiB and the allowlisted build context is about 3.3 MiB, so
+moving the live workload to the 10 TB archive volume would add latency without
+a meaningful capacity benefit. Keep recovery copies on `/volume2` instead:
+
+- Compose: `/volume1/docker/seoul-education-travel-map/compose.yml`
+- Runtime secrets: `/volume1/docker/seoul-education-travel-map/runtime.env`
+  (`0600 root:root`)
+- Backups: `/volume2/docker-1/backups/seoul-education-travel-map/<UTC stamp>`
+  (`0700 root:root`; files `0600 root:root`)
+
+The Compose service binds only `127.0.0.1:18080`, uses a read-only root
+filesystem, drops all capabilities, and reaches the public internet only via
+the DSM HTTPS reverse proxy. Configure Docker's `json-file` logger with
+`max-size: 10m` and `max-file: 5`. Do not remove the previous image until the
+replacement has passed health and route checks.
+
+For each update:
+
+1. Confirm GitLab and GitHub `main` point to the same reviewed commit.
+2. Stage the allowlisted context with `prepare-release-context.py`, then build a
+   new immutable image tag containing the snapshot ID and short Git SHA.
+3. Copy `compose.yml` and `runtime.env`, and save the current image, to a new
+   root-only backup directory on `/volume2`.
+4. Change only the image tag in Compose and run `docker compose up -d`.
+5. Require container health plus internal and public `/healthz`, HTTPS/TLS,
+   security headers, and the 30-case route review before removing any rollback
+   asset.
+6. To roll back, restore the preceding image tag in Compose and run
+   `docker compose up -d` again.
+
+The 2026-08-14 30-case review covered all 25 Seoul districts, 11 institution
+types, three foundation types, two 12 km buffer cases, and one out-of-coverage
+case. Kakao transit, walk, and car routes remained available. The separate
+Seoul bus API still needs a key approved specifically for the public-data
+`ws.bus.go.kr` service, and the current Opinet key returns an empty price list;
+until those operator issues are resolved, the application keeps the Kakao
+routes and reports unavailable fuel cost as unknown rather than estimating it.
