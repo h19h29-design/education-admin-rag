@@ -8,6 +8,7 @@ CI = ROOT / ".gitlab-ci.yml"
 ENTRYPOINT = ROOT / "scripts" / "ci-public-gates.sh"
 RUNBOOK = ROOT / "docs" / "runbooks" / "public-gitlab.md"
 REPORT = ROOT / "docs" / "reports" / "public-gitlab-bootstrap.md"
+WORKER_CONFIG = ROOT / "web" / "qa-worker" / "wrangler.toml"
 
 
 def test_gitlab_pipeline_is_full_history_public_safe() -> None:
@@ -46,6 +47,20 @@ def test_public_gate_quality_isolates_and_tests_both_python_projects() -> None:
         "uv run --project apps/travel-map pytest apps/travel-map/tests -q -W error"
         in text
     )
+
+
+def test_quality_gate_runs_public_worker_tests() -> None:
+    text = ENTRYPOINT.read_text(encoding="utf-8")
+
+    assert "npm --prefix web/qa-worker test" in text
+    assert "node --check web/qa-worker/src/worker.js" in text
+    assert "node --check web/qa-worker/public/app.js" in text
+
+
+def test_public_worker_runs_before_static_assets_for_security_headers() -> None:
+    text = WORKER_CONFIG.read_text(encoding="utf-8")
+
+    assert "run_worker_first = true" in text
 
 
 def test_public_gate_policy_mode_executes_repository_policy() -> None:

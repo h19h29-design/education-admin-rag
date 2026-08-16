@@ -15,6 +15,9 @@ case "${1:-}" in
     uv run ruff format --check src
     uv run mypy --strict --explicit-package-bases src
     uv lock --check --offline
+    npm --prefix web/qa-worker test
+    node --check web/qa-worker/src/worker.js
+    node --check web/qa-worker/public/app.js
     uv sync --project apps/travel-map --frozen --dev
     uv run --project apps/travel-map pytest apps/travel-map/tests -q -W error
     uv run --project apps/travel-map ruff check apps/travel-map

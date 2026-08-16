@@ -15,6 +15,8 @@ _DOCKER_CONTEXT_EXCEPTIONS = (
     "src/evaluation/*.py",
     "src/ingestion/",
     "src/ingestion/*.py",
+    "src/integrations/",
+    "src/integrations/*.py",
     "src/retrieval/",
     "src/retrieval/*.py",
     "config/models.lock.json",

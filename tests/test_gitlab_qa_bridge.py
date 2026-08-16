@@ -1,0 +1,709 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import threading
+import time
+from http.client import HTTPConnection
+from pathlib import Path
+
+import pytest
+
+from src.integrations.gitlab_qa_bridge import (
+    BridgeConfig,
+    BridgeError,
+    GitLabQaBridgeService,
+    GitLabQaRequest,
+    build_hermes_command,
+    build_hermes_prompt,
+    create_server,
+    load_config,
+    make_hermes_runner,
+    parse_filter_output,
+    run_answer_job,
+    run_overload_job,
+    validate_and_transform,
+)
+from src.integrations.gitlab_qa_public import (
+    CASES_ONLY_TEXT,
+    NO_EVIDENCE_TEXT,
+    TEMPORARILY_UNAVAILABLE_TEXT,
+    PublicAnswer,
+    public_cases_from_evidence,
+)
+
+REQUEST_ID = "senqa-0123456789abcdef0123456789abcdef"
+
+
+def _request() -> GitLabQaRequest:
+    return GitLabQaRequest(
+        issue_iid=73,
+        request_id=REQUEST_ID,
+        question="수의계약이 가능한 경우를 알려줘",
+        evidence={
+            "complete_corpus": False,
+            "production_eligible": False,
+            "results": [
+                {
+                    "answer": "근거 답변",
+                    "basis": "근거",
+                    "candidate_sha256": "a" * 64,
+                    "case_id": "senqa-2022-case-a",
+                    "case_no": "1",
+                    "citations": [
+                        {
+                            "bbox": [55.0, 66.0, 810.0, 700.0],
+                            "pdf_page_index": 4,
+                            "text_sha256": "b" * 64,
+                        }
+                    ],
+                    "doc_id": "sen-qa-2022",
+                    "domain": "계약",
+                    "edition_year": 2022,
+                    "facts": "사실",
+                    "part": "계약 업무",
+                    "pdf_pages": [4],
+                    "question": "수의계약 질문",
+                    "review_status": "machine_extracted",
+                    "subtopic": None,
+                    "title": "근거 제목",
+                }
+            ],
+            "schema_version": "sen-qa-preview-search-response/v1",
+            "warning_code": "unreviewed_incomplete_preview",
+        },
+    )
+
+
+def _request_number(index: int) -> GitLabQaRequest:
+    original = _request()
+    return GitLabQaRequest(
+        issue_iid=original.issue_iid + index,
+        request_id=f"senqa-{index:032x}",
+        question=original.question,
+        evidence=original.evidence,
+    )
+
+
+def _filter_payload(request: GitLabQaRequest) -> bytes:
+    return (
+        json.dumps(
+            {
+                "command": "ask",
+                "evidence": request.evidence,
+                "project": "h19h19/education-admin-rag",
+                "project_id": 428,
+                "question": request.question,
+                "request_id": request.request_id,
+                "target_iid": request.issue_iid,
+            }
+        ).encode()
+        + b"\n"
+    )
+
+
+def _bridge_config(tmp_path: Path) -> BridgeConfig:
+    return BridgeConfig(
+        webhook_secret="w" * 32,
+        delivery_token="response-token",
+        bot_username="senqa-worker-bot",
+        executor_profile="education-agent",
+        filter_path=tmp_path / "filter",
+        hermes_path=Path("/opt/hermes"),
+        search_path=tmp_path / "search",
+        search_config=tmp_path / "config.json",
+    )
+
+
+def test_filter_output_becomes_exact_qa_request() -> None:
+    payload = {
+        "command": "ask",
+        "evidence": _request().evidence,
+        "project": "h19h19/education-admin-rag",
+        "project_id": 428,
+        "question": _request().question,
+        "request_id": REQUEST_ID,
+        "target_iid": 73,
+    }
+
+    checked = parse_filter_output(
+        (json.dumps(payload, ensure_ascii=False) + "\n").encode()
+    )
+
+    assert checked == _request()
+
+
+def test_filter_output_accepts_twenty_ranked_results() -> None:
+    payload = {
+        "command": "ask",
+        "evidence": json.loads(json.dumps(_request().evidence)),
+        "project": "h19h19/education-admin-rag",
+        "project_id": 428,
+        "question": _request().question,
+        "request_id": REQUEST_ID,
+        "target_iid": 73,
+    }
+    original = payload["evidence"]["results"][0]
+    payload["evidence"]["results"] = [
+        {**original, "case_id": f"senqa-2022-case-{index}"} for index in range(20)
+    ]
+
+    checked = parse_filter_output(
+        (json.dumps(payload, ensure_ascii=False) + "\n").encode()
+    )
+
+    assert checked is not None
+    assert len(checked.evidence["results"]) == 20
+
+
+def test_silent_and_malformed_filter_output_are_not_jobs() -> None:
+    assert parse_filter_output(b"[SILENT]\n") is None
+    assert parse_filter_output(b"not-json\n") is None
+
+
+def test_prompt_treats_question_as_data_and_requires_grounded_preview_answer() -> None:
+    request = _request()
+    cases = public_cases_from_evidence(request.question, request.evidence)
+    prompt = build_hermes_prompt(request, cases)
+
+    assert "도구를 호출하지 마세요" in prompt
+    assert "제공된 사례에 없는 사실을 추가하지 마세요" in prompt
+    assert '"case_id":"senqa-2022-case-a"' in prompt
+    assert '"question":"수의계약이 가능한 경우를 알려줘"' in prompt
+    assert "PDF 4쪽" in prompt
+    assert "제목, 인사말, 목록, 표, 코드블록을 쓰지 마세요" in prompt
+    assert "허용 근거 표기: [2022년 · PDF 4쪽]" in prompt
+    assert "허용 근거 표기: [senqa-2022-case-a" not in prompt
+    for forbidden in (
+        "gitlab",
+        "webhook",
+        "hermes",
+        "rag",
+        "production_eligible",
+        "warning_code",
+        "complete_corpus",
+        "review_status",
+    ):
+        assert forbidden not in prompt.casefold()
+
+
+def test_hermes_command_uses_configured_profile_and_zero_tool_allowlist(
+    tmp_path: Path,
+) -> None:
+    hermes = tmp_path / "hermes"
+    command = build_hermes_command(hermes, "education-agent", "PROMPT")
+
+    assert command == (
+        str(hermes),
+        "-p",
+        "education-agent",
+        "-z",
+        "PROMPT",
+        "-t",
+        "context_engine",
+        "--ignore-rules",
+    )
+
+
+def test_hostile_filter_fields_fail_value_free() -> None:
+    marker = "PRIVATE_BRIDGE_SENTINEL"
+    payload = {
+        "command": "ask",
+        "evidence": _request().evidence,
+        "project": "h19h19/education-admin-rag",
+        "project_id": 428,
+        "question": marker,
+        "request_id": "bad",
+        "target_iid": 73,
+    }
+
+    with pytest.raises(BridgeError) as caught:
+        parse_filter_output(json.dumps(payload).encode())
+
+    rendered = repr(caught.value) + str(caught.value)
+    assert rendered == "BridgeError('bridge_invalid')bridge_invalid"
+    assert marker not in rendered
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_webhook_secret_and_event_are_checked_before_filter() -> None:
+    calls: list[bytes] = []
+
+    def filter_runner(raw: bytes) -> bytes:
+        calls.append(raw)
+        return b"[SILENT]\n"
+
+    marker = b"PRIVATE_WEBHOOK_SENTINEL"
+    with pytest.raises(BridgeError):
+        validate_and_transform(
+            marker,
+            event="Note Hook",
+            supplied_secret="wrong",
+            expected_secret="correct-secret-12",
+            filter_runner=filter_runner,
+        )
+
+    assert calls == []
+
+
+def test_valid_webhook_runs_filter_once() -> None:
+    expected = _request()
+
+    def filter_runner(raw: bytes) -> bytes:
+        assert raw == b'{"object_kind":"note"}'
+        return (
+            json.dumps(
+                {
+                    "command": "ask",
+                    "evidence": expected.evidence,
+                    "project": "h19h19/education-admin-rag",
+                    "project_id": 428,
+                    "question": expected.question,
+                    "request_id": expected.request_id,
+                    "target_iid": expected.issue_iid,
+                }
+            ).encode()
+            + b"\n"
+        )
+
+    checked = validate_and_transform(
+        b'{"object_kind":"note"}',
+        event="Note Hook",
+        supplied_secret="correct-secret-12",
+        expected_secret="correct-secret-12",
+        filter_runner=filter_runner,
+    )
+
+    assert checked == expected
+
+
+def test_confidential_note_hook_event_runs_filter_once() -> None:
+    calls: list[bytes] = []
+
+    def filter_runner(raw: bytes) -> bytes:
+        calls.append(raw)
+        return b"[SILENT]\n"
+
+    checked = validate_and_transform(
+        b'{"object_kind":"note"}',
+        event="Confidential Note Hook",
+        supplied_secret="correct-secret-12",
+        expected_secret="correct-secret-12",
+        filter_runner=filter_runner,
+    )
+
+    assert checked is None
+    assert calls == [b'{"object_kind":"note"}']
+
+
+def test_answer_job_runs_hermes_without_tools_then_delivers() -> None:
+    captured: dict[str, object] = {}
+
+    def hermes_runner(command: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+        captured["command"] = command
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "수의계약 기준입니다. [2022년 · PDF 4쪽]\n".encode(),
+            b"",
+        )
+
+    def deliver(
+        *, issue_iid: object, request_id: object, answer: object, token: object
+    ) -> str:
+        captured["delivery"] = (issue_iid, request_id, answer, token)
+        return "91"
+
+    note_id = run_answer_job(
+        _request(),
+        hermes_path=Path("/opt/hermes"),
+        executor_profile="education-agent",
+        delivery_token="response-token",
+        hermes_runner=hermes_runner,
+        deliver=deliver,
+    )
+
+    command = captured["command"]
+    assert command[0:4] == ("/opt/hermes", "-p", "education-agent", "-z")
+    assert command[-3:] == ("-t", "context_engine", "--ignore-rules")
+    delivered = captured["delivery"]
+    assert delivered[0:2] == (73, REQUEST_ID)
+    assert delivered[3] == "response-token"
+    assert delivered[2] == PublicAnswer(
+        answer="수의계약 기준입니다. [2022년 · PDF 4쪽]",
+        answer_kind="grounded",
+        cases=public_cases_from_evidence(_request().question, _request().evidence),
+    )
+    assert note_id == "91"
+
+
+def test_answer_job_skips_ai_when_no_case_is_relevant() -> None:
+    request = _request()
+    unrelated = GitLabQaRequest(
+        issue_iid=request.issue_iid,
+        request_id=request.request_id,
+        question="학교폭력 조치",
+        evidence=request.evidence,
+    )
+    calls = 0
+    delivered: list[PublicAnswer] = []
+
+    def hermes_runner(_command: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("AI runner must not be called")
+
+    def deliver(**values: object) -> str:
+        delivered.append(values["answer"])
+        return "92"
+
+    assert (
+        run_answer_job(
+            unrelated,
+            hermes_path=Path("/opt/hermes"),
+            executor_profile="education-agent",
+            delivery_token="response-token",
+            hermes_runner=hermes_runner,
+            deliver=deliver,
+        )
+        == "92"
+    )
+    assert calls == 0
+    assert delivered == [
+        PublicAnswer(answer=NO_EVIDENCE_TEXT, answer_kind="no_evidence", cases=())
+    ]
+
+
+def test_invalid_ai_answer_keeps_related_cases() -> None:
+    delivered: list[PublicAnswer] = []
+
+    def hermes_runner(command: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(command, 0, b"unsupported claim", b"")
+
+    def deliver(**values: object) -> str:
+        delivered.append(values["answer"])
+        return "93"
+
+    assert (
+        run_answer_job(
+            _request(),
+            hermes_path=Path("/opt/hermes"),
+            executor_profile="education-agent",
+            delivery_token="response-token",
+            hermes_runner=hermes_runner,
+            deliver=deliver,
+        )
+        == "93"
+    )
+    assert delivered[0].answer == CASES_ONLY_TEXT
+    assert delivered[0].answer_kind == "cases_only"
+    assert len(delivered[0].cases) == 1
+
+
+def test_config_is_exact_local_only_and_does_not_embed_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    filter_path = tmp_path / "filter"
+    filter_path.write_text("#!/bin/sh\n")
+    filter_path.chmod(0o500)
+    hermes_path = tmp_path / "hermes"
+    hermes_path.write_text("#!/bin/sh\n")
+    hermes_path.chmod(0o500)
+    search_path = tmp_path / "search"
+    search_path.write_text("#!/bin/sh\n")
+    search_path.chmod(0o500)
+    search_config = tmp_path / "config.json"
+    search_config.write_text("{}\n")
+    search_config.chmod(0o600)
+    values = {
+        "SENQA_GITLAB_WEBHOOK_SECRET": "w" * 32,
+        "SENQA_GITLAB_RESPONSE_TOKEN": "response-token",
+        "SENQA_GITLAB_BOT_USERNAME": "senqa-worker-bot",
+        "SENQA_GITLAB_QA_FILTER": str(filter_path),
+        "SENQA_HERMES_COMMAND": str(hermes_path),
+        "SENQA_EXECUTOR_PROFILE": "education-agent",
+        "SENQA_PREVIEW_SEARCH_COMMAND": str(search_path),
+        "SENQA_PREVIEW_SEARCH_CONFIG": str(search_config),
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+    config = load_config()
+
+    assert isinstance(config, BridgeConfig)
+    assert config.bind_host == "127.0.0.1"
+    assert config.bind_port == 8645
+    assert config.executor_profile == "education-agent"
+    assert repr(config).count("response-token") == 0
+    assert repr(config).count("w" * 32) == 0
+
+    for invalid_profile in ("", "has space", "../profile", "a" * 65):
+        monkeypatch.setenv("SENQA_EXECUTOR_PROFILE", invalid_profile)
+        with pytest.raises(BridgeError, match="bridge_invalid"):
+            load_config()
+
+
+def test_missing_bridge_secret_fails_value_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "PRIVATE_CONFIG_SENTINEL"
+    monkeypatch.delenv("SENQA_GITLAB_WEBHOOK_SECRET", raising=False)
+    monkeypatch.setenv("SENQA_GITLAB_RESPONSE_TOKEN", marker)
+
+    with pytest.raises(BridgeError) as caught:
+        load_config()
+
+    assert marker not in repr(caught.value) + str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_http_server_accepts_only_exact_gitlab_qa_route() -> None:
+    calls: list[tuple[bytes, str, str]] = []
+
+    class Service:
+        def accept(self, raw: bytes, *, event: str, supplied_secret: str) -> str:
+            calls.append((raw, event, supplied_secret))
+            return "accepted"
+
+    server = create_server("127.0.0.1", 0, Service())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection.request(
+            "POST",
+            "/webhooks/gitlab-qa",
+            body=b'{"object_kind":"note"}',
+            headers={
+                "Content-Length": "22",
+                "Content-Type": "application/json",
+                "X-Gitlab-Event": "Note Hook",
+                "X-Gitlab-Token": "secret",
+            },
+        )
+        response = connection.getresponse()
+        assert response.status == 202
+        assert response.read() == b'{"status":"accepted"}\n'
+        connection.close()
+
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection.request("POST", "/wrong", body=b"{}")
+        response = connection.getresponse()
+        assert response.status == 404
+        assert response.read() == b""
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert calls == [(b'{"object_kind":"note"}', "Note Hook", "secret")]
+
+
+def test_bridge_service_suppresses_inflight_gitlab_retries(tmp_path: Path) -> None:
+    request = _request()
+    jobs: list[object] = []
+    config = BridgeConfig(
+        webhook_secret="w" * 32,
+        delivery_token="response-token",
+        bot_username="senqa-worker-bot",
+        executor_profile="education-agent",
+        filter_path=tmp_path / "filter",
+        hermes_path=Path("/opt/hermes"),
+        search_path=tmp_path / "search",
+        search_config=tmp_path / "config.json",
+    )
+
+    def filter_runner(_raw: bytes) -> bytes:
+        return (
+            json.dumps(
+                {
+                    "command": "ask",
+                    "evidence": request.evidence,
+                    "project": "h19h19/education-admin-rag",
+                    "project_id": 428,
+                    "question": request.question,
+                    "request_id": request.request_id,
+                    "target_iid": request.issue_iid,
+                }
+            ).encode()
+            + b"\n"
+        )
+
+    service = GitLabQaBridgeService(
+        config,
+        filter_runner=filter_runner,
+        answer_runner=lambda _request: None,
+        thread_launcher=jobs.append,
+    )
+
+    assert (
+        service.accept(b"{}", event="Note Hook", supplied_secret="w" * 32) == "accepted"
+    )
+    assert (
+        service.accept(b"{}", event="Note Hook", supplied_secret="w" * 32)
+        == "duplicate"
+    )
+    assert len(jobs) == 1
+
+    jobs[0]()
+    assert (
+        service.accept(b"{}", event="Note Hook", supplied_secret="w" * 32) == "accepted"
+    )
+
+
+def test_bridge_service_runs_unique_requests_one_at_a_time_in_fifo_order(
+    tmp_path: Path,
+) -> None:
+    state_lock = threading.Lock()
+    active = 0
+    peak_active = 0
+    observed: list[str] = []
+    finished = threading.Event()
+
+    def filter_runner(raw: bytes) -> bytes:
+        return _filter_payload(_request_number(int(raw)))
+
+    def answer_runner(request: GitLabQaRequest) -> None:
+        nonlocal active, peak_active
+        with state_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+            observed.append(request.request_id)
+        time.sleep(0.05)
+        with state_lock:
+            active -= 1
+            if len(observed) == 5 and active == 0:
+                finished.set()
+
+    service = GitLabQaBridgeService(
+        _bridge_config(tmp_path),
+        filter_runner=filter_runner,
+        answer_runner=answer_runner,
+    )
+
+    for index in range(5):
+        assert (
+            service.accept(
+                str(index).encode(),
+                event="Note Hook",
+                supplied_secret="w" * 32,
+            )
+            == "accepted"
+        )
+
+    assert finished.wait(3)
+    assert peak_active == 1
+    assert observed == [_request_number(index).request_id for index in range(5)]
+
+
+def test_bridge_service_limits_active_and_waiting_requests_to_five(
+    tmp_path: Path,
+) -> None:
+    worker_jobs: list[object] = []
+    service = GitLabQaBridgeService(
+        _bridge_config(tmp_path),
+        filter_runner=lambda raw: _filter_payload(_request_number(int(raw))),
+        answer_runner=lambda _request: None,
+        thread_launcher=worker_jobs.append,
+    )
+
+    results = [
+        service.accept(
+            str(index).encode(),
+            event="Note Hook",
+            supplied_secret="w" * 32,
+        )
+        for index in range(6)
+    ]
+
+    assert results == ["accepted"] * 5 + ["overloaded"]
+    assert len(worker_jobs) == 1
+
+
+def test_overloaded_request_gets_one_notification_without_running_answer_model(
+    tmp_path: Path,
+) -> None:
+    answer_calls: list[GitLabQaRequest] = []
+    overload_calls: list[GitLabQaRequest] = []
+    worker_jobs: list[object] = []
+    notification_jobs: list[object] = []
+    service = GitLabQaBridgeService(
+        _bridge_config(tmp_path),
+        filter_runner=lambda raw: _filter_payload(_request_number(int(raw))),
+        answer_runner=answer_calls.append,
+        thread_launcher=worker_jobs.append,
+        overload_runner=overload_calls.append,
+        notification_launcher=notification_jobs.append,
+    )
+
+    for index in range(5):
+        assert (
+            service.accept(
+                str(index).encode(), event="Note Hook", supplied_secret="w" * 32
+            )
+            == "accepted"
+        )
+    assert (
+        service.accept(b"5", event="Note Hook", supplied_secret="w" * 32)
+        == "overloaded"
+    )
+    assert (
+        service.accept(b"5", event="Note Hook", supplied_secret="w" * 32) == "duplicate"
+    )
+
+    assert answer_calls == []
+    assert len(worker_jobs) == 1
+    assert len(notification_jobs) == 1
+    notification_jobs[0]()
+    assert overload_calls == [_request_number(5)]
+
+
+def test_overload_job_delivers_only_the_fixed_public_server_load_response() -> None:
+    delivered: list[tuple[object, object, object, object]] = []
+
+    def deliver(
+        *, issue_iid: object, request_id: object, answer: object, token: object
+    ) -> str:
+        delivered.append((issue_iid, request_id, answer, token))
+        return "94"
+
+    assert (
+        run_overload_job(_request(), delivery_token="response-token", deliver=deliver)
+        == "94"
+    )
+    assert delivered == [
+        (
+            73,
+            REQUEST_ID,
+            PublicAnswer(
+                answer=TEMPORARILY_UNAVAILABLE_TEXT,
+                answer_kind="temporarily_unavailable",
+                cases=(),
+            ),
+            "response-token",
+        )
+    ]
+
+
+def test_hermes_runner_isolates_the_child_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(
+        command: object, **options: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        captured.update(options)
+        options["stdout"].write(b"answer")
+        return subprocess.CompletedProcess(command, 0, None, None)
+
+    monkeypatch.setattr("src.integrations.gitlab_qa_bridge.subprocess.run", fake_run)
+
+    completed = make_hermes_runner("education-agent")(("/opt/hermes", "-z", "prompt"))
+
+    assert captured["start_new_session"] is True
+    assert captured["env"]["HERMES_PROFILE"] == "education-agent"
+    assert completed.stdout == b"answer"
