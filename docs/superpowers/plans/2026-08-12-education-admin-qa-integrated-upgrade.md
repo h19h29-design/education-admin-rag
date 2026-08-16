@@ -40,7 +40,7 @@
 
 - [ ] Run Node view-model tests and Worker tests relevant to static assets.
 - [ ] Start a local Wrangler preview, exercise a response containing one-word search results, inspect result ordering, history retry behavior, both themes, and keyboard navigation.
-- [ ] Capture desktop and 390px mobile screenshots. Compare the rendered screen with the approved concept at `/Users/mac-mini/.codex/generated_images/019fd0ca-175b-7593-bb3d-87054ece75c3/exec-6ad5c12a-2015-41ce-8708-af33ac2fd68e.png` using `view_image`.
+- [ ] Capture desktop and 390px mobile screenshots. Compare the rendered screen with the checked-in approved concept using `view_image`.
 - [ ] Repair any visual mismatch that materially affects the approved hierarchy, typography, theme contrast, input usability, or responsive overflow.
 
 ## Task 4: deploy and hand off

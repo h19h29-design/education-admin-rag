@@ -87,7 +87,8 @@ def test_installs_exact_owner_only_search_config_and_skill(tmp_path: Path) -> No
 
     assert result.returncode == 0, result.stderr
     assert (
-        result.stdout.strip() == "installed=1 profile=hermes2 skill=sen-qa-preview-rag"
+        result.stdout.strip()
+        == "installed=1 profile=configured skill=sen-qa-preview-rag"
     )
     assert search.read_bytes() == SEARCH_SOURCE.read_bytes()
     assert stat.S_IMODE(search.stat().st_mode) == 0o500

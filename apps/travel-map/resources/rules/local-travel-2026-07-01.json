@@ -1,0 +1,15 @@
+{
+  "ruleSetId": "local-travel-2026-07-01",
+  "effectiveFrom": "2026-07-01",
+  "localRoundTripExclusiveMeters": 12000,
+  "actualExpenseInclusiveMeters": 2000,
+  "fourHoursMinutes": 240,
+  "underFourHoursKrw": 10000,
+  "fourHoursOrMoreKrw": 20000,
+  "officialVehicleDeductionKrw": 10000,
+  "sourceRefs": [
+    "https://www.law.go.kr/LSW/lsInfoP.do?lsiSeq=287535",
+    "https://www.law.go.kr/LSW/ordinInfoP.do?ordinSeq=2099835",
+    "https://www.mpm.go.kr/mpm/info/resultPay/payBoard/?boardId=bbs_0000000000000035&category=%EB%B3%B4%EC%88%98&cntId=693&mode=view"
+  ]
+}

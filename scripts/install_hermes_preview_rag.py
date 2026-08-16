@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the read-only SEN-QA preview search skill for Hermes hermes2."""
+"""Install the read-only SEN-QA preview search skill into a configured profile."""
 
 from __future__ import annotations
 
@@ -287,7 +287,7 @@ def main() -> int:
     except (InstallError, OSError, ValueError, TypeError):
         print("install_failed", file=sys.stderr)
         return 2
-    print("installed=1 profile=hermes2 skill=sen-qa-preview-rag")
+    print("installed=1 profile=configured skill=sen-qa-preview-rag")
     return 0
 
 

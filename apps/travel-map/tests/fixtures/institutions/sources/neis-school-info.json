@@ -1,0 +1,36 @@
+{
+  "schoolInfo": [
+    {
+      "head": [
+        {"list_total_count": 2},
+        {"RESULT": {"CODE": "INFO-000", "MESSAGE": "\uc815\uc0c1 \ucc98\ub9ac\ub418\uc5c8\uc2b5\ub2c8\ub2e4."}}
+      ]
+    },
+    {
+      "row": [
+        {
+          "ATPT_OFCDC_SC_CODE": "B10",
+          "ATPT_OFCDC_SC_NM": "\uc11c\uc6b8\ud2b9\ubcc4\uc2dc\uad50\uc721\uccad",
+          "SD_SCHUL_CODE": "7010001",
+          "SCHUL_NM": "\uac80\uc99d\uacf5\ub9bd\ucd08\ub4f1\ud559\uad50",
+          "SCHUL_KND_SC_NM": "\ucd08\ub4f1\ud559\uad50",
+          "JU_ORG_NM": "\uc11c\uc6b8\ud2b9\ubcc4\uc2dc\uc911\ubd80\uad50\uc721\uc9c0\uc6d0\uccad",
+          "FOND_SC_NM": "\uacf5\ub9bd",
+          "ORG_RDNMA": "\uc11c\uc6b8\ud2b9\ubcc4\uc2dc \uc911\uad6c \uac80\uc99d\ub85c 1",
+          "LOAD_DTM": "20260810"
+        },
+        {
+          "ATPT_OFCDC_SC_CODE": "B10",
+          "ATPT_OFCDC_SC_NM": "\uc11c\uc6b8\ud2b9\ubcc4\uc2dc\uad50\uc721\uccad",
+          "SD_SCHUL_CODE": "7010002",
+          "SCHUL_NM": "\uac80\uc99d\uc0ac\ub9bd\uace0\ub4f1\ud559\uad50",
+          "SCHUL_KND_SC_NM": "\uace0\ub4f1\ud559\uad50",
+          "JU_ORG_NM": "\uc11c\uc6b8\ud2b9\ubcc4\uc2dc\uad50\uc721\uccad",
+          "FOND_SC_NM": "\uc0ac\ub9bd",
+          "ORG_RDNMA": "\uc11c\uc6b8\ud2b9\ubcc4\uc2dc \uc911\uad6c \uac80\uc99d\ub85c 2",
+          "LOAD_DTM": "20260810"
+        }
+      ]
+    }
+  ]
+}

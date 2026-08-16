@@ -1,9 +1,9 @@
-# Hermes OAuth preview RAG
+# Local preview RAG
 
-This runbook deploys the incomplete SEN-QA preview index to the existing
-`hermes2` profile. Hermes remains the only answer-generation layer and uses the
-already authenticated `openai-codex` OAuth provider. No OpenAI API key, Ollama,
-NAS compute, public listener, or production alias is required.
+This runbook deploys the incomplete SEN-QA preview index to a locally configured
+answer-generation profile. The profile and authentication provider are supplied
+outside Git. No API key, local model, NAS compute, public listener, or production
+alias is required by this repository workflow.
 
 ## Safety status
 
@@ -20,12 +20,13 @@ and database hashes.
 
 ## Install
 
-Confirm the selected profile before installation:
+Confirm the privately selected profile and provider before installation. Do not
+record their names or authentication output in the repository:
 
 ```sh
-hermes --profile hermes2 auth status openai-codex
-hermes --profile hermes2 config get model.provider
-hermes --profile hermes2 config get model.default
+<local-agent-command> auth status
+<local-agent-command> config get model.provider
+<local-agent-command> config get model.default
 ```
 
 Run the repository installer with absolute paths to the preview database,
@@ -33,21 +34,21 @@ attestation, and independently recorded attestation SHA-256. It installs only:
 
 - `~/.local/bin/senqa-preview-search`
 - `~/.config/senqa-preview-rag/config.json`
-- `~/.hermes/profiles/hermes2/skills/sen-qa-preview-rag/SKILL.md`
+- `<private-profile-root>/skills/sen-qa-preview-rag/SKILL.md`
 
 The installer rejects mismatched authority, symlinks, and conflicting existing
 files. An exact reinstall is idempotent.
 
 ## Use
 
-Start the existing loopback-only Hermes dashboard:
+Start the existing loopback-only local dashboard:
 
 ```sh
-hermes --profile hermes2 dashboard --host 127.0.0.1 --no-open
+<local-agent-command> dashboard --host 127.0.0.1 --no-open
 ```
 
 Ask a source-grounded question and explicitly invoke the `sen-qa-preview-rag`
-skill if Hermes does not select it automatically. Do not expose the dashboard
+skill if the executor does not select it automatically. Do not expose the dashboard
 on a public interface.
 
 ## Promotion boundary

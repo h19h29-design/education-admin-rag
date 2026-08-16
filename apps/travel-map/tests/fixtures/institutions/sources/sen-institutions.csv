@@ -1,0 +1,14 @@
+# source_url=https://www.sen.go.kr/www/website.jsp
+# source_as_of=2026-08-10
+# source_sha256=69863ac78689fb4b6e9941aabea03c3c1d618ccb26568e844079afd9092eb2c2
+# normalized_sha256=2df3f1a34bee3091df190371c9bcfff2e40675135bbd718dcd40a194dd806b90
+# directory_source_raw_sha256=9f202202edc653b09b4debb5a0ff939cf9fcdc64dd58174b28f8d009bb1b7424
+# main_site_source_url=https://gslib.sen.go.kr/gslib/html.do?menu_idx=52
+# main_site_source_raw_sha256=312ca8f63086188dabcb272ed3a2bfdfdb0d2c360f010cdc1fb59e6ff90288e7
+# branch_site_source_url=https://gylib.sen.go.kr/gylib/html.do?menu_idx=43
+# branch_site_source_raw_sha256=b3036767d04ef37b77d72c617ca21b052b83682eeab6f19ecb15a8a0aa54dd49
+# site_sources_checked_at=2026-08-11
+# license_name=KOGL_TYPE_1_ATTRIBUTION
+# attribution=Source: Seoul Metropolitan Office of Education
+institution_id,official_name,institution_type,foundation_type,education_office,road_address,district,latitude,longitude,site_code,site_name,is_default
+sen:headquarters,\uc11c\uc6b8\ud2b9\ubcc4\uc2dc\uad50\uc721\uccad,HEADQUARTERS,PUBLIC,\uc11c\uc6b8\ud2b9\ubcc4\uc2dc\uad50\uc721\uccad,\uc11c\uc6b8\ud2b9\ubcc4\uc2dc \uc885\ub85c\uad6c \uc1a1\uc6d4\uae38 48,\uc885\ub85c\uad6c,37.5710,126.9680,main,\ubcf8\uad00,true

@@ -9,7 +9,7 @@
 `/webhooks/gitlab-agent`와 Hermes status/review 경로는 변경하지 않는다.
 
 브리지는 bot actor, project ID/path, confidential flag, request ID를 확인하고
-고정된 read-only 프리뷰 검색기를 먼저 실행한다. Hermes `hermes2`는
+고정된 read-only 프리뷰 검색기를 먼저 실행한다. 로컬 실행 프로필은
 `-t context_engine --ignore-rules`로 실행되므로 terminal, web, browser, MCP를 사용할 수
 없다. 답변은 별도 response token으로 같은 confidential issue에만 게시된다.
 

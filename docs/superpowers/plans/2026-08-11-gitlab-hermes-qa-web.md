@@ -2,7 +2,7 @@
 
 1. GitLab QA Note Hook의 exact filter, RAG 선행 검색, 값 비노출 계약을
    RED→GREEN으로 구현한다.
-2. GitLab QA 전용 로컬 브리지에서 Hermes `hermes2`를 무도구 1회 호출하고,
+2. GitLab QA 전용 로컬 브리지에서 설정된 실행 프로필을 무도구 1회 호출하고,
    결과를 confidential GitLab issue note로 보내는 외부 SHA 고정 설치기를 구현한다.
 3. Cloudflare Worker에 confidential issue 생성, `/hermes ask` note 생성, KV 폴링
    권한, Turnstile/rate-limit 경계를 구현한다.

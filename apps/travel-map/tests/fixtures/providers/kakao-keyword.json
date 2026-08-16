@@ -1,0 +1,33 @@
+{
+  "meta": {"is_end": true, "pageable_count": 2, "same_name": null, "total_count": 2},
+  "documents": [
+    {
+      "address_name": "서울 중구 세종대로 110",
+      "category_group_code": "PO3",
+      "category_group_name": "공공기관",
+      "category_name": "사회,공공기관 > 지방행정기관 > 시청",
+      "distance": "",
+      "id": "kakao-place-1",
+      "phone": "02-120",
+      "place_name": "서울특별시청",
+      "place_url": "https://place.map.kakao.com/1",
+      "road_address_name": "서울 중구 세종대로 110",
+      "x": "126.978388",
+      "y": "37.566610"
+    },
+    {
+      "address_name": "서울 중구 태평로1가 31",
+      "category_group_code": "",
+      "category_group_name": "",
+      "category_name": "문화,예술 > 도서관",
+      "distance": "",
+      "id": "kakao-place-2",
+      "phone": "",
+      "place_name": "서울도서관",
+      "place_url": "https://place.map.kakao.com/2",
+      "road_address_name": "서울 중구 세종대로 110",
+      "x": "126.977900",
+      "y": "37.566300"
+    }
+  ]
+}

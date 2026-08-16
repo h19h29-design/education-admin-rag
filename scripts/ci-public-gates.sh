@@ -10,7 +10,7 @@ case "${1:-}" in
     ;;
   quality)
     uv sync --locked --group dev
-    uv run pytest -q
+    uv run pytest -q tests
     uv run ruff check src tests
     uv run ruff format --check src
     uv run mypy --strict --explicit-package-bases src
@@ -18,6 +18,10 @@ case "${1:-}" in
     npm --prefix web/qa-worker test
     node --check web/qa-worker/src/worker.js
     node --check web/qa-worker/public/app.js
+    uv sync --project apps/travel-map --frozen --dev
+    uv run --project apps/travel-map pytest apps/travel-map/tests -q -W error
+    uv run --project apps/travel-map ruff check apps/travel-map
+    uv run --project apps/travel-map mypy apps/travel-map/app apps/travel-map/scripts
     ;;
   security)
     ./scripts/verify-public-repo.sh

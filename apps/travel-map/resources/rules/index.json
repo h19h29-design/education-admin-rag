@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {
+      "effectiveFrom": "2026-07-01",
+      "file": "local-travel-2026-07-01.json",
+      "sha256": "fb1e309a2f471dc9d18e4a2a3d1b7b45892793374c4aee530aef6985e1a6a9f8"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "status": "SUCCESS",
+  "message": "\uc815\uc0c1",
+  "pageCnt": 100,
+  "currentPage": 1,
+  "sidoList": "11",
+  "sggList": "11110",
+  "timing": "20261",
+  "kinderInfo": [
+    {
+      "kinderCode": "K12345678",
+      "officeedu": "\uc11c\uc6b8\ud2b9\ubcc4\uc2dc\uad50\uc721\uccad",
+      "subofficeedu": "\uc911\ubd80\uad50\uc721\uc9c0\uc6d0\uccad",
+      "kindername": "\uac80\uc99d\ucd08\ub4f1\ud559\uad50\ubcd1\uc124\uc720\uce58\uc6d0",
+      "establish": "\uacf5\ub9bd(\ubcd1\uc124)",
+      "addr": "\uc11c\uc6b8\ud2b9\ubcc4\uc2dc \uc885\ub85c\uad6c \uac80\uc99d\ub85c 3",
+      "pbnttmng": "20261",
+      "rpstYn": "N",
+      "lttdcdnt": "37.5759",
+      "lngtcdnt": "126.9768"
+    }
+  ]
+}

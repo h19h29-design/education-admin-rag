@@ -3,7 +3,7 @@
 ## 목표
 
 공개 질문 웹페이지에서 질문을 접수하고, GitLab Note Hook이 맥미니의
-Hermes `hermes2` 프로필을 깨워 `openai-codex` OAuth로 답변하며,
+저장소 밖에서 설정된 로컬 실행 프로필로 답변하며,
 결과를 다시 웹페이지에 보여준다. GitLab은 질문 큐와 Webhook, 감사
 이력의 권위 원천이다. Cloudflare는 공개 웹/API와 이미 구성된
 GitLab-to-Mac Tunnel만 담당한다.
@@ -18,8 +18,8 @@ GitLab-to-Mac Tunnel만 담당한다.
    새 `/webhooks/gitlab-qa` 경로를 통해 맥미니의 로컬 QA 브리지에 도착한다.
 5. 전용 필터가 프로젝트, bot actor, confidential issue, 명령, 질문 크기를
    재검증하고 고정된 로컬 RAG 검색기를 직접 실행한다.
-6. 브리지는 Hermes `hermes2`를 도구 0개인 `context_engine` allowlist와 `--ignore-rules`로
-   1회 호출한다. Hermes는 봉인된 검색 근거만 받고 OAuth 모델로 답변한다.
+6. 브리지는 설정된 로컬 실행 프로필을 도구 0개인 `context_engine` allowlist와
+   `--ignore-rules`로 1회 호출한다. 실행기는 봉인된 검색 근거만 받아 답변한다.
 7. 브리지의 독립 GitLab delivery 경계가 답변을 동일 confidential issue의
    machine-marked note로 게시한다.
 8. Worker가 임의의 폴링 토큰을 검증하고 해당 note를 정규화해 웹에

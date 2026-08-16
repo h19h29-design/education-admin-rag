@@ -1,0 +1,9 @@
+{
+  "RESULT": {
+    "OIL": [
+      {"TRADE_DT": "20260810", "PRODCD": "B027", "PRODNM": "휘발유", "PRICE": "1700.00", "DIFF": "0.00"},
+      {"TRADE_DT": "20260810", "PRODCD": "D047", "PRODNM": "자동차용경유", "PRICE": "1600.00", "DIFF": "0.00"},
+      {"TRADE_DT": "20260810", "PRODCD": "K015", "PRODNM": "자동차용부탄", "PRICE": "1100.00", "DIFF": "0.00"}
+    ]
+  }
+}
