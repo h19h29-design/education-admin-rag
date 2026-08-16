@@ -217,6 +217,42 @@ test("poll returns only the matching structured public answer", async () => {
   assert.equal(JSON.stringify(body).includes("production_eligible"), false);
 });
 
+test("poll returns the fixed temporary-unavailability answer without cases", async () => {
+  const requestId = "senqa-0123456789abcdef0123456789abcdef";
+  const pollToken = "A".repeat(43);
+  const runtime = env(async () =>
+    Response.json([
+      {
+        body: answerNote(requestId, {
+          answer:
+            "서버 부하로 약간의 대기 시간이 필요합니다. 잠시 후 다시 시도해 주세요.",
+          answer_kind: "temporarily_unavailable",
+          cases: [],
+        }),
+      },
+    ]),
+  );
+  await runtime.QUESTIONS.put(
+    `question:${requestId}`,
+    JSON.stringify({
+      issue_iid: 73,
+      poll_token_sha256: createHash("sha256").update(pollToken).digest("hex"),
+    }),
+  );
+  const response = await worker.fetch(
+    new Request(`${ORIGIN}/api/questions/${requestId}?token=${pollToken}`, {
+      headers: { origin: ORIGIN },
+    }),
+    runtime,
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.status, "complete");
+  assert.equal(body.answer_kind, "temporarily_unavailable");
+  assert.deepEqual(body.cases, []);
+});
+
 test("poll rejects a structured answer with internal or extra fields", async () => {
   const requestId = "senqa-0123456789abcdef0123456789abcdef";
   const pollToken = "A".repeat(43);

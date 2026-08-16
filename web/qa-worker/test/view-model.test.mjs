@@ -84,6 +84,19 @@ test("no-evidence completion accepts only the exact fixed guidance", () => {
   assert.equal(normalizeCompletion({ ...value, answer: "관련 내용이 없습니다." }), null);
 });
 
+test("temporary-unavailability completion accepts only the fixed server-load guidance", () => {
+  const value = {
+    answer: "서버 부하로 약간의 대기 시간이 필요합니다. 잠시 후 다시 시도해 주세요.",
+    answer_kind: "temporarily_unavailable",
+    cases: [],
+    request_id: COMPLETION.request_id,
+    status: "complete",
+  };
+  assert.deepEqual(normalizeCompletion(value), value);
+  assert.equal(normalizeCompletion({ ...value, cases: [PUBLIC_CASE] }), null);
+  assert.equal(normalizeCompletion({ ...value, answer: "잠시 기다려 주세요." }), null);
+});
+
 test("history v2 keeps structured results and drops answer-only legacy rows", () => {
   const completeRow = {
     createdAt: 1_800_000_000_000,

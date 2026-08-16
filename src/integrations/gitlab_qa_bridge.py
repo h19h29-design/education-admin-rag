@@ -11,6 +11,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +24,7 @@ from src.integrations.gitlab_qa_public import (
     cases_only_answer,
     no_evidence_answer,
     public_cases_from_evidence,
+    temporarily_unavailable_answer,
     validate_grounded_answer,
 )
 
@@ -36,6 +38,7 @@ _MAX_QUESTION_CHARACTERS = 1_000
 _MAX_WEBHOOK_BYTES = 65_536
 _MAX_ANSWER_BYTES = 32_000
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 class BridgeError(ValueError):
@@ -63,6 +66,7 @@ class BridgeConfig:
     webhook_secret: str = field(repr=False)
     delivery_token: str = field(repr=False)
     bot_username: str
+    executor_profile: str
     filter_path: Path
     hermes_path: Path
     search_path: Path
@@ -79,12 +83,19 @@ class GitLabQaBridgeService:
         filter_runner: Callable[[bytes], bytes],
         answer_runner: Callable[[GitLabQaRequest], object],
         thread_launcher: Callable[[Callable[[], None]], object] | None = None,
+        overload_runner: Callable[[GitLabQaRequest], object] | None = None,
+        notification_launcher: Callable[[Callable[[], None]], object] | None = None,
     ) -> None:
         self._config = config
         self._filter_runner = filter_runner
         self._answer_runner = answer_runner
         self._thread_launcher = thread_launcher or self._launch_thread
+        self._overload_runner = overload_runner
+        self._notification_launcher = notification_launcher or self._launch_thread
         self._inflight: set[str] = set()
+        self._notifying: set[str] = set()
+        self._pending: deque[GitLabQaRequest] = deque()
+        self._worker_running = False
         self._lock = threading.Lock()
 
     @staticmethod
@@ -113,6 +124,31 @@ class GitLabQaBridgeService:
         if failed:
             return
 
+    def _drain(self) -> None:
+        while True:
+            with self._lock:
+                if not self._pending:
+                    self._worker_running = False
+                    return
+                request = self._pending.popleft()
+            self._run(request)
+
+    def _notify_overload(self, request: GitLabQaRequest) -> None:
+        try:
+            if self._overload_runner is not None:
+                self._overload_runner(request)
+        except (
+            BridgeError,
+            OSError,
+            RuntimeError,
+            ValueError,
+            subprocess.SubprocessError,
+        ):
+            pass
+        finally:
+            with self._lock:
+                self._notifying.discard(request.request_id)
+
     def accept(self, raw: bytes, *, event: str, supplied_secret: str) -> str:
         request = validate_and_transform(
             raw,
@@ -123,19 +159,45 @@ class GitLabQaBridgeService:
         )
         if request is None:
             return "ignored"
+        notify_overload = False
         with self._lock:
-            if request.request_id in self._inflight:
+            if (
+                request.request_id in self._inflight
+                or request.request_id in self._notifying
+            ):
                 return "duplicate"
-            self._inflight.add(request.request_id)
-        failed = False
-        try:
-            self._thread_launcher(lambda: self._run(request))
-        except (OSError, RuntimeError):
-            failed = True
-        if failed:
-            with self._lock:
-                self._inflight.discard(request.request_id)
-            _raise()
+            if len(self._inflight) >= 5:
+                if self._overload_runner is None:
+                    return "overloaded"
+                self._notifying.add(request.request_id)
+                notify_overload = True
+            else:
+                self._inflight.add(request.request_id)
+                self._pending.append(request)
+                if self._worker_running:
+                    return "accepted"
+                self._worker_running = True
+                failed = False
+                try:
+                    self._thread_launcher(self._drain)
+                except (OSError, RuntimeError):
+                    failed = True
+                if failed:
+                    self._worker_running = False
+                    self._pending.remove(request)
+                    self._inflight.discard(request.request_id)
+                    _raise()
+        if notify_overload:
+            failed = False
+            try:
+                self._notification_launcher(lambda: self._notify_overload(request))
+            except (OSError, RuntimeError):
+                failed = True
+            if failed:
+                with self._lock:
+                    self._notifying.discard(request.request_id)
+                _raise()
+            return "overloaded"
         return "accepted"
 
 
@@ -161,6 +223,7 @@ def load_config() -> BridgeConfig:
     webhook_secret = os.environ.get("SENQA_GITLAB_WEBHOOK_SECRET", "")
     delivery_token = os.environ.get("SENQA_GITLAB_RESPONSE_TOKEN", "")
     bot_username = os.environ.get("SENQA_GITLAB_BOT_USERNAME", "")
+    executor_profile = os.environ.get("SENQA_EXECUTOR_PROFILE", "")
     filter_path = Path(os.environ.get("SENQA_GITLAB_QA_FILTER", ""))
     hermes_path = Path(os.environ.get("SENQA_HERMES_COMMAND", ""))
     search_path = Path(os.environ.get("SENQA_PREVIEW_SEARCH_COMMAND", ""))
@@ -172,6 +235,7 @@ def load_config() -> BridgeConfig:
         or len(delivery_token) > 512
         or any(character.isspace() for character in delivery_token)
         or _USERNAME_RE.fullmatch(bot_username) is None
+        or _PROFILE_RE.fullmatch(executor_profile) is None
         or not _owner_file(filter_path, executable=True)
         or not _owner_file(hermes_path, executable=True)
         or not _owner_file(search_path, executable=True)
@@ -182,6 +246,7 @@ def load_config() -> BridgeConfig:
         webhook_secret=webhook_secret,
         delivery_token=delivery_token,
         bot_username=bot_username,
+        executor_profile=executor_profile,
         filter_path=filter_path,
         hermes_path=hermes_path,
         search_path=search_path,
@@ -380,11 +445,20 @@ def build_hermes_prompt(request: GitLabQaRequest, cases: tuple[PublicCase, ...])
     )
 
 
-def build_hermes_command(hermes_path: Path, prompt: str) -> tuple[str, ...]:
+def build_hermes_command(
+    hermes_path: Path, executor_profile: str, prompt: str
+) -> tuple[str, ...]:
+    if (
+        not isinstance(hermes_path, Path)
+        or _PROFILE_RE.fullmatch(executor_profile) is None
+        or type(prompt) is not str
+        or not prompt
+    ):
+        _raise()
     return (
         str(hermes_path),
         "-p",
-        "hermes2",
+        executor_profile,
         "-z",
         prompt,
         "-t",
@@ -427,6 +501,7 @@ def run_answer_job(
     request: GitLabQaRequest,
     *,
     hermes_path: Path,
+    executor_profile: str,
     delivery_token: str,
     hermes_runner: Callable[[tuple[str, ...]], subprocess.CompletedProcess[bytes]],
     deliver: Callable[..., str],
@@ -435,6 +510,7 @@ def run_answer_job(
         type(request) is not GitLabQaRequest
         or not isinstance(hermes_path, Path)
         or not hermes_path.is_absolute()
+        or _PROFILE_RE.fullmatch(executor_profile) is None
         or type(delivery_token) is not str
         or not delivery_token
         or len(delivery_token) > 512
@@ -464,7 +540,9 @@ def run_answer_job(
     if not cases:
         public_answer = no_evidence_answer()
     else:
-        command = build_hermes_command(hermes_path, build_hermes_prompt(checked, cases))
+        command = build_hermes_command(
+            hermes_path, executor_profile, build_hermes_prompt(checked, cases)
+        )
         completed: subprocess.CompletedProcess[bytes] | None = None
         generation_failed = False
         try:
@@ -516,6 +594,36 @@ def run_answer_job(
     return note_id
 
 
+def run_overload_job(
+    request: GitLabQaRequest,
+    *,
+    delivery_token: str,
+    deliver: Callable[..., str],
+) -> str:
+    if (
+        type(request) is not GitLabQaRequest
+        or type(delivery_token) is not str
+        or not delivery_token
+        or len(delivery_token) > 512
+        or any(character.isspace() for character in delivery_token)
+    ):
+        _raise()
+    note_id: str | None = None
+    failed = False
+    try:
+        note_id = deliver(
+            issue_iid=request.issue_iid,
+            request_id=request.request_id,
+            answer=temporarily_unavailable_answer(),
+            token=delivery_token,
+        )
+    except (BridgeError, OSError, RuntimeError, ValueError):
+        failed = True
+    if failed or type(note_id) is not str or not note_id.isdecimal():
+        _raise()
+    return note_id
+
+
 def create_server(
     host: str, port: int, service: BridgeServiceProtocol
 ) -> ThreadingHTTPServer:
@@ -526,10 +634,14 @@ def create_server(
         def log_message(self, _format: str, *_args: object) -> None:
             return
 
+        def _send_empty(self, status: int) -> None:
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_POST(self) -> None:
             if self.path != "/webhooks/gitlab-qa":
-                self.send_response(404)
-                self.end_headers()
+                self._send_empty(404)
                 return
             content_length_text = self.headers.get("Content-Length", "")
             if (
@@ -537,8 +649,7 @@ def create_server(
                 or not 1 <= int(content_length_text) <= _MAX_WEBHOOK_BYTES
                 or self.headers.get_content_type() != "application/json"
             ):
-                self.send_response(400)
-                self.end_headers()
+                self._send_empty(400)
                 return
             raw = self.rfile.read(int(content_length_text))
             failed = False
@@ -552,12 +663,10 @@ def create_server(
             except BridgeError:
                 failed = True
             if failed:
-                self.send_response(403)
-                self.end_headers()
+                self._send_empty(403)
                 return
             if status not in {"accepted", "duplicate", "ignored"}:
-                self.send_response(503)
-                self.end_headers()
+                self._send_empty(503)
                 return
             payload = (
                 json.dumps(
@@ -618,11 +727,13 @@ def make_filter_runner(config: BridgeConfig) -> Callable[[bytes], bytes]:
     return run
 
 
-def make_hermes_runner() -> Callable[
-    [tuple[str, ...]], subprocess.CompletedProcess[bytes]
-]:
+def make_hermes_runner(
+    executor_profile: str,
+) -> Callable[[tuple[str, ...]], subprocess.CompletedProcess[bytes]]:
+    if _PROFILE_RE.fullmatch(executor_profile) is None:
+        _raise()
     environment = _minimal_environment()
-    environment["HERMES_PROFILE"] = "hermes2"
+    environment["HERMES_PROFILE"] = executor_profile
 
     def run(command: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
         failed = False
@@ -663,14 +774,22 @@ def main() -> None:
     from src.integrations.gitlab_qa_delivery import post_answer_comment
 
     config = load_config()
-    hermes_runner = make_hermes_runner()
+    hermes_runner = make_hermes_runner(config.executor_profile)
 
     def answer(request: GitLabQaRequest) -> str:
         return run_answer_job(
             request,
             hermes_path=config.hermes_path,
+            executor_profile=config.executor_profile,
             delivery_token=config.delivery_token,
             hermes_runner=hermes_runner,
+            deliver=post_answer_comment,
+        )
+
+    def overload(request: GitLabQaRequest) -> str:
+        return run_overload_job(
+            request,
+            delivery_token=config.delivery_token,
             deliver=post_answer_comment,
         )
 
@@ -678,6 +797,7 @@ def main() -> None:
         config,
         filter_runner=make_filter_runner(config),
         answer_runner=answer,
+        overload_runner=overload,
     )
     server = create_server(config.bind_host, config.bind_port, service)
     try:

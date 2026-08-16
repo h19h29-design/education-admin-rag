@@ -15,6 +15,9 @@ NO_EVIDENCE_TEXT = (
 CASES_ONLY_TEXT = (
     "답변을 정리하지 못했습니다. 관련 사례는 아래 목록에서 직접 확인해 주세요."
 )
+TEMPORARILY_UNAVAILABLE_TEXT = (
+    "서버 부하로 약간의 대기 시간이 필요합니다. 잠시 후 다시 시도해 주세요."
+)
 
 _CASE_ID_RE = re.compile(r"^senqa-20(?:20|21|22|23|24|25)-[a-z0-9-]{1,160}$")
 _CASE_ID_SEARCH_RE = re.compile(r"senqa-20(?:20|21|22|23|24|25)-[a-z0-9-]{1,160}")
@@ -131,14 +134,22 @@ class PublicCase:
 @dataclass(frozen=True, slots=True)
 class PublicAnswer:
     answer: str
-    answer_kind: Literal["grounded", "no_evidence", "cases_only"]
+    answer_kind: Literal[
+        "grounded", "no_evidence", "cases_only", "temporarily_unavailable"
+    ]
     cases: tuple[PublicCase, ...]
     schema_version: Literal["senqa-public-answer/v1"] = PUBLIC_SCHEMA
 
     def __post_init__(self) -> None:
         if (
             not _plain_text(self.answer, maximum=_MAX_ANSWER_CHARACTERS)
-            or self.answer_kind not in {"grounded", "no_evidence", "cases_only"}
+            or self.answer_kind
+            not in {
+                "grounded",
+                "no_evidence",
+                "cases_only",
+                "temporarily_unavailable",
+            }
             or type(self.cases) is not tuple
             or len(self.cases) > _MAX_CASES
             or any(type(case) is not PublicCase for case in self.cases)
@@ -153,6 +164,10 @@ class PublicAnswer:
             _raise()
         if self.answer_kind == "cases_only" and (
             self.answer != CASES_ONLY_TEXT or not self.cases
+        ):
+            _raise()
+        if self.answer_kind == "temporarily_unavailable" and (
+            self.answer != TEMPORARILY_UNAVAILABLE_TEXT or self.cases
         ):
             _raise()
         if self.answer_kind == "grounded" and (
@@ -274,6 +289,14 @@ def no_evidence_answer() -> PublicAnswer:
 
 def cases_only_answer(cases: tuple[PublicCase, ...]) -> PublicAnswer:
     return PublicAnswer(answer=CASES_ONLY_TEXT, answer_kind="cases_only", cases=cases)
+
+
+def temporarily_unavailable_answer() -> PublicAnswer:
+    return PublicAnswer(
+        answer=TEMPORARILY_UNAVAILABLE_TEXT,
+        answer_kind="temporarily_unavailable",
+        cases=(),
+    )
 
 
 def canonical_public_answer_json(answer: object) -> str:

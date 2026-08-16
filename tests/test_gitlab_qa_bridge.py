@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
+import time
 from http.client import HTTPConnection
 from pathlib import Path
 
@@ -20,11 +21,13 @@ from src.integrations.gitlab_qa_bridge import (
     make_hermes_runner,
     parse_filter_output,
     run_answer_job,
+    run_overload_job,
     validate_and_transform,
 )
 from src.integrations.gitlab_qa_public import (
     CASES_ONLY_TEXT,
     NO_EVIDENCE_TEXT,
+    TEMPORARILY_UNAVAILABLE_TEXT,
     PublicAnswer,
     public_cases_from_evidence,
 )
@@ -69,6 +72,46 @@ def _request() -> GitLabQaRequest:
             "schema_version": "sen-qa-preview-search-response/v1",
             "warning_code": "unreviewed_incomplete_preview",
         },
+    )
+
+
+def _request_number(index: int) -> GitLabQaRequest:
+    original = _request()
+    return GitLabQaRequest(
+        issue_iid=original.issue_iid + index,
+        request_id=f"senqa-{index:032x}",
+        question=original.question,
+        evidence=original.evidence,
+    )
+
+
+def _filter_payload(request: GitLabQaRequest) -> bytes:
+    return (
+        json.dumps(
+            {
+                "command": "ask",
+                "evidence": request.evidence,
+                "project": "h19h19/education-admin-rag",
+                "project_id": 428,
+                "question": request.question,
+                "request_id": request.request_id,
+                "target_iid": request.issue_iid,
+            }
+        ).encode()
+        + b"\n"
+    )
+
+
+def _bridge_config(tmp_path: Path) -> BridgeConfig:
+    return BridgeConfig(
+        webhook_secret="w" * 32,
+        delivery_token="response-token",
+        bot_username="senqa-worker-bot",
+        executor_profile="education-agent",
+        filter_path=tmp_path / "filter",
+        hermes_path=Path("/opt/hermes"),
+        search_path=tmp_path / "search",
+        search_config=tmp_path / "config.json",
     )
 
 
@@ -144,14 +187,16 @@ def test_prompt_treats_question_as_data_and_requires_grounded_preview_answer() -
         assert forbidden not in prompt.casefold()
 
 
-def test_hermes_command_pins_profile_and_zero_tool_allowlist(tmp_path: Path) -> None:
+def test_hermes_command_uses_configured_profile_and_zero_tool_allowlist(
+    tmp_path: Path,
+) -> None:
     hermes = tmp_path / "hermes"
-    command = build_hermes_command(hermes, "PROMPT")
+    command = build_hermes_command(hermes, "education-agent", "PROMPT")
 
     assert command == (
         str(hermes),
         "-p",
-        "hermes2",
+        "education-agent",
         "-z",
         "PROMPT",
         "-t",
@@ -273,13 +318,14 @@ def test_answer_job_runs_hermes_without_tools_then_delivers() -> None:
     note_id = run_answer_job(
         _request(),
         hermes_path=Path("/opt/hermes"),
+        executor_profile="education-agent",
         delivery_token="response-token",
         hermes_runner=hermes_runner,
         deliver=deliver,
     )
 
     command = captured["command"]
-    assert command[0:4] == ("/opt/hermes", "-p", "hermes2", "-z")
+    assert command[0:4] == ("/opt/hermes", "-p", "education-agent", "-z")
     assert command[-3:] == ("-t", "context_engine", "--ignore-rules")
     delivered = captured["delivery"]
     assert delivered[0:2] == (73, REQUEST_ID)
@@ -316,6 +362,7 @@ def test_answer_job_skips_ai_when_no_case_is_relevant() -> None:
         run_answer_job(
             unrelated,
             hermes_path=Path("/opt/hermes"),
+            executor_profile="education-agent",
             delivery_token="response-token",
             hermes_runner=hermes_runner,
             deliver=deliver,
@@ -342,6 +389,7 @@ def test_invalid_ai_answer_keeps_related_cases() -> None:
         run_answer_job(
             _request(),
             hermes_path=Path("/opt/hermes"),
+            executor_profile="education-agent",
             delivery_token="response-token",
             hermes_runner=hermes_runner,
             deliver=deliver,
@@ -374,6 +422,7 @@ def test_config_is_exact_local_only_and_does_not_embed_tokens(
         "SENQA_GITLAB_BOT_USERNAME": "senqa-worker-bot",
         "SENQA_GITLAB_QA_FILTER": str(filter_path),
         "SENQA_HERMES_COMMAND": str(hermes_path),
+        "SENQA_EXECUTOR_PROFILE": "education-agent",
         "SENQA_PREVIEW_SEARCH_COMMAND": str(search_path),
         "SENQA_PREVIEW_SEARCH_CONFIG": str(search_config),
     }
@@ -385,8 +434,14 @@ def test_config_is_exact_local_only_and_does_not_embed_tokens(
     assert isinstance(config, BridgeConfig)
     assert config.bind_host == "127.0.0.1"
     assert config.bind_port == 8645
+    assert config.executor_profile == "education-agent"
     assert repr(config).count("response-token") == 0
     assert repr(config).count("w" * 32) == 0
+
+    for invalid_profile in ("", "has space", "../profile", "a" * 65):
+        monkeypatch.setenv("SENQA_EXECUTOR_PROFILE", invalid_profile)
+        with pytest.raises(BridgeError, match="bridge_invalid"):
+            load_config()
 
 
 def test_missing_bridge_secret_fails_value_free(
@@ -454,6 +509,7 @@ def test_bridge_service_suppresses_inflight_gitlab_retries(tmp_path: Path) -> No
         webhook_secret="w" * 32,
         delivery_token="response-token",
         bot_username="senqa-worker-bot",
+        executor_profile="education-agent",
         filter_path=tmp_path / "filter",
         hermes_path=Path("/opt/hermes"),
         search_path=tmp_path / "search",
@@ -498,6 +554,140 @@ def test_bridge_service_suppresses_inflight_gitlab_retries(tmp_path: Path) -> No
     )
 
 
+def test_bridge_service_runs_unique_requests_one_at_a_time_in_fifo_order(
+    tmp_path: Path,
+) -> None:
+    state_lock = threading.Lock()
+    active = 0
+    peak_active = 0
+    observed: list[str] = []
+    finished = threading.Event()
+
+    def filter_runner(raw: bytes) -> bytes:
+        return _filter_payload(_request_number(int(raw)))
+
+    def answer_runner(request: GitLabQaRequest) -> None:
+        nonlocal active, peak_active
+        with state_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+            observed.append(request.request_id)
+        time.sleep(0.05)
+        with state_lock:
+            active -= 1
+            if len(observed) == 5 and active == 0:
+                finished.set()
+
+    service = GitLabQaBridgeService(
+        _bridge_config(tmp_path),
+        filter_runner=filter_runner,
+        answer_runner=answer_runner,
+    )
+
+    for index in range(5):
+        assert (
+            service.accept(
+                str(index).encode(),
+                event="Note Hook",
+                supplied_secret="w" * 32,
+            )
+            == "accepted"
+        )
+
+    assert finished.wait(3)
+    assert peak_active == 1
+    assert observed == [_request_number(index).request_id for index in range(5)]
+
+
+def test_bridge_service_limits_active_and_waiting_requests_to_five(
+    tmp_path: Path,
+) -> None:
+    worker_jobs: list[object] = []
+    service = GitLabQaBridgeService(
+        _bridge_config(tmp_path),
+        filter_runner=lambda raw: _filter_payload(_request_number(int(raw))),
+        answer_runner=lambda _request: None,
+        thread_launcher=worker_jobs.append,
+    )
+
+    results = [
+        service.accept(
+            str(index).encode(),
+            event="Note Hook",
+            supplied_secret="w" * 32,
+        )
+        for index in range(6)
+    ]
+
+    assert results == ["accepted"] * 5 + ["overloaded"]
+    assert len(worker_jobs) == 1
+
+
+def test_overloaded_request_gets_one_notification_without_running_answer_model(
+    tmp_path: Path,
+) -> None:
+    answer_calls: list[GitLabQaRequest] = []
+    overload_calls: list[GitLabQaRequest] = []
+    worker_jobs: list[object] = []
+    notification_jobs: list[object] = []
+    service = GitLabQaBridgeService(
+        _bridge_config(tmp_path),
+        filter_runner=lambda raw: _filter_payload(_request_number(int(raw))),
+        answer_runner=answer_calls.append,
+        thread_launcher=worker_jobs.append,
+        overload_runner=overload_calls.append,
+        notification_launcher=notification_jobs.append,
+    )
+
+    for index in range(5):
+        assert (
+            service.accept(
+                str(index).encode(), event="Note Hook", supplied_secret="w" * 32
+            )
+            == "accepted"
+        )
+    assert (
+        service.accept(b"5", event="Note Hook", supplied_secret="w" * 32)
+        == "overloaded"
+    )
+    assert (
+        service.accept(b"5", event="Note Hook", supplied_secret="w" * 32) == "duplicate"
+    )
+
+    assert answer_calls == []
+    assert len(worker_jobs) == 1
+    assert len(notification_jobs) == 1
+    notification_jobs[0]()
+    assert overload_calls == [_request_number(5)]
+
+
+def test_overload_job_delivers_only_the_fixed_public_server_load_response() -> None:
+    delivered: list[tuple[object, object, object, object]] = []
+
+    def deliver(
+        *, issue_iid: object, request_id: object, answer: object, token: object
+    ) -> str:
+        delivered.append((issue_iid, request_id, answer, token))
+        return "94"
+
+    assert (
+        run_overload_job(_request(), delivery_token="response-token", deliver=deliver)
+        == "94"
+    )
+    assert delivered == [
+        (
+            73,
+            REQUEST_ID,
+            PublicAnswer(
+                answer=TEMPORARILY_UNAVAILABLE_TEXT,
+                answer_kind="temporarily_unavailable",
+                cases=(),
+            ),
+            "response-token",
+        )
+    ]
+
+
 def test_hermes_runner_isolates_the_child_process_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -512,7 +702,8 @@ def test_hermes_runner_isolates_the_child_process_group(
 
     monkeypatch.setattr("src.integrations.gitlab_qa_bridge.subprocess.run", fake_run)
 
-    completed = make_hermes_runner()(("/opt/hermes", "-z", "prompt"))
+    completed = make_hermes_runner("education-agent")(("/opt/hermes", "-z", "prompt"))
 
     assert captured["start_new_session"] is True
+    assert captured["env"]["HERMES_PROFILE"] == "education-agent"
     assert completed.stdout == b"answer"

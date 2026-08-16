@@ -13,6 +13,7 @@ from src.integrations.gitlab_qa_public import (
     cases_only_answer,
     no_evidence_answer,
     public_cases_from_evidence,
+    temporarily_unavailable_answer,
     validate_grounded_answer,
 )
 
@@ -201,6 +202,18 @@ def test_fixed_fallback_answers_are_exact() -> None:
         answer_kind="cases_only",
         cases=(_case(),),
     )
+
+
+def test_temporary_unavailability_is_a_public_answer_without_cases() -> None:
+    message = "서버 부하로 약간의 대기 시간이 필요합니다. 잠시 후 다시 시도해 주세요."
+    answer = temporarily_unavailable_answer()
+
+    assert json.loads(canonical_public_answer_json(answer)) == {
+        "answer": message,
+        "answer_kind": "temporarily_unavailable",
+        "cases": [],
+        "schema_version": "senqa-public-answer/v1",
+    }
 
 
 def test_canonical_json_has_only_public_fields() -> None:

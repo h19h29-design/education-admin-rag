@@ -13,6 +13,8 @@ const NO_EVIDENCE_TEXT =
   "등록된 사례집에서 이 질문과 관련된 내용을 찾지 못했습니다. 다른 표현이나 핵심어로 다시 검색해 주세요.";
 const CASES_ONLY_TEXT =
   "답변을 정리하지 못했습니다. 관련 사례는 아래 목록에서 직접 확인해 주세요.";
+const TEMPORARILY_UNAVAILABLE_TEXT =
+  "서버 부하로 약간의 대기 시간이 필요합니다. 잠시 후 다시 시도해 주세요.";
 const LEGACY_TEXT =
   "이전 형식의 답변입니다. 같은 질문을 다시 검색해 관련 사례를 확인해 주세요.";
 const PUBLIC_CASE_RE = /^senqa-20(?:20|21|22|23|24|25)-[a-z0-9-]{1,160}$/u;
@@ -186,7 +188,9 @@ function parsePublicAnswerPayload(raw) {
   if (
     !exactObject(value, ["answer", "answer_kind", "cases", "schema_version"]) ||
     value.schema_version !== PUBLIC_SCHEMA ||
-    !["grounded", "no_evidence", "cases_only"].includes(value.answer_kind) ||
+    !["grounded", "no_evidence", "cases_only", "temporarily_unavailable"].includes(
+      value.answer_kind,
+    ) ||
     !boundedPublicText(value.answer, 32_000) ||
     !Array.isArray(value.cases) ||
     value.cases.length > 20
@@ -202,6 +206,8 @@ function parsePublicAnswerPayload(raw) {
       (value.answer !== NO_EVIDENCE_TEXT || checkedCases.length !== 0)) ||
     (value.answer_kind === "cases_only" &&
       (value.answer !== CASES_ONLY_TEXT || checkedCases.length === 0)) ||
+    (value.answer_kind === "temporarily_unavailable" &&
+      (value.answer !== TEMPORARILY_UNAVAILABLE_TEXT || checkedCases.length !== 0)) ||
     (value.answer_kind === "grounded" &&
       (checkedCases.length === 0 || !groundedAnswerIsValid(value.answer, checkedCases)))
   ) {
